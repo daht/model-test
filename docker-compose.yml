@@ -1,0 +1,23 @@
+services:
+  hy-mt-api:
+    build: .
+    image: hy-mt-rest-api:latest
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./models:/models:ro
+      - hf-cache:/root/.cache/huggingface
+    gpus: all
+    restart: unless-stopped
+    shm_size: "2gb"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).read()\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+volumes:
+  hf-cache:

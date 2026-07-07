@@ -1,0 +1,78 @@
+HELP.md
+.gradle
+build/
+!gradle/wrapper/gradle-wrapper.jar
+!**/src/main/**/build/
+!**/src/test/**/build/
+logs/
+localCheckpointStore*
+### STS ###
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+
+### IntelliJ IDEA ###
+.idea
+*.iws
+*.iml
+*.ipr
+**/.flattened-pom.xml
+out/
+!**/src/main/**/out/
+!**/src/test/**/out/
+target/
+
+### NetBeans ###
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+
+### VS Code ###
+.vscode/
+
+/AGENTS.md
+/CLAUDE.md
+/docker-claude.sh
+/docker-codex.sh
+.DS_Store
+/.superpowers/
+/sony-member-trade-starter/src/main/resources/application-local.yml
+/docs/superpowers/
+/.test/
+/.venv/
+
+### Python ###
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+### Local env / secrets ###
+.env
+.env.*
+!.env.example
+!cloud/*.env.example
+
+### Model weights / runtime caches ###
+models/
+hf-cache/
+.cache/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.gguf
+
+### Runtime output ###
+*.log
+logs/
