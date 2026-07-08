@@ -9,6 +9,8 @@ The recommended target for your current server is NVIDIA A10 24GB. Use `float16`
 - `app/main.py`: FastAPI routes, health check, API key guard.
 - `app/asr_api.py`: Qwen3-ASR file upload and WebSocket routes.
 - `app/asr.py`: Qwen3-ASR lazy-loading inference wrapper and mock backend.
+- `app/tts_api.py`: CosyVoice HTTP and WebSocket TTS routes.
+- `app/tts.py`: CosyVoice lazy-loading inference wrapper and mock WAV backend.
 - `app/model.py`: mock translator for tests and Transformers translator for production.
 - `app/schemas.py`: request and response models.
 - `Dockerfile`: GPU-capable image based on NVIDIA CUDA runtime.
@@ -63,6 +65,14 @@ If your model weights are local, copy them into:
 ```text
 models/HY-MT1.5-1.8B
 models/Qwen3-ASR-1.7B-hf
+models/CosyVoice
+models/CosyVoice-ttsfrd
+```
+
+CosyVoice also needs the official runtime code in the build context:
+
+```bash
+git clone --recursive https://github.com/FunAudioLLM/CosyVoice.git CosyVoice
 ```
 
 Keep this A10 default config:
@@ -76,6 +86,10 @@ MAX_NEW_TOKENS=1024
 ASR_MODEL_ID=/models/Qwen3-ASR-1.7B-hf
 ASR_BACKEND=qwen
 ASR_TORCH_DTYPE=bfloat16
+TTS_MODEL_ID=/models/CosyVoice
+TTS_BACKEND=cosyvoice
+TTS_COSYVOICE_REPO=/opt/CosyVoice
+TTS_SAMPLE_RATE=24000
 ```
 
 If HY-MT loads as an encoder-decoder model in your weights, change:
@@ -90,6 +104,7 @@ Start service:
 docker compose up --build -d
 docker compose logs -f hy-mt-api
 docker compose logs -f qwen-asr-api
+docker compose logs -f cosyvoice-tts-api
 ```
 
 Update service after code changes:
@@ -142,6 +157,11 @@ Verify:
 ```bash
 API_KEY=your-api-key BASE_URL=http://your-server-ip:8000 scripts/smoke_test.sh
 API_KEY=your-api-key BASE_URL=http://your-server-ip:8002 scripts/smoke_asr.sh
+curl -H "X-API-Key: your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"你好，欢迎使用。"}' \
+  --output output.wav \
+  http://your-server-ip:8003/v1/tts
 ```
 
 Remote deploy from your local machine is also supported:
@@ -176,6 +196,14 @@ For Qwen3-ASR, download the model to:
 hf download Qwen/Qwen3-ASR-1.7B-hf --local-dir models/Qwen3-ASR-1.7B-hf
 ```
 
+For CosyVoice TTS, download the model and runtime resources:
+
+```bash
+git clone --recursive https://github.com/FunAudioLLM/CosyVoice.git CosyVoice
+hf download FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --local-dir models/CosyVoice
+hf download FunAudioLLM/CosyVoice-ttsfrd --local-dir models/CosyVoice-ttsfrd
+```
+
 Run with Docker Compose:
 
 ```bash
@@ -187,6 +215,7 @@ Check health:
 ```bash
 curl http://localhost:8000/health
 curl http://localhost:8002/health
+curl http://localhost:8003/health
 ```
 
 Translate:
@@ -213,6 +242,16 @@ curl -X POST http://localhost:8002/v1/transcribe \
   -H "X-API-Key: your-production-api-key" \
   -F "language=zh" \
   -F "file=@/path/to/audio.wav"
+```
+
+Synthesize speech:
+
+```bash
+curl -X POST http://localhost:8003/v1/tts \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-production-api-key" \
+  -d '{"text":"你好，欢迎使用我们的产品。","voice":"default"}' \
+  --output output.wav
 ```
 
 WebSocket streaming protocol:
@@ -259,7 +298,7 @@ Clear pending audio while keeping the WebSocket session open:
 {"type":"segment"}
 ```
 
-You can test the stream with the included client:
+You can test the ASR stream with the included client:
 
 ```bash
 API_KEY=your-production-api-key \
@@ -270,6 +309,38 @@ python scripts/stream_asr_client.py /path/to/audio.wav \
 ```
 
 The client converts the input audio to `16kHz mono pcm_s16le` with `ffmpeg`, sends 200ms chunks, and prints `partial` / `sentence_final` / `final` messages.
+
+TTS WebSocket streaming protocol:
+
+```text
+WS ws://localhost:8003/v1/tts/stream
+```
+
+Client sends a JSON start message:
+
+```json
+{
+  "type": "start",
+  "api_key": "your-production-api-key",
+  "voice": "default",
+  "sample_rate": 24000,
+  "format": "wav"
+}
+```
+
+The server returns `{"type":"ready"}`. Send text messages as either plain text or JSON:
+
+```json
+{"type":"text","text":"你好，欢迎使用我们的产品。"}
+```
+
+For each text message, the server returns one binary WAV audio chunk. End the stream with:
+
+```json
+{"type":"end"}
+```
+
+The server sends `{"type":"done"}` and closes the WebSocket.
 
 ## Local Test Mode
 

@@ -27,6 +27,14 @@ class Settings(BaseSettings):
     asr_stream_chunk_seconds: float = 2.0
     asr_vad_silence_seconds: float = 1.0
     asr_vad_rms_threshold: int = 200
+    tts_model_name: str = "CosyVoice"
+    tts_backend: Literal["mock", "cosyvoice"] = "mock"
+    tts_model_id: str = "/models/CosyVoice"
+    tts_device: str = "auto"
+    tts_sample_rate: int = 24000
+    tts_max_text_chars: int = 1000
+    tts_default_voice: str = "default"
+    tts_cosyvoice_repo: str | None = "/opt/CosyVoice"
     trust_remote_code: bool = True
 
 

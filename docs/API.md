@@ -7,6 +7,7 @@ Replace these placeholder domains with your production API domains.
 ```text
 Translation API: https://translate-api.example.com
 ASR API:         https://asr-api.example.com
+TTS API:         https://tts-api.example.com
 ```
 
 Interactive Swagger docs:
@@ -14,6 +15,7 @@ Interactive Swagger docs:
 ```text
 https://translate-api.example.com/docs
 https://asr-api.example.com/docs
+https://tts-api.example.com/docs
 ```
 
 OpenAPI JSON:
@@ -21,6 +23,7 @@ OpenAPI JSON:
 ```text
 https://translate-api.example.com/openapi.json
 https://asr-api.example.com/openapi.json
+https://tts-api.example.com/openapi.json
 ```
 
 ## Authentication
@@ -70,6 +73,23 @@ Response:
   "status": "ok",
   "model": "Qwen3-ASR-1.7B",
   "backend": "qwen"
+}
+```
+
+### TTS Health
+
+```bash
+curl https://tts-api.example.com/health
+```
+
+Response:
+
+```json
+{
+  "status": "ok",
+  "model": "CosyVoice",
+  "backend": "mock",
+  "sample_rate": 24000
 }
 ```
 
@@ -277,6 +297,96 @@ python3 scripts/stream_asr_client.py /path/to/audio.wav \
   --realtime
 ```
 
+## TTS Synthesis
+
+Use this endpoint for non-streaming text-to-speech. The response body is WAV audio.
+
+```http
+POST /v1/tts
+Content-Type: application/json
+X-API-Key: <your-api-key>
+Accept: audio/wav
+```
+
+Request:
+
+```json
+{
+  "text": "你好，欢迎使用我们的产品。",
+  "voice": "default"
+}
+```
+
+Response:
+
+```http
+200 OK
+Content-Type: audio/wav
+```
+
+curl:
+
+```bash
+curl -X POST https://tts-api.example.com/v1/tts \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: <your-api-key>" \
+  -d '{"text":"你好，欢迎使用我们的产品。","voice":"default"}' \
+  --output output.wav
+```
+
+## TTS WebSocket Streaming
+
+Use this endpoint when the client wants to send text incrementally and receive audio chunks.
+
+```text
+wss://tts-api.example.com/v1/tts/stream
+```
+
+First client message must be JSON:
+
+```json
+{
+  "type": "start",
+  "api_key": "<your-api-key>",
+  "voice": "default",
+  "sample_rate": 24000,
+  "format": "wav"
+}
+```
+
+Server ready response:
+
+```json
+{
+  "type": "ready"
+}
+```
+
+Then send text as JSON:
+
+```json
+{
+  "type": "text",
+  "text": "你好，欢迎使用我们的产品。"
+}
+```
+
+The server returns a binary WAV audio chunk for each text message. End the stream:
+
+```json
+{
+  "type": "end"
+}
+```
+
+Server done response:
+
+```json
+{
+  "type": "done"
+}
+```
+
 ## Python Examples
 
 ### Translate
@@ -449,6 +559,26 @@ ws.onmessage = (event) => {
 
 Browser microphone audio is usually Float32 PCM at the device sample rate. Convert it to `16kHz mono pcm_s16le` before sending.
 
+### TTS HTTP
+
+```python
+import requests
+
+api_key = "<your-api-key>"
+url = "https://tts-api.example.com/v1/tts"
+
+response = requests.post(
+    url,
+    headers={"X-API-Key": api_key},
+    json={"text": "你好，欢迎使用我们的产品。", "voice": "default"},
+    timeout=120,
+)
+response.raise_for_status()
+
+with open("output.wav", "wb") as audio:
+    audio.write(response.content)
+```
+
 ## Error Responses
 
 Invalid or missing API key:
@@ -475,6 +605,14 @@ Audio too large:
 }
 ```
 
+TTS backend unavailable:
+
+```json
+{
+  "detail": "CosyVoice backend is unavailable: ..."
+}
+```
+
 WebSocket error:
 
 ```json
@@ -489,5 +627,6 @@ WebSocket error:
 - First request can be slower because the model loads lazily.
 - Translation service listens on port `8000`.
 - ASR service listens on port `8002`.
+- TTS service listens on port `8003`.
 - For production, use HTTPS and a domain name in front of these services.
 - Do not expose real API keys in client-side code for public websites.

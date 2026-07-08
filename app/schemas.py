@@ -49,3 +49,43 @@ class TranscribeStreamInfoResponse(BaseModel):
     end_message: dict[str, str]
     segment_message: dict[str, str]
     server_messages: list[dict[str, str]]
+
+
+class TTSRequest(BaseModel):
+    text: str = Field(..., min_length=1, examples=["你好，欢迎使用我们的产品。"])
+    voice: str | None = Field(default=None, min_length=1, max_length=128, examples=["default"])
+
+    @field_validator("text")
+    @classmethod
+    def reject_blank_text(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("text cannot be blank")
+        return stripped
+
+    @field_validator("voice")
+    @classmethod
+    def reject_blank_voice(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("voice cannot be blank")
+        return stripped
+
+
+class TTSHealthResponse(BaseModel):
+    status: str
+    model: str
+    backend: str
+    sample_rate: int
+
+
+class TTSInfoResponse(BaseModel):
+    websocket_url: str
+    http_endpoint: str
+    audio_format: dict[str, int | str]
+    start_message: dict[str, int | str]
+    text_message: dict[str, str]
+    end_message: dict[str, str]
+    server_messages: list[dict[str, str]]

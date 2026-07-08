@@ -53,6 +53,15 @@ cd /opt/model-test
 hf download Qwen/Qwen3-ASR-1.7B-hf --local-dir models/Qwen3-ASR-1.7B-hf
 ```
 
+CosyVoice TTS runtime and model:
+
+```bash
+cd /opt/model-test
+git clone --recursive https://github.com/FunAudioLLM/CosyVoice.git CosyVoice
+hf download FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --local-dir models/CosyVoice
+hf download FunAudioLLM/CosyVoice-ttsfrd --local-dir models/CosyVoice-ttsfrd
+```
+
 ## 3. Configure A10 defaults
 
 ```bash
@@ -71,6 +80,10 @@ MAX_NEW_TOKENS=1024
 ASR_TORCH_DTYPE=bfloat16
 ASR_DEVICE=auto
 ASR_STREAM_CHUNK_SECONDS=2.0
+TTS_BACKEND=cosyvoice
+TTS_MODEL_ID=/models/CosyVoice
+TTS_COSYVOICE_REPO=/opt/CosyVoice
+TTS_SAMPLE_RATE=24000
 ```
 
 If the model is encoder-decoder rather than causal language model, set:
@@ -87,6 +100,7 @@ From the server:
 docker compose up --build -d
 docker compose logs -f hy-mt-api
 docker compose logs -f qwen-asr-api
+docker compose logs -f cosyvoice-tts-api
 ```
 
 From your local machine:
@@ -95,6 +109,11 @@ From your local machine:
 REMOTE_HOST=root@your-server-ip ENV_FILE=.env scripts/deploy_remote.sh
 API_KEY=your-api-key BASE_URL=http://your-server-ip:8000 scripts/smoke_test.sh
 API_KEY=your-api-key BASE_URL=http://your-server-ip:8002 scripts/smoke_asr.sh
+curl -H "X-API-Key: your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"你好，欢迎使用。"}' \
+  --output output.wav \
+  http://your-server-ip:8003/v1/tts
 ```
 
 ## 5. Client request
@@ -149,16 +168,28 @@ python3 scripts/stream_asr_client.py /path/to/audio.wav \
   --realtime
 ```
 
+TTS HTTP endpoint:
+
+```bash
+curl -X POST http://your-server-ip:8003/v1/tts \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-api-key" \
+  -d '{"text":"你好，欢迎使用。","voice":"default"}' \
+  --output output.wav
+```
+
 ## 6. Operations
 
 ```bash
 docker compose ps
 docker compose logs -f hy-mt-api
 docker compose logs -f qwen-asr-api
+docker compose logs -f cosyvoice-tts-api
 docker stats
 nvidia-smi
 docker compose restart hy-mt-api
 docker compose restart qwen-asr-api
+docker compose restart cosyvoice-tts-api
 docker compose pull && docker compose up --build -d
 ```
 
