@@ -9,6 +9,10 @@ WORKDIR /app
 ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 ARG PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 RUN python -m pip install --upgrade pip \
     && python -m pip install \

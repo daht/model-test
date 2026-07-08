@@ -28,3 +28,15 @@ class HealthResponse(BaseModel):
     status: str
     model: str
     backend: str
+
+
+class ASRHealthResponse(BaseModel):
+    status: str
+    model: str
+    backend: str
+
+
+class TranscribeResponse(BaseModel):
+    text: str
+    language: str | None
+    model: str

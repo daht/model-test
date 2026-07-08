@@ -13,10 +13,18 @@ class Settings(BaseSettings):
     model_id: str = Field(default="HY-MT1.5-1.8B", description="Hugging Face id or local path")
     model_backend: Literal["transformers", "mock"] = "transformers"
     model_task: Literal["causal-lm", "seq2seq-lm"] = "causal-lm"
+    asr_model_name: str = "Qwen3-ASR-1.7B"
+    asr_model_id: str = "/models/Qwen3-ASR-1.7B-hf"
+    asr_backend: Literal["qwen", "mock"] = "qwen"
     api_key: str = Field(default="change-me", description="Required X-API-Key value")
     device: str = "auto"
     torch_dtype: Literal["auto", "float16", "bfloat16", "float32"] = "float16"
     max_new_tokens: int = 1024
+    asr_device: str = "auto"
+    asr_torch_dtype: Literal["auto", "float16", "bfloat16", "float32"] = "bfloat16"
+    asr_max_new_tokens: int = 512
+    asr_max_upload_mb: int = 200
+    asr_stream_chunk_seconds: float = 4.0
     trust_remote_code: bool = True
 
 

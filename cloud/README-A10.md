@@ -46,6 +46,13 @@ MODEL_ID=your-org-or-user/HY-MT1.5-1.8B
 
 Put that value in `.env`.
 
+Qwen3-ASR model:
+
+```bash
+cd /opt/model-test
+hf download Qwen/Qwen3-ASR-1.7B-hf --local-dir models/Qwen3-ASR-1.7B-hf
+```
+
 ## 3. Configure A10 defaults
 
 ```bash
@@ -61,6 +68,9 @@ For A10, keep:
 TORCH_DTYPE=float16
 DEVICE=auto
 MAX_NEW_TOKENS=1024
+ASR_TORCH_DTYPE=bfloat16
+ASR_DEVICE=auto
+ASR_STREAM_CHUNK_SECONDS=4.0
 ```
 
 If the model is encoder-decoder rather than causal language model, set:
@@ -76,6 +86,7 @@ From the server:
 ```bash
 docker compose up --build -d
 docker compose logs -f hy-mt-api
+docker compose logs -f qwen-asr-api
 ```
 
 From your local machine:
@@ -83,6 +94,7 @@ From your local machine:
 ```bash
 REMOTE_HOST=root@your-server-ip ENV_FILE=.env scripts/deploy_remote.sh
 API_KEY=your-api-key BASE_URL=http://your-server-ip:8000 scripts/smoke_test.sh
+API_KEY=your-api-key BASE_URL=http://your-server-ip:8002 scripts/smoke_asr.sh
 ```
 
 ## 5. Client request
@@ -102,14 +114,31 @@ curl -X POST http://your-server-ip:8000/v1/translate \
   }'
 ```
 
+ASR upload:
+
+```bash
+curl -X POST http://your-server-ip:8002/v1/transcribe \
+  -H "X-API-Key: your-api-key" \
+  -F "language=zh" \
+  -F "file=@/path/to/audio.wav"
+```
+
+ASR WebSocket endpoint:
+
+```text
+ws://your-server-ip:8002/v1/transcribe/stream
+```
+
 ## 6. Operations
 
 ```bash
 docker compose ps
 docker compose logs -f hy-mt-api
+docker compose logs -f qwen-asr-api
 docker stats
 nvidia-smi
 docker compose restart hy-mt-api
+docker compose restart qwen-asr-api
 docker compose pull && docker compose up --build -d
 ```
 
@@ -141,4 +170,5 @@ Use a narrower mode when only config or model files changed:
 scripts/update_service.sh env
 scripts/update_service.sh restart
 scripts/update_service.sh logs
+SERVICE=qwen-asr-api BASE_URL=http://127.0.0.1:8002 scripts/update_service.sh
 ```

@@ -1,5 +1,6 @@
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI
 
+from app.auth import require_api_key
 from app.config import Settings, get_settings
 from app.model import Translator, create_translator
 from app.schemas import HealthResponse, TranslateRequest, TranslateResponse
@@ -12,17 +13,6 @@ app = FastAPI(
     version="0.1.0",
     description="REST API template for HY-MT1.5-1.8B translation deployment.",
 )
-
-
-def require_api_key(
-    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
-    current_settings: Settings = Depends(get_settings),
-) -> None:
-    if not x_api_key or x_api_key != current_settings.api_key:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing API key",
-        )
 
 
 def get_translator() -> Translator:

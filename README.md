@@ -7,6 +7,8 @@ The recommended target for your current server is NVIDIA A10 24GB. Use `float16`
 ## Files
 
 - `app/main.py`: FastAPI routes, health check, API key guard.
+- `app/asr_api.py`: Qwen3-ASR file upload and WebSocket routes.
+- `app/asr.py`: Qwen3-ASR lazy-loading inference wrapper and mock backend.
 - `app/model.py`: mock translator for tests and Transformers translator for production.
 - `app/schemas.py`: request and response models.
 - `Dockerfile`: GPU-capable image based on NVIDIA CUDA runtime.
@@ -15,6 +17,7 @@ The recommended target for your current server is NVIDIA A10 24GB. Use `float16`
 - `scripts/bootstrap_ubuntu_gpu.sh`: Ubuntu GPU server bootstrap script.
 - `scripts/deploy_remote.sh`: rsync and remote Docker Compose deployment.
 - `scripts/smoke_test.sh`: post-deploy API check.
+- `scripts/smoke_asr.sh`: post-deploy Qwen3-ASR API check.
 - `scripts/update_service.sh`: update/recreate the cloud Docker service.
 - `cloud/README-A10.md`: A10-specific deployment runbook.
 
@@ -59,6 +62,7 @@ If your model weights are local, copy them into:
 
 ```text
 models/HY-MT1.5-1.8B
+models/Qwen3-ASR-1.7B-hf
 ```
 
 Keep this A10 default config:
@@ -69,6 +73,9 @@ MODEL_TASK=causal-lm
 DEVICE=auto
 TORCH_DTYPE=float16
 MAX_NEW_TOKENS=1024
+ASR_MODEL_ID=/models/Qwen3-ASR-1.7B-hf
+ASR_BACKEND=qwen
+ASR_TORCH_DTYPE=bfloat16
 ```
 
 If HY-MT loads as an encoder-decoder model in your weights, change:
@@ -82,6 +89,7 @@ Start service:
 ```bash
 docker compose up --build -d
 docker compose logs -f hy-mt-api
+docker compose logs -f qwen-asr-api
 ```
 
 Update service after code changes:
@@ -116,10 +124,17 @@ Restart after replacing model files:
 scripts/update_service.sh restart
 ```
 
+Update only the ASR container:
+
+```bash
+SERVICE=qwen-asr-api BASE_URL=http://127.0.0.1:8002 scripts/update_service.sh
+```
+
 Verify:
 
 ```bash
 API_KEY=your-api-key BASE_URL=http://your-server-ip:8000 scripts/smoke_test.sh
+API_KEY=your-api-key BASE_URL=http://your-server-ip:8002 scripts/smoke_asr.sh
 ```
 
 Remote deploy from your local machine is also supported:
@@ -148,6 +163,12 @@ MODEL_TASK=causal-lm
 
 If the model is on Hugging Face, set `MODEL_ID` to the model id. If the model is local, put the weights under `./models/HY-MT1.5-1.8B`.
 
+For Qwen3-ASR, download the model to:
+
+```bash
+hf download Qwen/Qwen3-ASR-1.7B-hf --local-dir models/Qwen3-ASR-1.7B-hf
+```
+
 Run with Docker Compose:
 
 ```bash
@@ -158,6 +179,7 @@ Check health:
 
 ```bash
 curl http://localhost:8000/health
+curl http://localhost:8002/health
 ```
 
 Translate:
@@ -175,6 +197,46 @@ curl -X POST http://localhost:8000/v1/translate \
     },
     "preserve_format": true
   }'
+```
+
+Transcribe an audio file:
+
+```bash
+curl -X POST http://localhost:8002/v1/transcribe \
+  -H "X-API-Key: your-production-api-key" \
+  -F "language=zh" \
+  -F "file=@/path/to/audio.wav"
+```
+
+WebSocket streaming protocol:
+
+```text
+WS ws://localhost:8002/v1/transcribe/stream
+```
+
+Client sends a JSON start message:
+
+```json
+{
+  "type": "start",
+  "api_key": "your-production-api-key",
+  "language": "zh",
+  "sample_rate": 16000,
+  "format": "pcm_s16le"
+}
+```
+
+Then the client sends binary PCM chunks. The server returns:
+
+```json
+{"type":"partial","text":"..."}
+{"type":"final","text":"..."}
+```
+
+End the stream with:
+
+```json
+{"type":"end"}
 ```
 
 ## Local Test Mode
@@ -238,6 +300,31 @@ Request:
     "产品": "product"
   },
   "preserve_format": true
+}
+```
+
+`POST /v1/transcribe`
+
+Headers:
+
+```text
+X-API-Key: your-production-api-key
+```
+
+Multipart fields:
+
+```text
+file: wav/mp3/m4a/flac/ogg/webm
+language: optional language hint, such as zh, en, yue
+```
+
+Response:
+
+```json
+{
+  "text": "客户可以使用 Apple Pay 结账。",
+  "language": "Chinese",
+  "model": "Qwen3-ASR-1.7B"
 }
 ```
 
