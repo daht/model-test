@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from threading import Lock
 
@@ -125,7 +126,7 @@ class TransformersTranslator(Translator):
                 "repetition_penalty": 1.05,
                 "pad_token_id": self._tokenizer.eos_token_id,
             }
-            if isinstance(model_inputs, dict):
+            if isinstance(model_inputs, Mapping):
                 prompt_length = model_inputs["input_ids"].shape[-1]
                 outputs = self._model.generate(**model_inputs, **generation_kwargs)
             else:
