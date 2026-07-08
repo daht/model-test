@@ -7,6 +7,48 @@ from app.config import Settings
 from app.schemas import TranslateRequest
 
 
+LANGUAGE_NAMES = {
+    "zh": ("Chinese", "中文"),
+    "en": ("English", "英语"),
+    "fr": ("French", "法语"),
+    "pt": ("Portuguese", "葡萄牙语"),
+    "es": ("Spanish", "西班牙语"),
+    "ja": ("Japanese", "日语"),
+    "tr": ("Turkish", "土耳其语"),
+    "ru": ("Russian", "俄语"),
+    "ar": ("Arabic", "阿拉伯语"),
+    "ko": ("Korean", "韩语"),
+    "th": ("Thai", "泰语"),
+    "it": ("Italian", "意大利语"),
+    "de": ("German", "德语"),
+    "vi": ("Vietnamese", "越南语"),
+    "ms": ("Malay", "马来语"),
+    "id": ("Indonesian", "印尼语"),
+    "tl": ("Filipino", "菲律宾语"),
+    "hi": ("Hindi", "印地语"),
+    "zh-Hant": ("Traditional Chinese", "繁体中文"),
+    "pl": ("Polish", "波兰语"),
+    "cs": ("Czech", "捷克语"),
+    "nl": ("Dutch", "荷兰语"),
+    "km": ("Khmer", "高棉语"),
+    "my": ("Burmese", "缅甸语"),
+    "fa": ("Persian", "波斯语"),
+    "gu": ("Gujarati", "古吉拉特语"),
+    "ur": ("Urdu", "乌尔都语"),
+    "te": ("Telugu", "泰卢固语"),
+    "mr": ("Marathi", "马拉地语"),
+    "he": ("Hebrew", "希伯来语"),
+    "bn": ("Bengali", "孟加拉语"),
+    "ta": ("Tamil", "泰米尔语"),
+    "uk": ("Ukrainian", "乌克兰语"),
+    "bo": ("Tibetan", "藏语"),
+    "kk": ("Kazakh", "哈萨克语"),
+    "mn": ("Mongolian", "蒙古语"),
+    "ug": ("Uyghur", "维吾尔语"),
+    "yue": ("Cantonese", "粤语"),
+}
+
+
 class Translator:
     def translate(self, request: TranslateRequest) -> str:
         raise NotImplementedError
@@ -67,41 +109,50 @@ class TransformersTranslator(Translator):
             assert self._model is not None
 
             prompt = self._build_prompt(request)
-            inputs = self._tokenizer(prompt, return_tensors="pt").to(self._model.device)
+            messages = [{"role": "user", "content": prompt}]
+            input_ids = self._tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=False,
+                return_tensors="pt",
+            ).to(self._model.device)
             outputs = self._model.generate(
-                **inputs,
+                input_ids,
                 max_new_tokens=self.settings.max_new_tokens,
-                do_sample=False,
+                do_sample=True,
+                top_k=20,
+                top_p=0.6,
+                temperature=0.7,
+                repetition_penalty=1.05,
                 pad_token_id=self._tokenizer.eos_token_id,
             )
-            decoded = self._tokenizer.decode(outputs[0], skip_special_tokens=True)
-            return self._strip_prompt(decoded, prompt)
+            generated_ids = outputs[0][input_ids.shape[-1] :]
+            return self._tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
 
     @staticmethod
     def _build_prompt(request: TranslateRequest) -> str:
-        lines = [
-            "You are a professional machine translation engine.",
-            f"Translate from {request.source_lang} to {request.target_lang}.",
-        ]
-        if request.preserve_format:
-            lines.append("Preserve line breaks, numbering, markdown, and placeholders.")
-        if request.glossary:
-            terms = ", ".join(f"{source} => {target}" for source, target in request.glossary.items())
-            lines.append(f"Use this glossary exactly where applicable: {terms}.")
-        lines.extend(["Text:", request.text, "Translation:"])
-        return "\n".join(lines)
+        target_english_name, target_chinese_name = _language_names(request.target_lang)
 
-    @staticmethod
-    def _strip_prompt(decoded: str, prompt: str) -> str:
-        if decoded.startswith(prompt):
-            return decoded[len(prompt) :].strip()
-        marker = "Translation:"
-        if marker in decoded:
-            return decoded.rsplit(marker, maxsplit=1)[-1].strip()
-        return decoded.strip()
+        if request.source_lang.startswith("zh"):
+            lines = [
+                f"将以下文本翻译为{target_chinese_name}，注意只需要输出翻译后的结果，不要额外解释：",
+            ]
+        else:
+            lines = [
+                f"Translate the following segment into {target_english_name}, without additional explanation.",
+            ]
+        if request.glossary:
+            for source, target in request.glossary.items():
+                lines.append(f"{source} => {target}")
+        lines.extend(["", request.text])
+        return "\n".join(lines)
 
 
 def create_translator(settings: Settings) -> Translator:
     if settings.model_backend == "mock":
         return MockTranslator()
     return TransformersTranslator(settings)
+
+
+def _language_names(language_code: str) -> tuple[str, str]:
+    return LANGUAGE_NAMES.get(language_code, (language_code, language_code))
