@@ -110,23 +110,29 @@ class TransformersTranslator(Translator):
 
             prompt = self._build_prompt(request)
             messages = [{"role": "user", "content": prompt}]
-            input_ids = self._tokenizer.apply_chat_template(
+            model_inputs = self._tokenizer.apply_chat_template(
                 messages,
                 tokenize=True,
                 add_generation_prompt=False,
                 return_tensors="pt",
             ).to(self._model.device)
-            outputs = self._model.generate(
-                input_ids,
-                max_new_tokens=self.settings.max_new_tokens,
-                do_sample=True,
-                top_k=20,
-                top_p=0.6,
-                temperature=0.7,
-                repetition_penalty=1.05,
-                pad_token_id=self._tokenizer.eos_token_id,
-            )
-            generated_ids = outputs[0][input_ids.shape[-1] :]
+            generation_kwargs = {
+                "max_new_tokens": self.settings.max_new_tokens,
+                "do_sample": True,
+                "top_k": 20,
+                "top_p": 0.6,
+                "temperature": 0.7,
+                "repetition_penalty": 1.05,
+                "pad_token_id": self._tokenizer.eos_token_id,
+            }
+            if isinstance(model_inputs, dict):
+                prompt_length = model_inputs["input_ids"].shape[-1]
+                outputs = self._model.generate(**model_inputs, **generation_kwargs)
+            else:
+                prompt_length = model_inputs.shape[-1]
+                outputs = self._model.generate(model_inputs, **generation_kwargs)
+
+            generated_ids = outputs[0][prompt_length:]
             return self._tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
 
     @staticmethod
