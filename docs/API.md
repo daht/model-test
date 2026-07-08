@@ -232,6 +232,16 @@ End the stream:
 }
 ```
 
+Clear the pending server audio buffer without closing the connection:
+
+```json
+{
+  "type": "segment"
+}
+```
+
+Use `segment` during long-running listening when the client has reached a stable utterance boundary. It prevents the server-side pending audio buffer from growing across segments and reduces repeated or drifting partial text.
+
 Server final response:
 
 ```json

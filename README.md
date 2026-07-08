@@ -246,6 +246,12 @@ End the stream with:
 {"type":"end"}
 ```
 
+Clear pending audio while keeping the WebSocket session open:
+
+```json
+{"type":"segment"}
+```
+
 You can test the stream with the included client:
 
 ```bash

@@ -70,6 +70,7 @@ def test_stream_info_is_available_in_http_docs():
     assert body["websocket_url"] == "/v1/transcribe/stream"
     assert body["audio_format"]["format"] == "pcm_s16le"
     assert body["start_message"]["type"] == "start"
+    assert body["segment_message"] == {"type": "segment"}
     assert body["end_message"] == {"type": "end"}
 
 
@@ -113,3 +114,25 @@ def test_stream_returns_partial_and_final_transcripts():
         final = websocket.receive_json()
         assert final["type"] == "final"
         assert final["text"] == "[mock asr zh] stream.wav"
+
+
+def test_stream_segment_clears_pending_audio_buffer():
+    with client.websocket_connect("/v1/transcribe/stream") as websocket:
+        websocket.send_json(
+            {
+                "type": "start",
+                "api_key": "test-key",
+                "language": "zh",
+                "sample_rate": 16000,
+                "format": "pcm_s16le",
+            }
+        )
+        assert websocket.receive_json() == {"type": "ready"}
+
+        websocket.send_bytes(b"\x00\x00" * 80)
+        websocket.send_json({"type": "segment"})
+        websocket.send_json({"type": "end"})
+
+        final = websocket.receive_json()
+        assert final["type"] == "final"
+        assert final["text"] == ""

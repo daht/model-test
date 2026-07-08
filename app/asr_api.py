@@ -78,6 +78,7 @@ def transcribe_stream_info() -> TranscribeStreamInfoResponse:
             "format": "pcm_s16le",
         },
         end_message={"type": "end"},
+        segment_message={"type": "segment"},
         server_messages=[
             {"type": "ready"},
             {"type": "partial", "text": "..."},
@@ -144,6 +145,8 @@ async def transcribe_stream(websocket: WebSocket) -> None:
                     await websocket.send_json({"type": "final", "text": " ".join(segments)})
                     await websocket.close(code=1000)
                     return
+                if payload.get("type") == "segment":
+                    buffer.clear()
             elif message.get("type") == "websocket.disconnect":
                 return
     except WebSocketDisconnect:

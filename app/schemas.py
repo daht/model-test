@@ -47,4 +47,5 @@ class TranscribeStreamInfoResponse(BaseModel):
     audio_format: dict[str, int | str]
     start_message: dict[str, int | str]
     end_message: dict[str, str]
+    segment_message: dict[str, str]
     server_messages: list[dict[str, str]]
