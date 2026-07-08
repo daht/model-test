@@ -112,3 +112,20 @@ nvidia-smi
 docker compose restart hy-mt-api
 docker compose pull && docker compose up --build -d
 ```
+
+## 7. Updates
+
+Run this from the project directory on the server:
+
+```bash
+cd /opt/model-test
+scripts/update_service.sh
+```
+
+Use a narrower mode when only config or model files changed:
+
+```bash
+scripts/update_service.sh env
+scripts/update_service.sh restart
+scripts/update_service.sh logs
+```

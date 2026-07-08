@@ -15,6 +15,7 @@ The recommended target for your current server is NVIDIA A10 24GB. Use `float16`
 - `scripts/bootstrap_ubuntu_gpu.sh`: Ubuntu GPU server bootstrap script.
 - `scripts/deploy_remote.sh`: rsync and remote Docker Compose deployment.
 - `scripts/smoke_test.sh`: post-deploy API check.
+- `scripts/update_service.sh`: update/recreate the cloud Docker service.
 - `cloud/README-A10.md`: A10-specific deployment runbook.
 
 ## Deploy to Your A10 Cloud Server
@@ -81,6 +82,25 @@ Start service:
 ```bash
 docker compose up --build -d
 docker compose logs -f hy-mt-api
+```
+
+Update service after code changes:
+
+```bash
+cd /opt/model-test
+scripts/update_service.sh
+```
+
+Reload only `.env` changes:
+
+```bash
+scripts/update_service.sh env
+```
+
+Restart after replacing model files:
+
+```bash
+scripts/update_service.sh restart
 ```
 
 Verify:
