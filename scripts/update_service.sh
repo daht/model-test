@@ -117,7 +117,7 @@ Modes:
 Environment:
   SERVICE=hy-mt-api
   BASE_URL=http://127.0.0.1:8000
-  PULL_CODE=auto        # auto | 0 | 1
+  PULL_CODE=auto        # auto pulls only when safe; 0 disables git pull; 1 forces git pull
   LOG_TAIL=120
   HEALTH_TIMEOUT_SECONDS=300
 EOF

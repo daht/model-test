@@ -122,6 +122,19 @@ cd /opt/model-test
 scripts/update_service.sh
 ```
 
+By default, update directly from the official GitHub remote:
+
+```bash
+cd /opt/model-test
+scripts/update_service.sh
+```
+
+If GitHub is temporarily unstable, push code from your local machine as a fallback:
+
+```bash
+REMOTE_HOST=ubuntu@your-server-ip REMOTE_DIR=/opt/model-test ENV_FILE=.env scripts/deploy_remote.sh
+```
+
 Use a narrower mode when only config or model files changed:
 
 ```bash
