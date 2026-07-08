@@ -8,7 +8,7 @@ from app.asr import ASRTranscriber, create_asr_transcriber
 from app.audio import remove_file, save_upload_to_tempfile, write_pcm_s16le_wav
 from app.auth import is_valid_api_key, require_api_key
 from app.config import Settings, get_settings
-from app.schemas import ASRHealthResponse, TranscribeResponse
+from app.schemas import ASRHealthResponse, TranscribeResponse, TranscribeStreamInfoResponse
 
 settings = get_settings()
 asr_transcriber = create_asr_transcriber(settings)
@@ -57,6 +57,33 @@ async def transcribe(
         text=result.text,
         language=result.language,
         model=current_settings.asr_model_name,
+    )
+
+
+@app.get("/v1/transcribe/stream-info", response_model=TranscribeStreamInfoResponse)
+def transcribe_stream_info() -> TranscribeStreamInfoResponse:
+    return TranscribeStreamInfoResponse(
+        websocket_url="/v1/transcribe/stream",
+        audio_format={
+            "format": "pcm_s16le",
+            "sample_rate": 16000,
+            "channels": 1,
+            "recommended_chunk_ms": "100-500",
+        },
+        start_message={
+            "type": "start",
+            "api_key": "<your-api-key>",
+            "language": "zh",
+            "sample_rate": 16000,
+            "format": "pcm_s16le",
+        },
+        end_message={"type": "end"},
+        server_messages=[
+            {"type": "ready"},
+            {"type": "partial", "text": "..."},
+            {"type": "final", "text": "..."},
+            {"type": "error", "message": "..."},
+        ],
     )
 
 

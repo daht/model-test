@@ -62,6 +62,17 @@ def test_transcribe_rejects_unsupported_extension():
     assert response.json()["detail"] == "Unsupported audio file type"
 
 
+def test_stream_info_is_available_in_http_docs():
+    response = client.get("/v1/transcribe/stream-info")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["websocket_url"] == "/v1/transcribe/stream"
+    assert body["audio_format"]["format"] == "pcm_s16le"
+    assert body["start_message"]["type"] == "start"
+    assert body["end_message"] == {"type": "end"}
+
+
 def test_stream_rejects_bad_api_key():
     with client.websocket_connect("/v1/transcribe/stream") as websocket:
         websocket.send_json(

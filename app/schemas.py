@@ -40,3 +40,11 @@ class TranscribeResponse(BaseModel):
     text: str
     language: str | None
     model: str
+
+
+class TranscribeStreamInfoResponse(BaseModel):
+    websocket_url: str
+    audio_format: dict[str, int | str]
+    start_message: dict[str, int | str]
+    end_message: dict[str, str]
+    server_messages: list[dict[str, str]]
