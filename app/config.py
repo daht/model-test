@@ -25,6 +25,8 @@ class Settings(BaseSettings):
     asr_max_new_tokens: int = 512
     asr_max_upload_mb: int = 200
     asr_stream_chunk_seconds: float = 2.0
+    asr_vad_silence_seconds: float = 1.0
+    asr_vad_rms_threshold: int = 200
     trust_remote_code: bool = True
 
 

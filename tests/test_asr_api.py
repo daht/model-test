@@ -34,6 +34,10 @@ def _send_transcribable_chunk(websocket):
     websocket.send_bytes(b"\x00\x00" * 160)
 
 
+def _pcm_s16le_samples(value: int, sample_count: int) -> bytes:
+    return int(value).to_bytes(2, byteorder="little", signed=True) * sample_count
+
+
 def test_asr_health_reports_model_name():
     response = client.get("/health")
 
@@ -87,6 +91,7 @@ def test_stream_info_is_available_in_http_docs():
     body = response.json()
     assert body["websocket_url"] == "/v1/transcribe/stream"
     assert body["audio_format"]["format"] == "pcm_s16le"
+    assert body["audio_format"]["vad_silence_seconds"] == 1.0
     assert body["start_message"]["type"] == "start"
     assert body["segment_message"] == {"type": "segment"}
     assert body["end_message"] == {"type": "end"}
@@ -195,6 +200,23 @@ def test_stream_end_final_only_returns_remaining_uncommitted_text(monkeypatch):
 
         assert websocket.receive_json() == {"type": "partial", "text": "最后半句"}
         assert websocket.receive_json() == {"type": "final", "text": "最后半句"}
+
+
+def test_stream_commits_pending_text_after_one_second_of_silence(monkeypatch):
+    texts = iter(["还没有标点", ""])
+    monkeypatch.setattr(asr_api, "_transcribe_pcm_chunk", lambda *_args: next(texts))
+
+    with client.websocket_connect("/v1/transcribe/stream") as websocket:
+        _start_stream(websocket)
+
+        websocket.send_bytes(_pcm_s16le_samples(1000, 160))
+        assert websocket.receive_json() == {"type": "partial", "text": "还没有标点"}
+
+        websocket.send_bytes(_pcm_s16le_samples(0, 16000))
+        assert websocket.receive_json() == {"type": "sentence_final", "text": "还没有标点"}
+
+        websocket.send_json({"type": "end"})
+        assert websocket.receive_json() == {"type": "final", "text": ""}
 
 
 def test_sentence_committer_does_not_split_decimal_abbreviations_or_domains():

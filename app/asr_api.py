@@ -72,6 +72,60 @@ class SentenceCommitter:
 
         return self.pending_text + text
 
+    def commit_pending(self) -> str:
+        sentence = self.pending_text.strip()
+        if sentence:
+            self.confirmed_texts.append(sentence)
+        self.pending_text = ""
+        return sentence
+
+
+@dataclass
+class SilenceEndpointDetector:
+    silence_seconds: float
+    rms_threshold: int
+    current_silence_seconds: float = 0.0
+    committed_for_current_silence: bool = False
+
+    def add_audio(self, pcm_bytes: bytes, sample_rate: int) -> bool:
+        if not pcm_bytes:
+            return False
+
+        if _pcm_s16le_rms(pcm_bytes) > self.rms_threshold:
+            self.current_silence_seconds = 0.0
+            self.committed_for_current_silence = False
+            return False
+
+        self.current_silence_seconds += _pcm_s16le_duration_seconds(pcm_bytes, sample_rate)
+        if self.current_silence_seconds < self.silence_seconds or self.committed_for_current_silence:
+            return False
+
+        self.committed_for_current_silence = True
+        return True
+
+    def reset(self) -> None:
+        self.current_silence_seconds = 0.0
+        self.committed_for_current_silence = False
+
+
+def _pcm_s16le_rms(pcm_bytes: bytes) -> int:
+    sample_count = len(pcm_bytes) // 2
+    if sample_count == 0:
+        return 0
+
+    total_square = 0
+    for index in range(0, sample_count * 2, 2):
+        sample = int.from_bytes(pcm_bytes[index : index + 2], byteorder="little", signed=True)
+        total_square += sample * sample
+
+    return int((total_square / sample_count) ** 0.5)
+
+
+def _pcm_s16le_duration_seconds(pcm_bytes: bytes, sample_rate: int) -> float:
+    if sample_rate <= 0:
+        return 0.0
+    return (len(pcm_bytes) // 2) / sample_rate
+
 
 def _split_committed_sentences(text: str) -> tuple[list[str], str]:
     committed: list[str] = []
@@ -177,7 +231,7 @@ async def transcribe(
 
 
 @app.get("/v1/transcribe/stream-info", response_model=TranscribeStreamInfoResponse)
-def transcribe_stream_info() -> TranscribeStreamInfoResponse:
+def transcribe_stream_info(current_settings: Settings = Depends(get_settings)) -> TranscribeStreamInfoResponse:
     return TranscribeStreamInfoResponse(
         websocket_url="/v1/transcribe/stream",
         audio_format={
@@ -185,6 +239,7 @@ def transcribe_stream_info() -> TranscribeStreamInfoResponse:
             "sample_rate": 16000,
             "channels": 1,
             "recommended_chunk_ms": "100-500",
+            "vad_silence_seconds": current_settings.asr_vad_silence_seconds,
         },
         start_message={
             "type": "start",
@@ -239,18 +294,25 @@ async def transcribe_stream(websocket: WebSocket) -> None:
     min_chunk_bytes = max(1, int(sample_rate * 2 * current_settings.asr_stream_chunk_seconds))
     buffer = bytearray()
     committer = SentenceCommitter()
+    silence_detector = SilenceEndpointDetector(
+        silence_seconds=current_settings.asr_vad_silence_seconds,
+        rms_threshold=current_settings.asr_vad_rms_threshold,
+    )
     await websocket.send_json({"type": "ready"})
 
     try:
         while True:
             message = await websocket.receive()
             if "bytes" in message and message["bytes"] is not None:
-                buffer.extend(message["bytes"])
+                pcm_bytes = message["bytes"]
+                buffer.extend(pcm_bytes)
                 if len(buffer) >= min_chunk_bytes:
                     segment_text = _transcribe_pcm_chunk(bytes(buffer), sample_rate, language)
                     buffer.clear()
                     if segment_text:
                         await _send_committed_and_partial(websocket, committer, segment_text)
+                if silence_detector.add_audio(pcm_bytes, sample_rate):
+                    await _send_pending_commit(websocket, committer)
             elif "text" in message and message["text"] is not None:
                 payload = json.loads(message["text"])
                 if payload.get("type") == "end":
@@ -263,6 +325,7 @@ async def transcribe_stream(websocket: WebSocket) -> None:
                     return
                 if payload.get("type") == "segment":
                     buffer.clear()
+                    silence_detector.reset()
             elif message.get("type") == "websocket.disconnect":
                 return
     except WebSocketDisconnect:
@@ -278,6 +341,12 @@ async def _send_committed_and_partial(
         await websocket.send_json({"type": "sentence_final", "text": sentence})
     if committer.pending_text:
         await websocket.send_json({"type": "partial", "text": committer.pending_text})
+
+
+async def _send_pending_commit(websocket: WebSocket, committer: SentenceCommitter) -> None:
+    sentence = committer.commit_pending()
+    if sentence:
+        await websocket.send_json({"type": "sentence_final", "text": sentence})
 
 
 def _transcribe_pcm_chunk(pcm_bytes: bytes, sample_rate: int, language: str | None) -> str:

@@ -241,7 +241,7 @@ Then the client sends binary PCM chunks. The server returns:
 {"type":"final","text":"..."}
 ```
 
-`partial` is the current unconfirmed streaming text and may change. `sentence_final` is a committed sentence and will not be sent again or changed by later messages. Later `partial` messages only contain the uncommitted tail after the latest committed sentence. On `end`, `final` contains only the remaining uncommitted text, so clients should render:
+`partial` is the current unconfirmed streaming text and may change. `sentence_final` is a committed sentence and will not be sent again or changed by later messages. Sentences are committed when the unconfirmed text reaches a sentence-ending punctuation mark or when the server detects 1.0 second of continuous silence in the PCM stream. Later `partial` messages only contain the uncommitted tail after the latest committed sentence. On `end`, `final` contains only the remaining uncommitted text, so clients should render:
 
 ```text
 display_text = all sentence_final text in order + latest partial or final tail

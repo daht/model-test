@@ -191,6 +191,7 @@ sample_rate: 16000
 channels:    1
 format:      pcm_s16le
 chunk size:  100ms to 500ms recommended
+VAD commit:  1.0s continuous silence by default
 ```
 
 First client message must be JSON:
@@ -235,7 +236,7 @@ Server committed sentence response:
 }
 ```
 
-`sentence_final` text is confirmed and will not change. Clients should append every `sentence_final` in order, then display the latest `partial` after that confirmed prefix.
+`sentence_final` text is confirmed and will not change. It is sent when the unconfirmed text reaches sentence-ending punctuation, or when the server detects 1.0 second of continuous silence in the PCM stream. Clients should append every `sentence_final` in order, then display the latest `partial` after that confirmed prefix.
 
 End the stream:
 
@@ -253,7 +254,7 @@ Clear the pending server audio buffer without closing the connection:
 }
 ```
 
-Use `segment` during long-running listening when the client has reached a stable utterance boundary. It prevents the server-side pending audio buffer from growing across segments and reduces repeated or drifting partial text.
+Use `segment` during long-running listening when the client wants to discard pending server audio without closing the socket. `segment` is not a commit command; sentence confirmation is triggered by punctuation or by the server's silence detector.
 
 Server final response:
 
