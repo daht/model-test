@@ -237,7 +237,14 @@ Then the client sends binary PCM chunks. The server returns:
 
 ```json
 {"type":"partial","text":"..."}
+{"type":"sentence_final","text":"..."}
 {"type":"final","text":"..."}
+```
+
+`partial` is the current unconfirmed streaming text and may change. `sentence_final` is a committed sentence and will not be sent again or changed by later messages. Later `partial` messages only contain the uncommitted tail after the latest committed sentence. On `end`, `final` contains only the remaining uncommitted text, so clients should render:
+
+```text
+display_text = all sentence_final text in order + latest partial or final tail
 ```
 
 End the stream with:
@@ -262,7 +269,7 @@ python scripts/stream_asr_client.py /path/to/audio.wav \
   --realtime
 ```
 
-The client converts the input audio to `16kHz mono pcm_s16le` with `ffmpeg`, sends 200ms chunks, and prints `partial` / `final` messages.
+The client converts the input audio to `16kHz mono pcm_s16le` with `ffmpeg`, sends 200ms chunks, and prints `partial` / `sentence_final` / `final` messages.
 
 ## Local Test Mode
 

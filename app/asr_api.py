@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, field
 
 from fastapi import Depends, FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
 
@@ -13,6 +14,24 @@ from app.schemas import ASRHealthResponse, TranscribeResponse, TranscribeStreamI
 settings = get_settings()
 asr_transcriber = create_asr_transcriber(settings)
 
+SENTENCE_TERMINATORS = set("。？！｡?!؟۔।॥။.")
+SENTENCE_CLOSERS = set("\"'”’」』）)】]》〉")
+DOT_ABBREVIATIONS = {
+    "dr.",
+    "mr.",
+    "mrs.",
+    "ms.",
+    "prof.",
+    "e.g.",
+    "i.e.",
+    "etc.",
+    "vs.",
+    "st.",
+    "jr.",
+    "sr.",
+    "ph.d.",
+}
+
 app = FastAPI(
     title="Qwen ASR REST API",
     version="0.1.0",
@@ -22,6 +41,103 @@ app = FastAPI(
 
 def get_asr_transcriber() -> ASRTranscriber:
     return asr_transcriber
+
+
+@dataclass
+class SentenceCommitter:
+    pending_text: str = ""
+    confirmed_texts: list[str] = field(default_factory=list)
+
+    def append(self, text: str) -> list[str]:
+        if not text:
+            return []
+
+        self.pending_text = self._merge_recognition_text(text)
+        committed, self.pending_text = _split_committed_sentences(self.pending_text)
+        self.confirmed_texts.extend(committed)
+        return committed
+
+    def _merge_recognition_text(self, text: str) -> str:
+        confirmed_text = "".join(self.confirmed_texts)
+        current_text = confirmed_text + self.pending_text
+
+        if confirmed_text and text.startswith(confirmed_text):
+            return text[len(confirmed_text) :].lstrip()
+
+        if current_text and text.startswith(current_text):
+            return text[len(confirmed_text) :].lstrip()
+
+        if self.pending_text and text.startswith(self.pending_text):
+            return text
+
+        return self.pending_text + text
+
+
+def _split_committed_sentences(text: str) -> tuple[list[str], str]:
+    committed: list[str] = []
+    sentence_start = 0
+    index = 0
+
+    while index < len(text):
+        char = text[index]
+        if char in SENTENCE_TERMINATORS and _is_sentence_end(text, index):
+            sentence_end = index + 1
+            while sentence_end < len(text) and text[sentence_end] in SENTENCE_CLOSERS:
+                sentence_end += 1
+
+            sentence = text[sentence_start:sentence_end].strip()
+            if sentence:
+                committed.append(sentence)
+
+            sentence_start = sentence_end
+            while sentence_start < len(text) and text[sentence_start].isspace():
+                sentence_start += 1
+            index = sentence_start
+            continue
+
+        index += 1
+
+    return committed, text[sentence_start:]
+
+
+def _is_sentence_end(text: str, index: int) -> bool:
+    if text[index] != ".":
+        return True
+
+    previous_char = text[index - 1] if index > 0 else ""
+    next_char = text[index + 1] if index + 1 < len(text) else ""
+
+    if previous_char.isdigit() and next_char.isdigit():
+        return False
+
+    if previous_char.isalnum() and next_char.isalnum():
+        return False
+
+    dot_token = _dot_token(text, index)
+
+    if dot_token.lower() in DOT_ABBREVIATIONS:
+        return False
+
+    if len(dot_token) == 2 and dot_token[0].isupper():
+        return False
+
+    if _is_dotted_initialism(dot_token):
+        return False
+
+    return True
+
+
+def _is_dotted_initialism(token: str) -> bool:
+    parts = token.split(".")
+    initials = [part for part in parts if part]
+    return len(initials) >= 2 and all(len(part) == 1 and part.isupper() for part in initials)
+
+
+def _dot_token(text: str, index: int) -> str:
+    start = index
+    while start > 0 and (text[start - 1].isalpha() or text[start - 1] == "."):
+        start -= 1
+    return text[start : index + 1]
 
 
 @app.get("/health", response_model=ASRHealthResponse)
@@ -82,6 +198,7 @@ def transcribe_stream_info() -> TranscribeStreamInfoResponse:
         server_messages=[
             {"type": "ready"},
             {"type": "partial", "text": "..."},
+            {"type": "sentence_final", "text": "..."},
             {"type": "final", "text": "..."},
             {"type": "error", "message": "..."},
         ],
@@ -121,7 +238,7 @@ async def transcribe_stream(websocket: WebSocket) -> None:
     language = start_payload.get("language")
     min_chunk_bytes = max(1, int(sample_rate * 2 * current_settings.asr_stream_chunk_seconds))
     buffer = bytearray()
-    segments: list[str] = []
+    committer = SentenceCommitter()
     await websocket.send_json({"type": "ready"})
 
     try:
@@ -133,16 +250,15 @@ async def transcribe_stream(websocket: WebSocket) -> None:
                     segment_text = _transcribe_pcm_chunk(bytes(buffer), sample_rate, language)
                     buffer.clear()
                     if segment_text:
-                        segments.append(segment_text)
-                        await websocket.send_json({"type": "partial", "text": " ".join(segments)})
+                        await _send_committed_and_partial(websocket, committer, segment_text)
             elif "text" in message and message["text"] is not None:
                 payload = json.loads(message["text"])
                 if payload.get("type") == "end":
                     if buffer:
                         segment_text = _transcribe_pcm_chunk(bytes(buffer), sample_rate, language)
                         if segment_text:
-                            segments.append(segment_text)
-                    await websocket.send_json({"type": "final", "text": " ".join(segments)})
+                            await _send_committed_and_partial(websocket, committer, segment_text)
+                    await websocket.send_json({"type": "final", "text": committer.pending_text})
                     await websocket.close(code=1000)
                     return
                 if payload.get("type") == "segment":
@@ -151,6 +267,17 @@ async def transcribe_stream(websocket: WebSocket) -> None:
                 return
     except WebSocketDisconnect:
         return
+
+
+async def _send_committed_and_partial(
+    websocket: WebSocket,
+    committer: SentenceCommitter,
+    text: str,
+) -> None:
+    for sentence in committer.append(text):
+        await websocket.send_json({"type": "sentence_final", "text": sentence})
+    if committer.pending_text:
+        await websocket.send_json({"type": "partial", "text": committer.pending_text})
 
 
 def _transcribe_pcm_chunk(pcm_bytes: bytes, sample_rate: int, language: str | None) -> str:

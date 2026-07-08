@@ -224,6 +224,19 @@ Server partial response:
 }
 ```
 
+`partial` is unconfirmed streaming text and may be replaced by later `partial` messages. It only contains the current uncommitted tail, not previously committed sentences.
+
+Server committed sentence response:
+
+```json
+{
+  "type": "sentence_final",
+  "text": "今天我们来介绍这个产品。"
+}
+```
+
+`sentence_final` text is confirmed and will not change. Clients should append every `sentence_final` in order, then display the latest `partial` after that confirmed prefix.
+
 End the stream:
 
 ```json
@@ -247,9 +260,11 @@ Server final response:
 ```json
 {
   "type": "final",
-  "text": "今天我们来介绍这个产品。"
+  "text": "剩余未确句文本"
 }
 ```
+
+`final` is sent only after `end` and contains the remaining uncommitted text. It does not repeat text already delivered by `sentence_final`. The completed transcript is all `sentence_final` messages in order plus the `final` text.
 
 Test client:
 
