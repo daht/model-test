@@ -171,6 +171,13 @@ cd /opt/model-test
 scripts/update_service.sh
 ```
 
+Update both translation and ASR services:
+
+```bash
+cd /opt/model-test
+scripts/update_all_services.sh
+```
+
 By default, update directly from the official GitHub remote:
 
 ```bash
