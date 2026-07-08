@@ -129,6 +129,26 @@ ASR WebSocket endpoint:
 ws://your-server-ip:8002/v1/transcribe/stream
 ```
 
+Test WebSocket streaming from the server:
+
+```bash
+API_KEY=your-api-key \
+python3 scripts/stream_asr_client.py /path/to/audio.wav \
+  --url ws://127.0.0.1:8002/v1/transcribe/stream \
+  --language zh \
+  --realtime
+```
+
+Test from your own machine by changing the URL:
+
+```bash
+API_KEY=your-api-key \
+python3 scripts/stream_asr_client.py /path/to/audio.wav \
+  --url ws://your-server-ip:8002/v1/transcribe/stream \
+  --language zh \
+  --realtime
+```
+
 ## 6. Operations
 
 ```bash

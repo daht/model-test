@@ -239,6 +239,18 @@ End the stream with:
 {"type":"end"}
 ```
 
+You can test the stream with the included client:
+
+```bash
+API_KEY=your-production-api-key \
+python scripts/stream_asr_client.py /path/to/audio.wav \
+  --url ws://127.0.0.1:8002/v1/transcribe/stream \
+  --language zh \
+  --realtime
+```
+
+The client converts the input audio to `16kHz mono pcm_s16le` with `ffmpeg`, sends 200ms chunks, and prints `partial` / `final` messages.
+
 ## Local Test Mode
 
 Use the mock backend when you only want to verify the API service:
