@@ -70,7 +70,7 @@ DEVICE=auto
 MAX_NEW_TOKENS=1024
 ASR_TORCH_DTYPE=bfloat16
 ASR_DEVICE=auto
-ASR_STREAM_CHUNK_SECONDS=4.0
+ASR_STREAM_CHUNK_SECONDS=2.0
 ```
 
 If the model is encoder-decoder rather than causal language model, set:

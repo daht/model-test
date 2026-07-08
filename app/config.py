@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     asr_torch_dtype: Literal["auto", "float16", "bfloat16", "float32"] = "bfloat16"
     asr_max_new_tokens: int = 512
     asr_max_upload_mb: int = 200
-    asr_stream_chunk_seconds: float = 4.0
+    asr_stream_chunk_seconds: float = 2.0
     trust_remote_code: bool = True
 
 
