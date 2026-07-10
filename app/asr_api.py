@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 
 from fastapi import Depends, FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
@@ -106,6 +107,51 @@ class SentenceCommitter:
         self.pending_text = ""
         return sentence
 
+    def commit_prefix(self, prefix: str) -> str:
+        if not prefix or not self.pending_text.startswith(prefix):
+            return ""
+        self.confirmed_texts.append(prefix)
+        self.pending_text = self.pending_text[len(prefix) :].lstrip()
+        return prefix
+
+
+@dataclass
+class StablePunctuationCommitter:
+    enabled: bool
+    stable_seconds: float
+    min_chars: int
+    min_updates: int
+    candidate: str = ""
+    candidate_since: float = 0.0
+    candidate_updates: int = 0
+
+    def observe(self, text: str, now: float) -> str | None:
+        next_candidate = _first_stable_punctuation_candidate(text, self.min_chars) if self.enabled else ""
+        if not next_candidate:
+            self.reset()
+            return None
+
+        if next_candidate != self.candidate:
+            self.candidate = next_candidate
+            self.candidate_since = now
+            self.candidate_updates = 1
+            return None
+
+        self.candidate_updates += 1
+        if self.candidate_updates < self.min_updates:
+            return None
+        if now - self.candidate_since < self.stable_seconds:
+            return None
+
+        committed = self.candidate
+        self.reset()
+        return committed
+
+    def reset(self) -> None:
+        self.candidate = ""
+        self.candidate_since = 0.0
+        self.candidate_updates = 0
+
 
 @dataclass
 class SilenceEndpointDetector:
@@ -179,6 +225,22 @@ def _split_committed_sentences(text: str) -> tuple[list[str], str]:
         index += 1
 
     return committed, text[sentence_start:]
+
+
+def _first_stable_punctuation_candidate(text: str, min_chars: int) -> str:
+    index = 0
+    while index < len(text):
+        if text[index] in SENTENCE_TERMINATORS and _is_sentence_end(text, index):
+            sentence_end = index + 1
+            while sentence_end < len(text) and text[sentence_end] in SENTENCE_CLOSERS:
+                sentence_end += 1
+            candidate = text[:sentence_end]
+            if len("".join(candidate.split())) >= min_chars:
+                return candidate
+            index = sentence_end
+            continue
+        index += 1
+    return ""
 
 
 def _is_sentence_end(text: str, index: int) -> bool:
@@ -276,6 +338,10 @@ def transcribe_stream_info(current_settings: Settings = Depends(get_settings)) -
                 "unfixed_token_num": current_settings.asr_stream_unfixed_token_num,
                 "vllm_gpu_memory_utilization": current_settings.asr_vllm_gpu_memory_utilization,
                 "vllm_max_new_tokens": current_settings.asr_vllm_max_new_tokens,
+                "stable_commit_enabled": current_settings.asr_stable_commit_enabled,
+                "stable_commit_seconds": current_settings.asr_stable_commit_seconds,
+                "stable_commit_min_chars": current_settings.asr_stable_commit_min_chars,
+                "stable_commit_min_updates": current_settings.asr_stable_commit_min_updates,
             },
         },
         start_message={
@@ -328,8 +394,13 @@ async def transcribe_stream(websocket: WebSocket) -> None:
 
     sample_rate = int(start_payload.get("sample_rate", 16000))
     language = start_payload.get("language")
+    stateful_stable_commit_enabled = (
+        current_settings.asr_stream_mode == "stateful" and current_settings.asr_stable_commit_enabled
+    )
     committer = SentenceCommitter(
-        commit_on_punctuation=current_settings.asr_commit_on_punctuation,
+        commit_on_punctuation=(
+            current_settings.asr_commit_on_punctuation and not stateful_stable_commit_enabled
+        ),
     )
     silence_detector = SilenceEndpointDetector(
         silence_seconds=current_settings.asr_vad_silence_seconds,
@@ -338,11 +409,18 @@ async def transcribe_stream(websocket: WebSocket) -> None:
 
     try:
         if current_settings.asr_stream_mode == "stateful":
+            stable_committer = StablePunctuationCommitter(
+                enabled=current_settings.asr_stable_commit_enabled,
+                stable_seconds=current_settings.asr_stable_commit_seconds,
+                min_chars=current_settings.asr_stable_commit_min_chars,
+                min_updates=current_settings.asr_stable_commit_min_updates,
+            )
             await _run_stateful_transcribe_stream(
                 websocket,
                 language,
                 sample_rate,
                 committer,
+                stable_committer,
                 silence_detector,
             )
         else:
@@ -404,6 +482,7 @@ async def _run_stateful_transcribe_stream(
     language: str | None,
     sample_rate: int,
     committer: SentenceCommitter,
+    stable_committer: StablePunctuationCommitter,
     silence_detector: SilenceEndpointDetector,
 ) -> None:
     if sample_rate != 16000:
@@ -429,22 +508,52 @@ async def _run_stateful_transcribe_stream(
         if "bytes" in message and message["bytes"] is not None:
             pcm_bytes = message["bytes"]
             result = session.add_pcm_s16le(pcm_bytes, sample_rate)
-            await _send_committed_and_partial(websocket, committer, result.text, cumulative=True)
+            if stable_committer.enabled:
+                await _send_stateful_update(websocket, committer, stable_committer, result.text)
+            else:
+                await _send_committed_and_partial(websocket, committer, result.text, cumulative=True)
             if silence_detector.add_audio(pcm_bytes, sample_rate):
                 await _send_pending_commit(websocket, committer)
+                stable_committer.reset()
         elif "text" in message and message["text"] is not None:
             payload = json.loads(message["text"])
             if payload.get("type") == "end":
                 result = session.finish()
-                await _send_committed_and_partial(websocket, committer, result.text, cumulative=True)
+                if stable_committer.enabled:
+                    await _send_stateful_update(websocket, committer, stable_committer, result.text)
+                else:
+                    await _send_committed_and_partial(websocket, committer, result.text, cumulative=True)
                 await websocket.send_json({"type": "final", "text": committer.pending_text})
                 await websocket.close(code=1000)
                 return
             if payload.get("type") == "segment":
                 session.reset_segment()
                 silence_detector.reset()
+                stable_committer.reset()
         elif message.get("type") == "websocket.disconnect":
             return
+
+
+async def _send_stateful_update(
+    websocket: WebSocket,
+    committer: SentenceCommitter,
+    stable_committer: StablePunctuationCommitter,
+    text: str,
+) -> None:
+    previous_pending = committer.pending_text
+    committer.append_cumulative(text)
+    stable_prefix = stable_committer.observe(committer.pending_text, now=time.monotonic())
+
+    if stable_prefix:
+        sentence = committer.commit_prefix(stable_prefix)
+        if sentence:
+            await websocket.send_json({"type": "sentence_final", "text": sentence})
+
+    if committer.pending_text != previous_pending or stable_prefix:
+        if committer.pending_text:
+            await websocket.send_json({"type": "partial", "text": committer.pending_text})
+        elif not stable_prefix and previous_pending:
+            await websocket.send_json({"type": "partial", "text": ""})
 
 
 async def _send_committed_and_partial(

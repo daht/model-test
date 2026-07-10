@@ -86,6 +86,11 @@ ASR_VLLM_GPU_MEMORY_UTILIZATION=0.8
 ASR_VLLM_MAX_NEW_TOKENS=32
 ASR_STREAM_UNFIXED_CHUNK_NUM=2
 ASR_STREAM_UNFIXED_TOKEN_NUM=5
+ASR_VAD_SILENCE_SECONDS=0.8
+ASR_STABLE_COMMIT_ENABLED=true
+ASR_STABLE_COMMIT_SECONDS=1.0
+ASR_STABLE_COMMIT_MIN_CHARS=8
+ASR_STABLE_COMMIT_MIN_UPDATES=2
 TTS_BACKEND=cosyvoice
 TTS_MODEL_ID=/models/CosyVoice
 TTS_COSYVOICE_REPO=/opt/CosyVoice
@@ -156,6 +161,8 @@ ASR WebSocket endpoint:
 ws://your-server-ip:8002/v1/transcribe/stream
 ```
 
+Stateful `partial` text is immediately replaceable. A punctuated prefix becomes `sentence_final` only after the exact prefix remains stable for 1.0 second and at least two updates, with a minimum of 8 non-whitespace characters. The A10 configuration uses 0.8 seconds of VAD silence as the fallback force-commit path.
+
 Test WebSocket streaming from the server:
 
 ```bash
@@ -183,7 +190,12 @@ python3 scripts/stream_asr_client.py /path/to/audio.wav \
 Check the deployed ASR mode during smoke tests:
 
 ```bash
-API_KEY=your-api-key EXPECT_ASR_STREAM_MODE=stateful EXPECT_ASR_BACKEND=qwen_vllm BASE_URL=http://127.0.0.1:8002 scripts/smoke_asr.sh
+API_KEY=your-api-key \
+EXPECT_ASR_STREAM_MODE=stateful \
+EXPECT_ASR_BACKEND=qwen_vllm \
+EXPECT_ASR_STABLE_COMMIT_ENABLED=true \
+BASE_URL=http://127.0.0.1:8002 \
+scripts/smoke_asr.sh
 ```
 
 TTS HTTP endpoint:

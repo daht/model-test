@@ -93,6 +93,11 @@ ASR_VLLM_GPU_MEMORY_UTILIZATION=0.8
 ASR_VLLM_MAX_NEW_TOKENS=32
 ASR_STREAM_UNFIXED_CHUNK_NUM=2
 ASR_STREAM_UNFIXED_TOKEN_NUM=5
+ASR_VAD_SILENCE_SECONDS=0.8
+ASR_STABLE_COMMIT_ENABLED=true
+ASR_STABLE_COMMIT_SECONDS=1.0
+ASR_STABLE_COMMIT_MIN_CHARS=8
+ASR_STABLE_COMMIT_MIN_UPDATES=2
 TTS_MODEL_ID=/models/CosyVoice
 TTS_BACKEND=cosyvoice
 TTS_COSYVOICE_REPO=/opt/CosyVoice
@@ -295,7 +300,7 @@ Then the client sends binary PCM chunks. The server returns:
 {"type":"final","text":"..."}
 ```
 
-`partial` is the current unconfirmed streaming text and may change. It may include model-generated punctuation, but that punctuation is not confirmed by default. `sentence_final` is committed text and will not be sent again or changed by later messages. By default, `sentence_final` is triggered when the server detects `ASR_VAD_SILENCE_SECONDS` of continuous silence in the PCM stream, with a default of `1.5` seconds. Set `ASR_COMMIT_ON_PUNCTUATION=true` to restore the older behavior that commits when the unconfirmed text reaches sentence-ending punctuation. Later `partial` messages only contain the uncommitted tail after the latest committed text. On `end`, `final` contains only the remaining uncommitted text, so clients should render:
+`partial` is the current unconfirmed streaming text and is replaceable immediately, including revisions that add or remove model-generated punctuation. In stateful mode, stable punctuation confirmation is enabled by default: the earliest punctuated prefix with at least 8 non-whitespace characters becomes `sentence_final` only after the exact prefix remains unchanged for 1.0 second and at least two updates. VAD remains the fallback and force-commits pending text after `ASR_VAD_SILENCE_SECONDS` of continuous silence. `sentence_final` will not be sent again or changed by later messages, and a following `partial` contains only the remaining uncommitted tail. Set `ASR_STABLE_COMMIT_ENABLED=false` to disable stable confirmation; stateful mode then honors the legacy `ASR_COMMIT_ON_PUNCTUATION` setting. On `end`, `final` contains only the remaining uncommitted text, so clients should render:
 
 ```text
 display_text = all sentence_final text in order + latest partial or final tail
@@ -343,6 +348,11 @@ ASR_VLLM_GPU_MEMORY_UTILIZATION=0.8
 ASR_VLLM_MAX_NEW_TOKENS=32
 ASR_STREAM_UNFIXED_CHUNK_NUM=2
 ASR_STREAM_UNFIXED_TOKEN_NUM=5
+ASR_VAD_SILENCE_SECONDS=0.8
+ASR_STABLE_COMMIT_ENABLED=true
+ASR_STABLE_COMMIT_SECONDS=1.0
+ASR_STABLE_COMMIT_MIN_CHARS=8
+ASR_STABLE_COMMIT_MIN_UPDATES=2
 SERVICE=qwen-asr-api BASE_URL=http://127.0.0.1:8002 scripts/update_service.sh build
 ```
 
@@ -352,6 +362,7 @@ Smoke-test the expected ASR mode:
 API_KEY=your-production-api-key \
 EXPECT_ASR_STREAM_MODE=stateful \
 EXPECT_ASR_BACKEND=qwen_vllm \
+EXPECT_ASR_STABLE_COMMIT_ENABLED=true \
 BASE_URL=http://127.0.0.1:8002 \
 scripts/smoke_asr.sh
 ```

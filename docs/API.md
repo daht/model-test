@@ -217,8 +217,9 @@ sample_rate: 16000
 channels:    1
 format:      pcm_s16le
 chunk size:  100ms to 500ms recommended
-VAD commit:  1.5s continuous silence by default
-punctuation commit: disabled by default; set ASR_COMMIT_ON_PUNCTUATION=true to enable
+VAD commit:  1.5s continuous silence by default; the A10 stateful example uses 0.8s
+stable punctuation commit: enabled for stateful mode; 1.0s, 2 updates, 8 non-whitespace characters
+legacy punctuation commit: set ASR_STABLE_COMMIT_ENABLED=false, then use ASR_COMMIT_ON_PUNCTUATION
 ```
 
 Production stateful qwen vLLM mode:
@@ -231,6 +232,11 @@ ASR_VLLM_GPU_MEMORY_UTILIZATION=0.8
 ASR_VLLM_MAX_NEW_TOKENS=32
 ASR_STREAM_UNFIXED_CHUNK_NUM=2
 ASR_STREAM_UNFIXED_TOKEN_NUM=5
+ASR_VAD_SILENCE_SECONDS=0.8
+ASR_STABLE_COMMIT_ENABLED=true
+ASR_STABLE_COMMIT_SECONDS=1.0
+ASR_STABLE_COMMIT_MIN_CHARS=8
+ASR_STABLE_COMMIT_MIN_UPDATES=2
 SERVICE=qwen-asr-api BASE_URL=http://127.0.0.1:8002 scripts/update_service.sh build
 ```
 
@@ -267,7 +273,7 @@ Server partial response:
 }
 ```
 
-`partial` is unconfirmed streaming text and may be replaced by later `partial` messages. It may include model-generated punctuation, but punctuation is not confirmed by default. It only contains the current uncommitted tail, not previously committed text.
+`partial` is unconfirmed streaming text and may be replaced immediately by later `partial` messages, including revisions that add or remove punctuation. It only contains the current uncommitted tail, not previously committed text.
 
 Server committed sentence response:
 
@@ -278,7 +284,7 @@ Server committed sentence response:
 }
 ```
 
-`sentence_final` text is confirmed and will not change. By default, it is sent when the server detects `ASR_VAD_SILENCE_SECONDS` of continuous silence in the PCM stream, with a default of `1.5` seconds. Set `ASR_COMMIT_ON_PUNCTUATION=true` to restore the older behavior that commits when the unconfirmed text reaches sentence-ending punctuation. Clients should append every `sentence_final` in order, then display the latest `partial` after that confirmed prefix.
+`sentence_final` text is confirmed and will not change. In stateful mode, the server confirms the earliest punctuated prefix with at least `ASR_STABLE_COMMIT_MIN_CHARS` non-whitespace characters after that exact prefix remains unchanged for `ASR_STABLE_COMMIT_SECONDS` and at least `ASR_STABLE_COMMIT_MIN_UPDATES` updates. The defaults are 8 characters, 1.0 second, and two updates. VAD remains a fallback and force-commits pending text after `ASR_VAD_SILENCE_SECONDS` of continuous silence. Set `ASR_STABLE_COMMIT_ENABLED=false` to disable stable confirmation; stateful mode then preserves the legacy `ASR_COMMIT_ON_PUNCTUATION` behavior. Clients should append every `sentence_final` in order, then display the latest replaceable `partial` tail after that confirmed prefix.
 
 End the stream:
 
@@ -296,7 +302,7 @@ Clear the pending server audio buffer without closing the connection:
 }
 ```
 
-Use `segment` during long-running listening when the client wants to discard pending server audio without closing the socket. `segment` is not a commit command; by default, sentence confirmation is triggered by the server's silence detector.
+Use `segment` during long-running listening when the client wants to discard pending server audio without closing the socket. `segment` is not a commit command; it resets the stateful punctuation tracker and silence detector.
 
 Server final response:
 
@@ -321,7 +327,7 @@ python3 scripts/stream_asr_client.py /path/to/audio.wav \
   --realtime
 ```
 
-`--print-mode display` renders the client-visible transcript as all confirmed `sentence_final` text plus the latest replaceable `partial` or `final` tail. For deployment smoke checks, set `EXPECT_ASR_STREAM_MODE=stateful` and `EXPECT_ASR_BACKEND=qwen_vllm` when running `scripts/smoke_asr.sh`.
+`--print-mode display` renders the client-visible transcript as all confirmed `sentence_final` text plus the latest replaceable `partial` or `final` tail. For deployment smoke checks, set `EXPECT_ASR_STREAM_MODE=stateful`, `EXPECT_ASR_BACKEND=qwen_vllm`, and `EXPECT_ASR_STABLE_COMMIT_ENABLED=true` when running `scripts/smoke_asr.sh`.
 
 ## TTS Synthesis
 

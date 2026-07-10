@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     asr_vad_silence_seconds: float = 1.5
     asr_vad_rms_threshold: int = 200
     asr_commit_on_punctuation: bool = False
+    asr_stable_commit_enabled: bool = True
+    asr_stable_commit_seconds: float = 1.0
+    asr_stable_commit_min_chars: int = 8
+    asr_stable_commit_min_updates: int = 2
     tts_model_name: str = "CosyVoice"
     tts_backend: Literal["mock", "cosyvoice"] = "mock"
     tts_model_id: str = "/models/CosyVoice"

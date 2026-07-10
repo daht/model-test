@@ -40,6 +40,12 @@ def _pcm_s16le_samples(value: int, sample_count: int) -> bytes:
     return int(value).to_bytes(2, byteorder="little", signed=True) * sample_count
 
 
+def _monotonic_values(monkeypatch, values):
+    iterator = iter(values)
+    clock = type("Clock", (), {"monotonic": staticmethod(lambda: next(iterator))})
+    monkeypatch.setattr(asr_api, "time", clock, raising=False)
+
+
 class FakeStreamingSession:
     def __init__(self, updates, final_text="hello world"):
         self.updates = iter(updates)
@@ -79,6 +85,20 @@ class RaisingStatefulTranscriber:
     def create_streaming_session(self, language=None):
         self.language = language
         raise self.exc
+
+
+class RecordingStableCommitter:
+    def __init__(self):
+        self.enabled = True
+        self.observations = []
+        self.reset_count = 0
+
+    def observe(self, text, now):
+        self.observations.append((text, now))
+        return None
+
+    def reset(self):
+        self.reset_count += 1
 
 
 def test_asr_health_reports_model_name():
@@ -159,6 +179,10 @@ def test_stream_info_reports_streaming_mode_and_stateful_settings(monkeypatch):
     monkeypatch.setenv("ASR_STREAM_UNFIXED_TOKEN_NUM", "5")
     monkeypatch.setenv("ASR_VLLM_GPU_MEMORY_UTILIZATION", "0.8")
     monkeypatch.setenv("ASR_VLLM_MAX_NEW_TOKENS", "32")
+    monkeypatch.setenv("ASR_STABLE_COMMIT_ENABLED", "true")
+    monkeypatch.setenv("ASR_STABLE_COMMIT_SECONDS", "1.0")
+    monkeypatch.setenv("ASR_STABLE_COMMIT_MIN_CHARS", "8")
+    monkeypatch.setenv("ASR_STABLE_COMMIT_MIN_UPDATES", "2")
 
     try:
         response = client.get("/v1/transcribe/stream-info")
@@ -176,6 +200,10 @@ def test_stream_info_reports_streaming_mode_and_stateful_settings(monkeypatch):
     assert body["audio_format"]["stateful"]["unfixed_token_num"] == 5
     assert body["audio_format"]["stateful"]["vllm_gpu_memory_utilization"] == 0.8
     assert body["audio_format"]["stateful"]["vllm_max_new_tokens"] == 32
+    assert body["audio_format"]["stateful"]["stable_commit_enabled"] is True
+    assert body["audio_format"]["stateful"]["stable_commit_seconds"] == 1.0
+    assert body["audio_format"]["stateful"]["stable_commit_min_chars"] == 8
+    assert body["audio_format"]["stateful"]["stable_commit_min_updates"] == 2
 
 
 def test_qwen_vllm_backend_can_be_selected():
@@ -390,6 +418,140 @@ def test_stateful_stream_replaces_revised_partial_text(monkeypatch):
             assert websocket.receive_json() == {"type": "partial", "text": "可以到店。"}
             websocket.send_bytes(_pcm_s16le_samples(1000, 160))
             assert websocket.receive_json() == {"type": "partial", "text": "可以到店使用"}
+    finally:
+        asr_api.get_settings.cache_clear()
+
+
+def test_stateful_stream_commits_stable_punctuation_and_keeps_tail(monkeypatch):
+    asr_api.get_settings.cache_clear()
+    monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
+    monkeypatch.setenv("ASR_STABLE_COMMIT_SECONDS", "1.0")
+    monkeypatch.setenv("ASR_STABLE_COMMIT_MIN_UPDATES", "2")
+    session = FakeStreamingSession(
+        [
+            "这是一个足够长的稳定句子。后续",
+            "这是一个足够长的稳定句子。后续文本",
+            "这是一个足够长的稳定句子。后续文本继续",
+        ]
+    )
+    monkeypatch.setattr(asr_api, "asr_transcriber", FakeStatefulTranscriber(session))
+    _monotonic_values(monkeypatch, [0.0, 1.0, 2.0])
+
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            _start_stream(websocket)
+            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
+            assert websocket.receive_json() == {
+                "type": "partial",
+                "text": "这是一个足够长的稳定句子。后续",
+            }
+            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
+            assert websocket.receive_json() == {
+                "type": "sentence_final",
+                "text": "这是一个足够长的稳定句子。",
+            }
+            assert websocket.receive_json() == {"type": "partial", "text": "后续文本"}
+            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
+            assert websocket.receive_json() == {"type": "partial", "text": "后续文本继续"}
+    finally:
+        asr_api.get_settings.cache_clear()
+
+
+def test_stateful_stream_does_not_commit_transient_short_punctuation(monkeypatch):
+    asr_api.get_settings.cache_clear()
+    monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
+    session = FakeStreamingSession(["肯德基。", "肯德基双人餐八件套兑换券。"])
+    monkeypatch.setattr(asr_api, "asr_transcriber", FakeStatefulTranscriber(session))
+    _monotonic_values(monkeypatch, [0.0, 2.0])
+
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            _start_stream(websocket)
+            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
+            assert websocket.receive_json() == {"type": "partial", "text": "肯德基。"}
+            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
+            assert websocket.receive_json() == {
+                "type": "partial",
+                "text": "肯德基双人餐八件套兑换券。",
+            }
+    finally:
+        asr_api.get_settings.cache_clear()
+
+
+def test_stateful_stream_vad_commit_resets_stable_tracker(monkeypatch):
+    asr_api.get_settings.cache_clear()
+    monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
+    tracker = RecordingStableCommitter()
+    session = FakeStreamingSession(["hello", "hello"])
+    monkeypatch.setattr(asr_api, "StablePunctuationCommitter", lambda **_kwargs: tracker)
+    monkeypatch.setattr(asr_api, "asr_transcriber", FakeStatefulTranscriber(session))
+    _monotonic_values(monkeypatch, [0.0, 0.5])
+
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            _start_stream(websocket)
+            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
+            assert websocket.receive_json() == {"type": "partial", "text": "hello"}
+            websocket.send_bytes(_pcm_s16le_samples(0, 24000))
+            assert websocket.receive_json() == {"type": "sentence_final", "text": "hello"}
+            assert tracker.reset_count == 1
+    finally:
+        asr_api.get_settings.cache_clear()
+
+
+def test_stateful_stream_segment_resets_stable_tracker(monkeypatch):
+    asr_api.get_settings.cache_clear()
+    monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
+    tracker = RecordingStableCommitter()
+    session = FakeStreamingSession([], final_text="")
+    monkeypatch.setattr(asr_api, "StablePunctuationCommitter", lambda **_kwargs: tracker)
+    monkeypatch.setattr(asr_api, "asr_transcriber", FakeStatefulTranscriber(session))
+    _monotonic_values(monkeypatch, [0.0])
+
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            _start_stream(websocket)
+            websocket.send_json({"type": "segment"})
+            websocket.send_json({"type": "end"})
+            assert websocket.receive_json() == {"type": "final", "text": ""}
+            assert session.segment_reset is True
+            assert tracker.reset_count == 1
+    finally:
+        asr_api.get_settings.cache_clear()
+
+
+def test_stateful_stream_stable_commit_blocks_legacy_immediate_punctuation(monkeypatch):
+    asr_api.get_settings.cache_clear()
+    monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
+    monkeypatch.setenv("ASR_COMMIT_ON_PUNCTUATION", "true")
+    monkeypatch.setenv("ASR_STABLE_COMMIT_ENABLED", "true")
+    session = FakeStreamingSession(["这是一个足够长的句子。"])
+    monkeypatch.setattr(asr_api, "asr_transcriber", FakeStatefulTranscriber(session))
+    _monotonic_values(monkeypatch, [0.0])
+
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            _start_stream(websocket)
+            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
+            assert websocket.receive_json() == {"type": "partial", "text": "这是一个足够长的句子。"}
+    finally:
+        asr_api.get_settings.cache_clear()
+
+
+def test_stateful_stream_stable_commit_disabled_preserves_legacy_punctuation(monkeypatch):
+    asr_api.get_settings.cache_clear()
+    monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
+    monkeypatch.setenv("ASR_COMMIT_ON_PUNCTUATION", "true")
+    monkeypatch.setenv("ASR_STABLE_COMMIT_ENABLED", "false")
+    session = FakeStreamingSession(["你好。"])
+    monkeypatch.setattr(asr_api, "asr_transcriber", FakeStatefulTranscriber(session))
+    _monotonic_values(monkeypatch, [0.0])
+
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            _start_stream(websocket)
+            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
+            assert websocket.receive_json() == {"type": "sentence_final", "text": "你好。"}
     finally:
         asr_api.get_settings.cache_clear()
 
@@ -724,6 +886,81 @@ def test_sentence_committer_includes_closing_quotes_in_committed_sentence():
 
     assert committed == ["他说“你好。”"]
     assert committer.pending_text == "后续"
+
+
+def test_sentence_committer_commit_prefix_preserves_pending_tail():
+    committer = asr_api.SentenceCommitter(pending_text="这是一个足够长的稳定句子。 后续文本")
+
+    committed = committer.commit_prefix("这是一个足够长的稳定句子。")
+
+    assert committed == "这是一个足够长的稳定句子。"
+    assert committer.confirmed_texts == ["这是一个足够长的稳定句子。"]
+    assert committer.pending_text == "后续文本"
+
+
+def test_stable_punctuation_rejects_short_transient_candidate():
+    tracker = asr_api.StablePunctuationCommitter(
+        enabled=True,
+        stable_seconds=1.0,
+        min_chars=8,
+        min_updates=2,
+    )
+
+    assert tracker.observe("肯德基。", now=0.0) is None
+    assert tracker.observe("肯德基。", now=2.0) is None
+
+
+def test_stable_punctuation_commits_after_time_and_update_thresholds():
+    tracker = asr_api.StablePunctuationCommitter(True, 1.0, 8, 2)
+    text = "肯德基双人餐八件套兑换券，限时优惠。仅需七十九元"
+
+    assert tracker.observe(text, now=0.0) is None
+    assert tracker.observe(text, now=0.5) is None
+    assert tracker.observe(text, now=1.0) == "肯德基双人餐八件套兑换券，限时优惠。"
+
+
+def test_stable_punctuation_revision_resets_candidate_timer():
+    tracker = asr_api.StablePunctuationCommitter(True, 1.0, 8, 2)
+
+    assert tracker.observe("这是第一版稳定候选。后续", now=0.0) is None
+    assert tracker.observe("这是修订后的稳定候选。后续", now=1.0) is None
+    assert tracker.observe("这是修订后的稳定候选。后续", now=1.5) is None
+    assert tracker.observe("这是修订后的稳定候选。后续", now=2.0) == "这是修订后的稳定候选。"
+
+
+def test_stable_punctuation_reset_discards_candidate():
+    tracker = asr_api.StablePunctuationCommitter(True, 1.0, 8, 2)
+    text = "这是一个足够长的候选句子。后续"
+
+    assert tracker.observe(text, now=0.0) is None
+    tracker.reset()
+    assert tracker.observe(text, now=2.0) is None
+
+
+def test_stable_punctuation_disappearing_candidate_resets_timer():
+    tracker = asr_api.StablePunctuationCommitter(True, 1.0, 8, 2)
+    text = "这是一个足够长的候选句子。后续"
+
+    assert tracker.observe(text, now=0.0) is None
+    assert tracker.observe("这是一个没有标点的修订", now=0.5) is None
+    assert tracker.observe(text, now=2.0) is None
+
+
+def test_stable_punctuation_empty_text_resets_timer():
+    tracker = asr_api.StablePunctuationCommitter(True, 1.0, 8, 2)
+    text = "这是一个足够长的候选句子。后续"
+
+    assert tracker.observe(text, now=0.0) is None
+    assert tracker.observe("", now=0.5) is None
+    assert tracker.observe(text, now=2.0) is None
+
+
+def test_stable_punctuation_candidate_is_exact_pending_prefix():
+    tracker = asr_api.StablePunctuationCommitter(True, 1.0, 8, 2)
+    text = " 这是一个足够长的候选句子。后续"
+
+    assert tracker.observe(text, now=0.0) is None
+    assert tracker.observe(text, now=1.0) == " 这是一个足够长的候选句子。"
 
 
 def test_stream_segment_clears_pending_audio_buffer():

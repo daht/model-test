@@ -18,12 +18,14 @@ echo
 EXPECT_ASR_STREAM_MODE="${EXPECT_ASR_STREAM_MODE:-}"
 EXPECT_ASR_BACKEND="${EXPECT_ASR_BACKEND:-}"
 EXPECT_ASR_COMMIT_ON_PUNCTUATION="${EXPECT_ASR_COMMIT_ON_PUNCTUATION:-}"
+EXPECT_ASR_STABLE_COMMIT_ENABLED="${EXPECT_ASR_STABLE_COMMIT_ENABLED:-}"
 
-if [[ -n "${EXPECT_ASR_STREAM_MODE}${EXPECT_ASR_BACKEND}${EXPECT_ASR_COMMIT_ON_PUNCTUATION}" ]]; then
+if [[ -n "${EXPECT_ASR_STREAM_MODE}${EXPECT_ASR_BACKEND}${EXPECT_ASR_COMMIT_ON_PUNCTUATION}${EXPECT_ASR_STABLE_COMMIT_ENABLED}" ]]; then
   STREAM_INFO_JSON="${stream_info}" \
   EXPECT_ASR_STREAM_MODE="${EXPECT_ASR_STREAM_MODE}" \
   EXPECT_ASR_BACKEND="${EXPECT_ASR_BACKEND}" \
   EXPECT_ASR_COMMIT_ON_PUNCTUATION="${EXPECT_ASR_COMMIT_ON_PUNCTUATION}" \
+  EXPECT_ASR_STABLE_COMMIT_ENABLED="${EXPECT_ASR_STABLE_COMMIT_ENABLED}" \
   python3 - <<'PY'
 import json
 import os
@@ -45,6 +47,18 @@ for env_name, key in checks.items():
         expected = expected.lower()
     if str(actual) != expected:
         raise SystemExit(f"{key} expected {expected!r}, got {actual!r}")
+
+expected_stable_commit = os.environ.get("EXPECT_ASR_STABLE_COMMIT_ENABLED", "")
+if expected_stable_commit:
+    actual_stable_commit = audio.get("stateful", {}).get("stable_commit_enabled")
+    if isinstance(actual_stable_commit, bool):
+        actual_stable_commit = str(actual_stable_commit).lower()
+        expected_stable_commit = expected_stable_commit.lower()
+    if str(actual_stable_commit) != expected_stable_commit:
+        raise SystemExit(
+            "stateful.stable_commit_enabled "
+            f"expected {expected_stable_commit!r}, got {actual_stable_commit!r}"
+        )
 PY
 fi
 
