@@ -264,6 +264,26 @@ def test_stateful_stream_returns_replaceable_partial(monkeypatch):
         asr_api.get_settings.cache_clear()
 
 
+def test_stateful_stream_replaces_revised_partial_text(monkeypatch):
+    asr_api.get_settings.cache_clear()
+    monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
+    monkeypatch.setattr(
+        asr_api,
+        "asr_transcriber",
+        FakeStatefulTranscriber(FakeStreamingSession(["可以到店。", "可以到店使用"])),
+    )
+
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            _start_stream(websocket)
+            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
+            assert websocket.receive_json() == {"type": "partial", "text": "可以到店。"}
+            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
+            assert websocket.receive_json() == {"type": "partial", "text": "可以到店使用"}
+    finally:
+        asr_api.get_settings.cache_clear()
+
+
 def test_stateful_stream_vad_commit_excludes_confirmed_prefix(monkeypatch):
     asr_api.get_settings.cache_clear()
     monkeypatch.setenv("ASR_STREAM_MODE", "stateful")

@@ -54,6 +54,16 @@ class SentenceCommitter:
             return []
 
         self.pending_text = self._merge_recognition_text(text)
+        return self._commit_complete_sentences()
+
+    def append_cumulative(self, text: str) -> list[str]:
+        if not text:
+            return []
+
+        self.pending_text = self._tail_after_confirmed_text(text)
+        return self._commit_complete_sentences()
+
+    def _commit_complete_sentences(self) -> list[str]:
         if not self.commit_on_punctuation:
             return []
 
@@ -75,6 +85,22 @@ class SentenceCommitter:
             return text
 
         return self.pending_text + text
+
+    def _tail_after_confirmed_text(self, text: str) -> str:
+        confirmed_text = "".join(self.confirmed_texts)
+        if not confirmed_text:
+            return text
+
+        if text.startswith(confirmed_text):
+            return text[len(confirmed_text) :]
+
+        overlap = min(len(confirmed_text), len(text))
+        while overlap > 0:
+            if confirmed_text.endswith(text[:overlap]):
+                return text[overlap:]
+            overlap -= 1
+
+        return text
 
     def commit_pending(self) -> str:
         sentence = self.pending_text.rstrip()
@@ -402,7 +428,7 @@ async def _run_stateful_transcribe_stream(
             pcm_bytes = message["bytes"]
             result = session.add_pcm_s16le(pcm_bytes, sample_rate)
             if result.text:
-                await _send_committed_and_partial(websocket, committer, result.text)
+                await _send_committed_and_partial(websocket, committer, result.text, cumulative=True)
             if silence_detector.add_audio(pcm_bytes, sample_rate):
                 await _send_pending_commit(websocket, committer)
         elif "text" in message and message["text"] is not None:
@@ -410,7 +436,7 @@ async def _run_stateful_transcribe_stream(
             if payload.get("type") == "end":
                 result = session.finish()
                 if result.text:
-                    await _send_committed_and_partial(websocket, committer, result.text)
+                    await _send_committed_and_partial(websocket, committer, result.text, cumulative=True)
                 await websocket.send_json({"type": "final", "text": committer.pending_text})
                 await websocket.close(code=1000)
                 return
@@ -424,9 +450,12 @@ async def _send_committed_and_partial(
     websocket: WebSocket,
     committer: SentenceCommitter,
     text: str,
+    *,
+    cumulative: bool = False,
 ) -> None:
     previous_pending = committer.pending_text
-    for sentence in committer.append(text):
+    append = committer.append_cumulative if cumulative else committer.append
+    for sentence in append(text):
         await websocket.send_json({"type": "sentence_final", "text": sentence})
     if committer.pending_text and committer.pending_text != previous_pending:
         await websocket.send_json({"type": "partial", "text": committer.pending_text})
