@@ -72,7 +72,7 @@ Response:
 {
   "status": "ok",
   "model": "Qwen3-ASR-1.7B",
-  "backend": "qwen"
+  "backend": "qwen_vllm"
 }
 ```
 
@@ -204,6 +204,12 @@ Use this endpoint for near-real-time transcription.
 wss://asr-api.example.com/v1/transcribe/stream
 ```
 
+Inspect the active streaming mode and stateful settings:
+
+```bash
+curl https://asr-api.example.com/v1/transcribe/stream-info
+```
+
 Audio format:
 
 ```text
@@ -214,6 +220,21 @@ chunk size:  100ms to 500ms recommended
 VAD commit:  1.5s continuous silence by default
 punctuation commit: disabled by default; set ASR_COMMIT_ON_PUNCTUATION=true to enable
 ```
+
+Production stateful qwen vLLM mode:
+
+```bash
+ASR_BACKEND=qwen_vllm
+ASR_STREAM_MODE=stateful
+ASR_STREAM_CHUNK_SECONDS=1.0
+ASR_VLLM_GPU_MEMORY_UTILIZATION=0.8
+ASR_VLLM_MAX_NEW_TOKENS=32
+ASR_STREAM_UNFIXED_CHUNK_NUM=2
+ASR_STREAM_UNFIXED_TOKEN_NUM=5
+SERVICE=qwen-asr-api BASE_URL=http://127.0.0.1:8002 scripts/update_service.sh build
+```
+
+Set `ASR_BACKEND=qwen` and `ASR_STREAM_MODE=chunked` to use the original chunked fallback.
 
 First client message must be JSON:
 
@@ -295,8 +316,12 @@ API_KEY=<your-api-key> \
 python3 scripts/stream_asr_client.py /path/to/audio.wav \
   --url wss://asr-api.example.com/v1/transcribe/stream \
   --language zh \
+  --show-stream-info \
+  --print-mode display \
   --realtime
 ```
+
+`--print-mode display` renders the client-visible transcript as all confirmed `sentence_final` text plus the latest replaceable `partial` or `final` tail. For deployment smoke checks, set `EXPECT_ASR_STREAM_MODE=stateful` and `EXPECT_ASR_BACKEND=qwen_vllm` when running `scripts/smoke_asr.sh`.
 
 ## TTS Synthesis
 

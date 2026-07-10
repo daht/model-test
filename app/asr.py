@@ -13,9 +13,26 @@ class TranscriptionResult:
     language: str | None
 
 
+@dataclass
+class StreamingTranscriptionResult:
+    text: str
+    language: str | None
+
+
+class ASRStreamingSession:
+    def add_pcm_s16le(self, pcm_bytes: bytes, sample_rate: int) -> StreamingTranscriptionResult:
+        raise NotImplementedError
+
+    def finish(self) -> StreamingTranscriptionResult:
+        raise NotImplementedError
+
+
 class ASRTranscriber:
     def transcribe(self, audio_path: str, language: str | None = None) -> TranscriptionResult:
         raise NotImplementedError
+
+    def create_streaming_session(self, language: str | None = None) -> ASRStreamingSession:
+        raise NotImplementedError("This ASR backend does not support stateful streaming")
 
 
 @dataclass
@@ -117,7 +134,110 @@ class QwenASRTranscriber(ASRTranscriber):
             return TranscriptionResult(text=text, language=language)
 
 
+class QwenVLLMStreamingSession(ASRStreamingSession):
+    def __init__(self, transcriber: "QwenVLLMASRTranscriber", language: str | None = None) -> None:
+        self.transcriber = transcriber
+        self.language = language
+        # qwen-asr owns the official ASRStreamingState object returned here.
+        self.state = transcriber._init_streaming_state(language=language)
+
+    def add_pcm_s16le(self, pcm_bytes: bytes, sample_rate: int) -> StreamingTranscriptionResult:
+        if sample_rate != 16000:
+            raise ValueError("Qwen vLLM streaming requires 16000 Hz sample_rate")
+        if not pcm_bytes:
+            return StreamingTranscriptionResult(
+                text=getattr(self.state, "text", ""),
+                language=getattr(self.state, "language", self.language),
+            )
+
+        sample_count = len(pcm_bytes) // 2
+        try:
+            import numpy as np
+
+            pcm = np.frombuffer(pcm_bytes[: sample_count * 2], dtype="<i2")
+        except ModuleNotFoundError:
+            import sys
+            from array import array
+
+            pcm = array("h")
+            pcm.frombytes(pcm_bytes[: sample_count * 2])
+            if sys.byteorder != "little":
+                pcm.byteswap()
+        state = self.transcriber._streaming_transcribe(pcm, self.state)
+        self.state = state
+        return StreamingTranscriptionResult(
+            text=getattr(state, "text", ""),
+            language=getattr(state, "language", self.language),
+        )
+
+    def finish(self) -> StreamingTranscriptionResult:
+        state = self.transcriber._finish_streaming_transcribe(self.state)
+        self.state = state
+        return StreamingTranscriptionResult(
+            text=getattr(state, "text", ""),
+            language=getattr(state, "language", self.language),
+        )
+
+
+class QwenVLLMASRTranscriber(ASRTranscriber):
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self._lock = Lock()
+        self._model = None
+
+    def _load(self) -> None:
+        if self._model is not None:
+            return
+        from qwen_asr import Qwen3ASRModel
+
+        self._model = Qwen3ASRModel.LLM(
+            model=self.settings.asr_model_id,
+            gpu_memory_utilization=self.settings.asr_vllm_gpu_memory_utilization,
+            max_new_tokens=self.settings.asr_vllm_max_new_tokens,
+        )
+
+    def transcribe(self, audio_path: str, language: str | None = None) -> TranscriptionResult:
+        with self._lock:
+            self._load()
+            assert self._model is not None
+            kwargs = {"audio": audio_path}
+            if language:
+                kwargs["language"] = language
+            results = self._model.transcribe(**kwargs)
+            result = results[0] if isinstance(results, list) else results
+            return TranscriptionResult(
+                text=getattr(result, "text", ""),
+                language=getattr(result, "language", language),
+            )
+
+    def create_streaming_session(self, language: str | None = None) -> ASRStreamingSession:
+        return QwenVLLMStreamingSession(self, language=language)
+
+    def _init_streaming_state(self, language: str | None = None):
+        with self._lock:
+            self._load()
+            assert self._model is not None
+            return self._model.init_streaming_state(
+                language=language,
+                unfixed_chunk_num=self.settings.asr_stream_unfixed_chunk_num,
+                unfixed_token_num=self.settings.asr_stream_unfixed_token_num,
+                chunk_size_sec=self.settings.asr_stream_chunk_seconds,
+            )
+
+    def _streaming_transcribe(self, pcm, state):
+        with self._lock:
+            assert self._model is not None
+            return self._model.streaming_transcribe(pcm, state)
+
+    def _finish_streaming_transcribe(self, state):
+        with self._lock:
+            assert self._model is not None
+            return self._model.finish_streaming_transcribe(state)
+
+
 def create_asr_transcriber(settings: Settings) -> ASRTranscriber:
     if settings.asr_backend == "mock":
         return MockASRTranscriber()
+    if settings.asr_backend == "qwen_vllm":
+        return QwenVLLMASRTranscriber(settings)
     return QwenASRTranscriber(settings)

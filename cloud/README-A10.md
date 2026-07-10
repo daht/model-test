@@ -79,12 +79,20 @@ DEVICE=auto
 MAX_NEW_TOKENS=1024
 ASR_TORCH_DTYPE=bfloat16
 ASR_DEVICE=auto
-ASR_STREAM_CHUNK_SECONDS=2.0
+ASR_BACKEND=qwen_vllm
+ASR_STREAM_MODE=stateful
+ASR_STREAM_CHUNK_SECONDS=1.0
+ASR_VLLM_GPU_MEMORY_UTILIZATION=0.8
+ASR_VLLM_MAX_NEW_TOKENS=32
+ASR_STREAM_UNFIXED_CHUNK_NUM=2
+ASR_STREAM_UNFIXED_TOKEN_NUM=5
 TTS_BACKEND=cosyvoice
 TTS_MODEL_ID=/models/CosyVoice
 TTS_COSYVOICE_REPO=/opt/CosyVoice
 TTS_SAMPLE_RATE=24000
 ```
+
+Use `ASR_BACKEND=qwen` and `ASR_STREAM_MODE=chunked` if you need the original chunked fallback.
 
 If the model is encoder-decoder rather than causal language model, set:
 
@@ -155,6 +163,8 @@ API_KEY=your-api-key \
 python3 scripts/stream_asr_client.py /path/to/audio.wav \
   --url ws://127.0.0.1:8002/v1/transcribe/stream \
   --language zh \
+  --show-stream-info \
+  --print-mode display \
   --realtime
 ```
 
@@ -165,7 +175,15 @@ API_KEY=your-api-key \
 python3 scripts/stream_asr_client.py /path/to/audio.wav \
   --url ws://your-server-ip:8002/v1/transcribe/stream \
   --language zh \
+  --show-stream-info \
+  --print-mode display \
   --realtime
+```
+
+Check the deployed ASR mode during smoke tests:
+
+```bash
+API_KEY=your-api-key EXPECT_ASR_STREAM_MODE=stateful EXPECT_ASR_BACKEND=qwen_vllm BASE_URL=http://127.0.0.1:8002 scripts/smoke_asr.sh
 ```
 
 TTS HTTP endpoint:
@@ -229,4 +247,10 @@ scripts/update_service.sh env
 scripts/update_service.sh restart
 scripts/update_service.sh logs
 SERVICE=qwen-asr-api BASE_URL=http://127.0.0.1:8002 scripts/update_service.sh
+```
+
+Rebuild the ASR image after vLLM dependency or Dockerfile changes:
+
+```bash
+SERVICE=qwen-asr-api BASE_URL=http://127.0.0.1:8002 scripts/update_service.sh build
 ```

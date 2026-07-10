@@ -10,6 +10,44 @@ echo "ASR health:"
 curl -fsS "${BASE_URL}/health"
 echo
 
+echo "ASR stream info:"
+stream_info="$(curl -fsS "${BASE_URL}/v1/transcribe/stream-info")"
+echo "${stream_info}"
+echo
+
+EXPECT_ASR_STREAM_MODE="${EXPECT_ASR_STREAM_MODE:-}"
+EXPECT_ASR_BACKEND="${EXPECT_ASR_BACKEND:-}"
+EXPECT_ASR_COMMIT_ON_PUNCTUATION="${EXPECT_ASR_COMMIT_ON_PUNCTUATION:-}"
+
+if [[ -n "${EXPECT_ASR_STREAM_MODE}${EXPECT_ASR_BACKEND}${EXPECT_ASR_COMMIT_ON_PUNCTUATION}" ]]; then
+  STREAM_INFO_JSON="${stream_info}" \
+  EXPECT_ASR_STREAM_MODE="${EXPECT_ASR_STREAM_MODE}" \
+  EXPECT_ASR_BACKEND="${EXPECT_ASR_BACKEND}" \
+  EXPECT_ASR_COMMIT_ON_PUNCTUATION="${EXPECT_ASR_COMMIT_ON_PUNCTUATION}" \
+  python3 - <<'PY'
+import json
+import os
+
+info = json.loads(os.environ["STREAM_INFO_JSON"])
+audio = info["audio_format"]
+checks = {
+    "EXPECT_ASR_STREAM_MODE": "stream_mode",
+    "EXPECT_ASR_BACKEND": "backend",
+    "EXPECT_ASR_COMMIT_ON_PUNCTUATION": "commit_on_punctuation",
+}
+for env_name, key in checks.items():
+    expected = os.environ.get(env_name, "")
+    if expected == "":
+        continue
+    actual = audio.get(key)
+    if isinstance(actual, bool):
+        actual = str(actual).lower()
+        expected = expected.lower()
+    if str(actual) != expected:
+        raise SystemExit(f"{key} expected {expected!r}, got {actual!r}")
+PY
+fi
+
 if [[ -z "${AUDIO_FILE}" ]]; then
   echo "AUDIO_FILE is not set; health check completed."
   echo "To test transcription: AUDIO_FILE=/path/to/audio.wav API_KEY=<key> scripts/smoke_asr.sh"

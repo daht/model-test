@@ -8,8 +8,27 @@ import os
 import subprocess
 import sys
 import time
+import urllib.request
 
 import websockets
+
+
+class DisplayState:
+    def __init__(self) -> None:
+        self.confirmed: list[str] = []
+        self.tail = ""
+
+    def apply(self, payload: dict[str, object]) -> str | None:
+        message_type = payload.get("type")
+        text = str(payload.get("text", ""))
+        if message_type == "sentence_final":
+            self.confirmed.append(text)
+            self.tail = ""
+        elif message_type in {"partial", "final"}:
+            self.tail = text
+        else:
+            return None
+        return "".join(self.confirmed) + self.tail
 
 
 def parse_args() -> argparse.Namespace:
@@ -28,12 +47,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--language", default=os.environ.get("LANGUAGE", "zh"))
     parser.add_argument("--sample-rate", type=int, default=16000)
     parser.add_argument("--chunk-ms", type=int, default=200)
+    parser.add_argument("--print-mode", choices=["events", "display"], default="events")
+    parser.add_argument("--stream-info-url", default=os.environ.get("STREAM_INFO_URL"))
+    parser.add_argument("--show-stream-info", action="store_true")
     parser.add_argument(
         "--realtime",
         action="store_true",
         help="Sleep between chunks to simulate microphone streaming.",
     )
     return parser.parse_args()
+
+
+def default_stream_info_url(ws_url: str) -> str:
+    if ws_url.startswith("wss://"):
+        base = "https://" + ws_url[len("wss://") :]
+    elif ws_url.startswith("ws://"):
+        base = "http://" + ws_url[len("ws://") :]
+    else:
+        return ws_url
+    return base.rsplit("/v1/transcribe/stream", 1)[0] + "/v1/transcribe/stream-info"
+
+
+def fetch_stream_info(url: str) -> dict[str, object]:
+    with urllib.request.urlopen(url, timeout=10) as response:
+        return json.loads(response.read().decode("utf-8"))
 
 
 def start_ffmpeg(audio_file: str, sample_rate: int) -> subprocess.Popen[bytes]:
@@ -55,7 +92,8 @@ def start_ffmpeg(audio_file: str, sample_rate: int) -> subprocess.Popen[bytes]:
     return subprocess.Popen(command, stdout=subprocess.PIPE)
 
 
-async def receive_messages(websocket: websockets.ClientConnection) -> None:
+async def receive_messages(websocket: websockets.ClientConnection, print_mode: str = "events") -> None:
+    display_state = DisplayState()
     async for message in websocket:
         try:
             payload = json.loads(message)
@@ -64,7 +102,13 @@ async def receive_messages(websocket: websockets.ClientConnection) -> None:
             continue
 
         message_type = payload.get("type")
-        if message_type in {"partial", "final"}:
+        if print_mode == "display":
+            display_text = display_state.apply(payload)
+            if display_text is not None:
+                print(f"[display] {display_text}")
+            else:
+                print(json.dumps(payload, ensure_ascii=False))
+        elif message_type in {"partial", "sentence_final", "final"}:
             print(f"[{message_type}] {payload.get('text', '')}")
         else:
             print(json.dumps(payload, ensure_ascii=False))
@@ -73,6 +117,11 @@ async def receive_messages(websocket: websockets.ClientConnection) -> None:
 async def stream_audio(args: argparse.Namespace) -> None:
     if not args.api_key:
         raise SystemExit("Missing API key. Pass --api-key or set API_KEY.")
+
+    if args.show_stream_info:
+        stream_info_url = args.stream_info_url or default_stream_info_url(args.url)
+        print("ASR stream info:")
+        print(json.dumps(fetch_stream_info(stream_info_url), ensure_ascii=False, indent=2))
 
     bytes_per_second = args.sample_rate * 2
     chunk_size = max(1, bytes_per_second * args.chunk_ms // 1000)
@@ -96,7 +145,7 @@ async def stream_audio(args: argparse.Namespace) -> None:
         if first.get("type") == "error":
             return
 
-        receiver = asyncio.create_task(receive_messages(websocket))
+        receiver = asyncio.create_task(receive_messages(websocket, args.print_mode))
         process = start_ffmpeg(args.audio_file, args.sample_rate)
 
         assert process.stdout is not None

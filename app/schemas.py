@@ -44,7 +44,7 @@ class TranscribeResponse(BaseModel):
 
 class TranscribeStreamInfoResponse(BaseModel):
     websocket_url: str
-    audio_format: dict[str, bool | float | int | str]
+    audio_format: dict[str, object]
     start_message: dict[str, int | str]
     end_message: dict[str, str]
     segment_message: dict[str, str]

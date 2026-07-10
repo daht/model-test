@@ -20,8 +20,10 @@ services:
       start_period: 120s
 
   qwen-asr-api:
-    build: .
-    image: hy-mt-rest-api:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.asr
+    image: qwen-asr-api:latest
     command: python -m uvicorn app.asr_api:app --host 0.0.0.0 --port 8000
     env_file:
       - .env

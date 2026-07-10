@@ -8,12 +8,14 @@ The recommended target for your current server is NVIDIA A10 24GB. Use `float16`
 
 - `app/main.py`: FastAPI routes, health check, API key guard.
 - `app/asr_api.py`: Qwen3-ASR file upload and WebSocket routes.
-- `app/asr.py`: Qwen3-ASR lazy-loading inference wrapper and mock backend.
+- `app/asr.py`: Qwen3-ASR lazy-loading inference wrappers, including chunked and qwen vLLM stateful streaming backends.
 - `app/tts_api.py`: CosyVoice HTTP and WebSocket TTS routes.
 - `app/tts.py`: CosyVoice lazy-loading inference wrapper and mock WAV backend.
 - `app/model.py`: mock translator for tests and Transformers translator for production.
 - `app/schemas.py`: request and response models.
 - `Dockerfile`: GPU-capable image based on NVIDIA CUDA runtime.
+- `Dockerfile.asr`: Qwen3-ASR image with optional qwen-asr vLLM dependencies.
+- `requirements-asr-vllm.txt`: optional dependency set for stateful Qwen3-ASR vLLM streaming.
 - `docker-compose.yml`: local or cloud VM deployment.
 - `nginx.conf.example`: reverse proxy starter config.
 - `scripts/bootstrap_ubuntu_gpu.sh`: Ubuntu GPU server bootstrap script.
@@ -84,13 +86,20 @@ DEVICE=auto
 TORCH_DTYPE=float16
 MAX_NEW_TOKENS=1024
 ASR_MODEL_ID=/models/Qwen3-ASR-1.7B-hf
-ASR_BACKEND=qwen
-ASR_TORCH_DTYPE=bfloat16
+ASR_BACKEND=qwen_vllm
+ASR_STREAM_MODE=stateful
+ASR_STREAM_CHUNK_SECONDS=1.0
+ASR_VLLM_GPU_MEMORY_UTILIZATION=0.8
+ASR_VLLM_MAX_NEW_TOKENS=32
+ASR_STREAM_UNFIXED_CHUNK_NUM=2
+ASR_STREAM_UNFIXED_TOKEN_NUM=5
 TTS_MODEL_ID=/models/CosyVoice
 TTS_BACKEND=cosyvoice
 TTS_COSYVOICE_REPO=/opt/CosyVoice
 TTS_SAMPLE_RATE=24000
 ```
+
+Use `ASR_BACKEND=qwen` and `ASR_STREAM_MODE=chunked` if you need the original temp-WAV chunked fallback instead of stateful qwen vLLM streaming.
 
 If HY-MT loads as an encoder-decoder model in your weights, change:
 
@@ -150,6 +159,12 @@ Update only the ASR container:
 
 ```bash
 SERVICE=qwen-asr-api BASE_URL=http://127.0.0.1:8002 scripts/update_service.sh
+```
+
+Rebuild the ASR image after changing stateful vLLM dependencies:
+
+```bash
+SERVICE=qwen-asr-api BASE_URL=http://127.0.0.1:8002 scripts/update_service.sh build
 ```
 
 Verify:
@@ -305,10 +320,41 @@ API_KEY=your-production-api-key \
 python scripts/stream_asr_client.py /path/to/audio.wav \
   --url ws://127.0.0.1:8002/v1/transcribe/stream \
   --language zh \
+  --show-stream-info \
+  --print-mode display \
   --realtime
 ```
 
-The client converts the input audio to `16kHz mono pcm_s16le` with `ffmpeg`, sends 200ms chunks, and prints `partial` / `sentence_final` / `final` messages.
+The client converts the input audio to `16kHz mono pcm_s16le` with `ffmpeg`, sends 200ms chunks, and prints either raw `partial` / `sentence_final` / `final` events or, with `--print-mode display`, the rendered transcript as confirmed text plus the latest replaceable partial.
+
+Check the server-selected ASR streaming mode before testing:
+
+```bash
+curl http://localhost:8002/v1/transcribe/stream-info
+```
+
+Stateful qwen vLLM streaming uses these production settings:
+
+```bash
+ASR_BACKEND=qwen_vllm
+ASR_STREAM_MODE=stateful
+ASR_STREAM_CHUNK_SECONDS=1.0
+ASR_VLLM_GPU_MEMORY_UTILIZATION=0.8
+ASR_VLLM_MAX_NEW_TOKENS=32
+ASR_STREAM_UNFIXED_CHUNK_NUM=2
+ASR_STREAM_UNFIXED_TOKEN_NUM=5
+SERVICE=qwen-asr-api BASE_URL=http://127.0.0.1:8002 scripts/update_service.sh build
+```
+
+Smoke-test the expected ASR mode:
+
+```bash
+API_KEY=your-production-api-key \
+EXPECT_ASR_STREAM_MODE=stateful \
+EXPECT_ASR_BACKEND=qwen_vllm \
+BASE_URL=http://127.0.0.1:8002 \
+scripts/smoke_asr.sh
+```
 
 TTS WebSocket streaming protocol:
 

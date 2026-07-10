@@ -243,8 +243,16 @@ def transcribe_stream_info(current_settings: Settings = Depends(get_settings)) -
             "sample_rate": 16000,
             "channels": 1,
             "recommended_chunk_ms": "100-500",
+            "backend": current_settings.asr_backend,
+            "stream_mode": current_settings.asr_stream_mode,
             "vad_silence_seconds": current_settings.asr_vad_silence_seconds,
             "commit_on_punctuation": current_settings.asr_commit_on_punctuation,
+            "stateful": {
+                "chunk_seconds": current_settings.asr_stream_chunk_seconds,
+                "unfixed_chunk_num": current_settings.asr_stream_unfixed_chunk_num,
+                "unfixed_token_num": current_settings.asr_stream_unfixed_token_num,
+                "vllm_max_new_tokens": current_settings.asr_vllm_max_new_tokens,
+            },
         },
         start_message={
             "type": "start",
@@ -296,8 +304,6 @@ async def transcribe_stream(websocket: WebSocket) -> None:
 
     sample_rate = int(start_payload.get("sample_rate", 16000))
     language = start_payload.get("language")
-    min_chunk_bytes = max(1, int(sample_rate * 2 * current_settings.asr_stream_chunk_seconds))
-    buffer = bytearray()
     committer = SentenceCommitter(
         commit_on_punctuation=current_settings.asr_commit_on_punctuation,
     )
@@ -305,38 +311,113 @@ async def transcribe_stream(websocket: WebSocket) -> None:
         silence_seconds=current_settings.asr_vad_silence_seconds,
         rms_threshold=current_settings.asr_vad_rms_threshold,
     )
-    await websocket.send_json({"type": "ready"})
 
     try:
-        while True:
-            message = await websocket.receive()
-            if "bytes" in message and message["bytes"] is not None:
-                pcm_bytes = message["bytes"]
-                buffer.extend(pcm_bytes)
-                if len(buffer) >= min_chunk_bytes:
-                    segment_text = _transcribe_pcm_chunk(bytes(buffer), sample_rate, language)
-                    buffer.clear()
-                    if segment_text:
-                        await _send_committed_and_partial(websocket, committer, segment_text)
-                if silence_detector.add_audio(pcm_bytes, sample_rate):
-                    await _send_pending_commit(websocket, committer)
-            elif "text" in message and message["text"] is not None:
-                payload = json.loads(message["text"])
-                if payload.get("type") == "end":
-                    if buffer:
-                        segment_text = _transcribe_pcm_chunk(bytes(buffer), sample_rate, language)
-                        if segment_text:
-                            await _send_committed_and_partial(websocket, committer, segment_text)
-                    await websocket.send_json({"type": "final", "text": committer.pending_text})
-                    await websocket.close(code=1000)
-                    return
-                if payload.get("type") == "segment":
-                    buffer.clear()
-                    silence_detector.reset()
-            elif message.get("type") == "websocket.disconnect":
-                return
+        if current_settings.asr_stream_mode == "stateful":
+            await _run_stateful_transcribe_stream(
+                websocket,
+                language,
+                sample_rate,
+                committer,
+                silence_detector,
+            )
+        else:
+            await websocket.send_json({"type": "ready"})
+            await _run_chunked_transcribe_stream(
+                websocket,
+                current_settings,
+                language,
+                sample_rate,
+                committer,
+                silence_detector,
+            )
     except WebSocketDisconnect:
         return
+
+
+async def _run_chunked_transcribe_stream(
+    websocket: WebSocket,
+    current_settings: Settings,
+    language: str | None,
+    sample_rate: int,
+    committer: SentenceCommitter,
+    silence_detector: SilenceEndpointDetector,
+) -> None:
+    min_chunk_bytes = max(1, int(sample_rate * 2 * current_settings.asr_stream_chunk_seconds))
+    buffer = bytearray()
+
+    while True:
+        message = await websocket.receive()
+        if "bytes" in message and message["bytes"] is not None:
+            pcm_bytes = message["bytes"]
+            buffer.extend(pcm_bytes)
+            if len(buffer) >= min_chunk_bytes:
+                segment_text = _transcribe_pcm_chunk(bytes(buffer), sample_rate, language)
+                buffer.clear()
+                if segment_text:
+                    await _send_committed_and_partial(websocket, committer, segment_text)
+            if silence_detector.add_audio(pcm_bytes, sample_rate):
+                await _send_pending_commit(websocket, committer)
+        elif "text" in message and message["text"] is not None:
+            payload = json.loads(message["text"])
+            if payload.get("type") == "end":
+                if buffer:
+                    segment_text = _transcribe_pcm_chunk(bytes(buffer), sample_rate, language)
+                    if segment_text:
+                        await _send_committed_and_partial(websocket, committer, segment_text)
+                await websocket.send_json({"type": "final", "text": committer.pending_text})
+                await websocket.close(code=1000)
+                return
+            if payload.get("type") == "segment":
+                buffer.clear()
+                silence_detector.reset()
+        elif message.get("type") == "websocket.disconnect":
+            return
+
+
+async def _run_stateful_transcribe_stream(
+    websocket: WebSocket,
+    language: str | None,
+    sample_rate: int,
+    committer: SentenceCommitter,
+    silence_detector: SilenceEndpointDetector,
+) -> None:
+    if sample_rate != 16000:
+        await websocket.send_json({"type": "error", "message": "Stateful ASR streaming requires sample_rate 16000"})
+        await websocket.close(code=1003)
+        return
+
+    try:
+        session = asr_transcriber.create_streaming_session(language=language)
+    except NotImplementedError as exc:
+        await websocket.send_json({"type": "error", "message": str(exc)})
+        await websocket.close(code=1011)
+        return
+
+    await websocket.send_json({"type": "ready"})
+
+    while True:
+        message = await websocket.receive()
+        if "bytes" in message and message["bytes"] is not None:
+            pcm_bytes = message["bytes"]
+            result = session.add_pcm_s16le(pcm_bytes, sample_rate)
+            if result.text:
+                await _send_committed_and_partial(websocket, committer, result.text)
+            if silence_detector.add_audio(pcm_bytes, sample_rate):
+                await _send_pending_commit(websocket, committer)
+        elif "text" in message and message["text"] is not None:
+            payload = json.loads(message["text"])
+            if payload.get("type") == "end":
+                result = session.finish()
+                if result.text:
+                    await _send_committed_and_partial(websocket, committer, result.text)
+                await websocket.send_json({"type": "final", "text": committer.pending_text})
+                await websocket.close(code=1000)
+                return
+            if payload.get("type") == "segment":
+                silence_detector.reset()
+        elif message.get("type") == "websocket.disconnect":
+            return
 
 
 async def _send_committed_and_partial(
@@ -344,9 +425,10 @@ async def _send_committed_and_partial(
     committer: SentenceCommitter,
     text: str,
 ) -> None:
+    previous_pending = committer.pending_text
     for sentence in committer.append(text):
         await websocket.send_json({"type": "sentence_final", "text": sentence})
-    if committer.pending_text:
+    if committer.pending_text and committer.pending_text != previous_pending:
         await websocket.send_json({"type": "partial", "text": committer.pending_text})
 
 

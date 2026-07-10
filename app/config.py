@@ -15,7 +15,8 @@ class Settings(BaseSettings):
     model_task: Literal["causal-lm", "seq2seq-lm"] = "causal-lm"
     asr_model_name: str = "Qwen3-ASR-1.7B"
     asr_model_id: str = "/models/Qwen3-ASR-1.7B-hf"
-    asr_backend: Literal["qwen", "mock"] = "qwen"
+    asr_backend: Literal["qwen", "qwen_vllm", "mock"] = "qwen"
+    asr_stream_mode: Literal["chunked", "stateful"] = "chunked"
     api_key: str = Field(default="change-me", description="Required X-API-Key value")
     device: str = "auto"
     torch_dtype: Literal["auto", "float16", "bfloat16", "float32"] = "float16"
@@ -25,6 +26,10 @@ class Settings(BaseSettings):
     asr_max_new_tokens: int = 512
     asr_max_upload_mb: int = 200
     asr_stream_chunk_seconds: float = 2.0
+    asr_vllm_gpu_memory_utilization: float = 0.8
+    asr_vllm_max_new_tokens: int = 32
+    asr_stream_unfixed_chunk_num: int = 2
+    asr_stream_unfixed_token_num: int = 5
     asr_vad_silence_seconds: float = 1.5
     asr_vad_rms_threshold: int = 200
     asr_commit_on_punctuation: bool = False

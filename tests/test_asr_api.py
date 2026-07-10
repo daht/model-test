@@ -40,6 +40,34 @@ def _pcm_s16le_samples(value: int, sample_count: int) -> bytes:
     return int(value).to_bytes(2, byteorder="little", signed=True) * sample_count
 
 
+class FakeStreamingSession:
+    def __init__(self, updates, final_text="hello world"):
+        self.updates = iter(updates)
+        self.finished = False
+        self.final_text = final_text
+
+    def add_pcm_s16le(self, _pcm_bytes, _sample_rate):
+        from app.asr import StreamingTranscriptionResult
+
+        text = next(self.updates)
+        return StreamingTranscriptionResult(text=text, language="zh")
+
+    def finish(self):
+        from app.asr import StreamingTranscriptionResult
+
+        self.finished = True
+        return StreamingTranscriptionResult(text=self.final_text, language="zh")
+
+
+class FakeStatefulTranscriber:
+    def __init__(self, session):
+        self.session = session
+
+    def create_streaming_session(self, language=None):
+        self.language = language
+        return self.session
+
+
 def test_asr_health_reports_model_name():
     response = client.get("/health")
 
@@ -109,6 +137,99 @@ def test_stream_info_reports_punctuation_commit_setting():
     assert body["audio_format"]["vad_silence_seconds"] == 1.5
 
 
+def test_stream_info_reports_streaming_mode_and_stateful_settings(monkeypatch):
+    asr_api.get_settings.cache_clear()
+    monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
+    monkeypatch.setenv("ASR_BACKEND", "qwen_vllm")
+    monkeypatch.setenv("ASR_STREAM_CHUNK_SECONDS", "1.0")
+    monkeypatch.setenv("ASR_STREAM_UNFIXED_CHUNK_NUM", "2")
+    monkeypatch.setenv("ASR_STREAM_UNFIXED_TOKEN_NUM", "5")
+    monkeypatch.setenv("ASR_VLLM_GPU_MEMORY_UTILIZATION", "0.8")
+    monkeypatch.setenv("ASR_VLLM_MAX_NEW_TOKENS", "32")
+
+    try:
+        response = client.get("/v1/transcribe/stream-info")
+    finally:
+        asr_api.get_settings.cache_clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["audio_format"]["stream_mode"] == "stateful"
+    assert body["audio_format"]["backend"] == "qwen_vllm"
+    assert body["audio_format"]["vad_silence_seconds"] == 1.5
+    assert body["audio_format"]["commit_on_punctuation"] is False
+    assert body["audio_format"]["stateful"]["chunk_seconds"] == 1.0
+    assert body["audio_format"]["stateful"]["unfixed_chunk_num"] == 2
+    assert body["audio_format"]["stateful"]["unfixed_token_num"] == 5
+    assert body["audio_format"]["stateful"]["vllm_max_new_tokens"] == 32
+
+
+def test_qwen_vllm_backend_can_be_selected():
+    from app.asr import QwenVLLMASRTranscriber, create_asr_transcriber
+    from app.config import Settings
+
+    transcriber = create_asr_transcriber(Settings(asr_backend="qwen_vllm"))
+
+    assert isinstance(transcriber, QwenVLLMASRTranscriber)
+
+
+def test_qwen_vllm_streaming_session_feeds_pcm_and_finishes(monkeypatch):
+    import sys
+    import types
+
+    from app.asr import QwenVLLMASRTranscriber
+    from app.config import Settings
+
+    calls = []
+
+    class FakeState:
+        text = ""
+        language = "zh"
+
+    class FakeModel:
+        def init_streaming_state(self, **kwargs):
+            calls.append(("init", kwargs))
+            return FakeState()
+
+        def streaming_transcribe(self, pcm, state):
+            calls.append(("stream", len(pcm)))
+            state.text = "可以到店"
+            state.language = "zh"
+            return state
+
+        def finish_streaming_transcribe(self, state):
+            calls.append(("finish", None))
+            state.text = "可以到店使用"
+            return state
+
+    class FakeQwen3ASRModel:
+        @classmethod
+        def LLM(cls, **kwargs):
+            calls.append(("load", kwargs))
+            return FakeModel()
+
+    monkeypatch.setitem(sys.modules, "qwen_asr", types.SimpleNamespace(Qwen3ASRModel=FakeQwen3ASRModel))
+    monkeypatch.delenv("ASR_STREAM_CHUNK_SECONDS", raising=False)
+
+    transcriber = QwenVLLMASRTranscriber(Settings(asr_backend="qwen_vllm"))
+    session = transcriber.create_streaming_session(language="zh")
+    update = session.add_pcm_s16le((1000).to_bytes(2, "little", signed=True) * 16000, sample_rate=16000)
+    final = session.finish()
+
+    assert update.text == "可以到店"
+    assert final.text == "可以到店使用"
+    assert calls[0][0] == "load"
+    assert calls[1] == (
+        "init",
+        {
+            "language": "zh",
+            "unfixed_chunk_num": 2,
+            "unfixed_token_num": 5,
+            "chunk_size_sec": 2.0,
+        },
+    )
+
+
 def test_stream_rejects_bad_api_key():
     with client.websocket_connect("/v1/transcribe/stream") as websocket:
         websocket.send_json(
@@ -125,6 +246,83 @@ def test_stream_rejects_bad_api_key():
             "type": "error",
             "message": "Invalid or missing API key",
         }
+
+
+def test_stateful_stream_returns_replaceable_partial(monkeypatch):
+    asr_api.get_settings.cache_clear()
+    monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
+    monkeypatch.setattr(asr_api, "asr_transcriber", FakeStatefulTranscriber(FakeStreamingSession(["可以到店", "可以到店使用"])))
+
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            _start_stream(websocket)
+            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
+            assert websocket.receive_json() == {"type": "partial", "text": "可以到店"}
+            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
+            assert websocket.receive_json() == {"type": "partial", "text": "可以到店使用"}
+    finally:
+        asr_api.get_settings.cache_clear()
+
+
+def test_stateful_stream_vad_commit_excludes_confirmed_prefix(monkeypatch):
+    asr_api.get_settings.cache_clear()
+    monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
+    monkeypatch.setattr(asr_api, "asr_transcriber", FakeStatefulTranscriber(FakeStreamingSession(["hello", "hello", "hello world"])))
+
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            _start_stream(websocket)
+            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
+            assert websocket.receive_json() == {"type": "partial", "text": "hello"}
+            websocket.send_bytes(_pcm_s16le_samples(0, 24000))
+            assert websocket.receive_json() == {"type": "sentence_final", "text": "hello"}
+            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
+            assert websocket.receive_json() == {"type": "partial", "text": " world"}
+    finally:
+        asr_api.get_settings.cache_clear()
+
+
+def test_stateful_stream_finish_flushes_remaining_text(monkeypatch):
+    asr_api.get_settings.cache_clear()
+    monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
+    session = FakeStreamingSession(["hello"], final_text="hello world")
+    monkeypatch.setattr(asr_api, "asr_transcriber", FakeStatefulTranscriber(session))
+
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            _start_stream(websocket)
+            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
+            assert websocket.receive_json() == {"type": "partial", "text": "hello"}
+            websocket.send_json({"type": "end"})
+            assert websocket.receive_json() == {"type": "partial", "text": "hello world"}
+            assert websocket.receive_json() == {"type": "final", "text": "hello world"}
+            assert session.finished is True
+    finally:
+        asr_api.get_settings.cache_clear()
+
+
+def test_stateful_stream_rejects_non_16khz_sample_rate(monkeypatch):
+    asr_api.get_settings.cache_clear()
+    monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
+    monkeypatch.setattr(asr_api, "asr_transcriber", FakeStatefulTranscriber(FakeStreamingSession([])))
+
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            websocket.send_json(
+                {
+                    "type": "start",
+                    "api_key": "test-key",
+                    "language": "zh",
+                    "sample_rate": 8000,
+                    "format": "pcm_s16le",
+                }
+            )
+            assert websocket.receive_json() == {
+                "type": "error",
+                "message": "Stateful ASR streaming requires sample_rate 16000",
+            }
+    finally:
+        asr_api.get_settings.cache_clear()
 
 
 def test_stream_returns_partial_and_final_transcripts(monkeypatch):
