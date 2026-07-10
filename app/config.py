@@ -25,8 +25,9 @@ class Settings(BaseSettings):
     asr_max_new_tokens: int = 512
     asr_max_upload_mb: int = 200
     asr_stream_chunk_seconds: float = 2.0
-    asr_vad_silence_seconds: float = 1.0
+    asr_vad_silence_seconds: float = 1.5
     asr_vad_rms_threshold: int = 200
+    asr_commit_on_punctuation: bool = False
     tts_model_name: str = "CosyVoice"
     tts_backend: Literal["mock", "cosyvoice"] = "mock"
     tts_model_id: str = "/models/CosyVoice"

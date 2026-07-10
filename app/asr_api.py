@@ -39,12 +39,17 @@ app = FastAPI(
 )
 
 
+class TranscribeStreamInfoWithCommitResponse(TranscribeStreamInfoResponse):
+    audio_format: dict[str, bool | float | int | str]
+
+
 def get_asr_transcriber() -> ASRTranscriber:
     return asr_transcriber
 
 
 @dataclass
 class SentenceCommitter:
+    commit_on_punctuation: bool = False
     pending_text: str = ""
     confirmed_texts: list[str] = field(default_factory=list)
 
@@ -53,6 +58,9 @@ class SentenceCommitter:
             return []
 
         self.pending_text = self._merge_recognition_text(text)
+        if not self.commit_on_punctuation:
+            return []
+
         committed, self.pending_text = _split_committed_sentences(self.pending_text)
         self.confirmed_texts.extend(committed)
         return committed
@@ -230,9 +238,9 @@ async def transcribe(
     )
 
 
-@app.get("/v1/transcribe/stream-info", response_model=TranscribeStreamInfoResponse)
-def transcribe_stream_info(current_settings: Settings = Depends(get_settings)) -> TranscribeStreamInfoResponse:
-    return TranscribeStreamInfoResponse(
+@app.get("/v1/transcribe/stream-info", response_model=TranscribeStreamInfoWithCommitResponse)
+def transcribe_stream_info(current_settings: Settings = Depends(get_settings)) -> TranscribeStreamInfoWithCommitResponse:
+    return TranscribeStreamInfoWithCommitResponse(
         websocket_url="/v1/transcribe/stream",
         audio_format={
             "format": "pcm_s16le",
@@ -240,6 +248,7 @@ def transcribe_stream_info(current_settings: Settings = Depends(get_settings)) -
             "channels": 1,
             "recommended_chunk_ms": "100-500",
             "vad_silence_seconds": current_settings.asr_vad_silence_seconds,
+            "commit_on_punctuation": current_settings.asr_commit_on_punctuation,
         },
         start_message={
             "type": "start",
@@ -293,7 +302,9 @@ async def transcribe_stream(websocket: WebSocket) -> None:
     language = start_payload.get("language")
     min_chunk_bytes = max(1, int(sample_rate * 2 * current_settings.asr_stream_chunk_seconds))
     buffer = bytearray()
-    committer = SentenceCommitter()
+    committer = SentenceCommitter(
+        commit_on_punctuation=current_settings.asr_commit_on_punctuation,
+    )
     silence_detector = SilenceEndpointDetector(
         silence_seconds=current_settings.asr_vad_silence_seconds,
         rms_threshold=current_settings.asr_vad_rms_threshold,

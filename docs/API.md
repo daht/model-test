@@ -211,7 +211,8 @@ sample_rate: 16000
 channels:    1
 format:      pcm_s16le
 chunk size:  100ms to 500ms recommended
-VAD commit:  1.0s continuous silence by default
+VAD commit:  1.5s continuous silence by default
+punctuation commit: disabled by default; set ASR_COMMIT_ON_PUNCTUATION=true to enable
 ```
 
 First client message must be JSON:
@@ -245,7 +246,7 @@ Server partial response:
 }
 ```
 
-`partial` is unconfirmed streaming text and may be replaced by later `partial` messages. It only contains the current uncommitted tail, not previously committed sentences.
+`partial` is unconfirmed streaming text and may be replaced by later `partial` messages. It may include model-generated punctuation, but punctuation is not confirmed by default. It only contains the current uncommitted tail, not previously committed text.
 
 Server committed sentence response:
 
@@ -256,7 +257,7 @@ Server committed sentence response:
 }
 ```
 
-`sentence_final` text is confirmed and will not change. It is sent when the unconfirmed text reaches sentence-ending punctuation, or when the server detects 1.0 second of continuous silence in the PCM stream. Clients should append every `sentence_final` in order, then display the latest `partial` after that confirmed prefix.
+`sentence_final` text is confirmed and will not change. By default, it is sent when the server detects `ASR_VAD_SILENCE_SECONDS` of continuous silence in the PCM stream, with a default of `1.5` seconds. Set `ASR_COMMIT_ON_PUNCTUATION=true` to restore the older behavior that commits when the unconfirmed text reaches sentence-ending punctuation. Clients should append every `sentence_final` in order, then display the latest `partial` after that confirmed prefix.
 
 End the stream:
 
@@ -274,7 +275,7 @@ Clear the pending server audio buffer without closing the connection:
 }
 ```
 
-Use `segment` during long-running listening when the client wants to discard pending server audio without closing the socket. `segment` is not a commit command; sentence confirmation is triggered by punctuation or by the server's silence detector.
+Use `segment` during long-running listening when the client wants to discard pending server audio without closing the socket. `segment` is not a commit command; by default, sentence confirmation is triggered by the server's silence detector.
 
 Server final response:
 
