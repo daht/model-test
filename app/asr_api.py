@@ -39,10 +39,6 @@ app = FastAPI(
 )
 
 
-class TranscribeStreamInfoWithCommitResponse(TranscribeStreamInfoResponse):
-    audio_format: dict[str, bool | float | int | str]
-
-
 def get_asr_transcriber() -> ASRTranscriber:
     return asr_transcriber
 
@@ -70,10 +66,10 @@ class SentenceCommitter:
         current_text = confirmed_text + self.pending_text
 
         if confirmed_text and text.startswith(confirmed_text):
-            return text[len(confirmed_text) :].lstrip()
+            return text[len(confirmed_text) :]
 
         if current_text and text.startswith(current_text):
-            return text[len(confirmed_text) :].lstrip()
+            return text[len(confirmed_text) :]
 
         if self.pending_text and text.startswith(self.pending_text):
             return text
@@ -81,7 +77,7 @@ class SentenceCommitter:
         return self.pending_text + text
 
     def commit_pending(self) -> str:
-        sentence = self.pending_text.strip()
+        sentence = self.pending_text.rstrip()
         if sentence:
             self.confirmed_texts.append(sentence)
         self.pending_text = ""
@@ -238,9 +234,9 @@ async def transcribe(
     )
 
 
-@app.get("/v1/transcribe/stream-info", response_model=TranscribeStreamInfoWithCommitResponse)
-def transcribe_stream_info(current_settings: Settings = Depends(get_settings)) -> TranscribeStreamInfoWithCommitResponse:
-    return TranscribeStreamInfoWithCommitResponse(
+@app.get("/v1/transcribe/stream-info", response_model=TranscribeStreamInfoResponse)
+def transcribe_stream_info(current_settings: Settings = Depends(get_settings)) -> TranscribeStreamInfoResponse:
+    return TranscribeStreamInfoResponse(
         websocket_url="/v1/transcribe/stream",
         audio_format={
             "format": "pcm_s16le",

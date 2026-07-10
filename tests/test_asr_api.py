@@ -5,6 +5,8 @@ from fastapi.testclient import TestClient
 os.environ["API_KEY"] = "test-key"
 os.environ["ASR_BACKEND"] = "mock"
 os.environ["ASR_STREAM_CHUNK_SECONDS"] = "0.01"
+os.environ["ASR_COMMIT_ON_PUNCTUATION"] = "false"
+os.environ["ASR_VAD_SILENCE_SECONDS"] = "1.5"
 
 from app.config import get_settings  # noqa: E402
 
@@ -218,6 +220,24 @@ def test_stream_keeps_multiple_punctuated_sentences_partial_by_default(monkeypat
         assert websocket.receive_json() == {"type": "partial", "text": "你好。再见！还有半句"}
 
 
+def test_stream_commits_multiple_sentences_and_partial_remainder_when_punctuation_commit_enabled(monkeypatch):
+    asr_api.get_settings.cache_clear()
+    monkeypatch.setenv("ASR_COMMIT_ON_PUNCTUATION", "true")
+    monkeypatch.setattr(asr_api, "_transcribe_pcm_chunk", lambda *_args: "你好。再见！还有半句")
+
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            _start_stream(websocket)
+
+            _send_transcribable_chunk(websocket)
+
+            assert websocket.receive_json() == {"type": "sentence_final", "text": "你好。"}
+            assert websocket.receive_json() == {"type": "sentence_final", "text": "再见！"}
+            assert websocket.receive_json() == {"type": "partial", "text": "还有半句"}
+    finally:
+        asr_api.get_settings.cache_clear()
+
+
 def test_stream_end_final_only_returns_remaining_uncommitted_text_when_punctuation_commit_enabled(monkeypatch):
     asr_api.get_settings.cache_clear()
     monkeypatch.setenv("ASR_COMMIT_ON_PUNCTUATION", "true")
@@ -252,6 +272,29 @@ def test_stream_commits_pending_text_after_silence(monkeypatch):
 
         websocket.send_bytes(_pcm_s16le_samples(0, 24000))
         assert websocket.receive_json() == {"type": "sentence_final", "text": "还没有标点。"}
+
+        websocket.send_json({"type": "end"})
+        assert websocket.receive_json() == {"type": "final", "text": ""}
+
+
+def test_stream_preserves_leading_separator_after_vad_commit_for_cumulative_text(monkeypatch):
+    texts = iter(["hello", "", "hello world", ""])
+    monkeypatch.setattr(asr_api, "_transcribe_pcm_chunk", lambda *_args: next(texts))
+
+    with client.websocket_connect("/v1/transcribe/stream") as websocket:
+        _start_stream(websocket)
+
+        websocket.send_bytes(_pcm_s16le_samples(1000, 160))
+        assert websocket.receive_json() == {"type": "partial", "text": "hello"}
+
+        websocket.send_bytes(_pcm_s16le_samples(0, 24000))
+        assert websocket.receive_json() == {"type": "sentence_final", "text": "hello"}
+
+        websocket.send_bytes(_pcm_s16le_samples(1000, 160))
+        assert websocket.receive_json() == {"type": "partial", "text": " world"}
+
+        websocket.send_bytes(_pcm_s16le_samples(0, 24000))
+        assert websocket.receive_json() == {"type": "sentence_final", "text": " world"}
 
         websocket.send_json({"type": "end"})
         assert websocket.receive_json() == {"type": "final", "text": ""}
