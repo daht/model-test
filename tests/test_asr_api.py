@@ -457,6 +457,36 @@ def test_stateful_stream_commits_stable_punctuation_and_keeps_tail(monkeypatch):
         asr_api.get_settings.cache_clear()
 
 
+def test_stateful_stable_commit_preserves_separator_for_future_cumulative_text(monkeypatch):
+    asr_api.get_settings.cache_clear()
+    monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
+    session = FakeStreamingSession(
+        [
+            "This is stable. tail",
+            "This is stable. tail",
+            "This is stable. tail",
+            "This is stable. tail next",
+        ]
+    )
+    monkeypatch.setattr(asr_api, "asr_transcriber", FakeStatefulTranscriber(session))
+    _monotonic_values(monkeypatch, [0.0, 1.0, 2.0, 3.0])
+
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            _start_stream(websocket)
+            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
+            assert websocket.receive_json() == {"type": "partial", "text": "This is stable. tail"}
+            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
+            assert websocket.receive_json() == {"type": "sentence_final", "text": "This is stable."}
+            assert websocket.receive_json() == {"type": "partial", "text": " tail"}
+            websocket.send_bytes(_pcm_s16le_samples(0, 24000))
+            assert websocket.receive_json() == {"type": "sentence_final", "text": " tail"}
+            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
+            assert websocket.receive_json() == {"type": "partial", "text": " next"}
+    finally:
+        asr_api.get_settings.cache_clear()
+
+
 def test_stateful_stream_does_not_commit_transient_short_punctuation(monkeypatch):
     asr_api.get_settings.cache_clear()
     monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
@@ -895,7 +925,7 @@ def test_sentence_committer_commit_prefix_preserves_pending_tail():
 
     assert committed == "这是一个足够长的稳定句子。"
     assert committer.confirmed_texts == ["这是一个足够长的稳定句子。"]
-    assert committer.pending_text == "后续文本"
+    assert committer.pending_text == " 后续文本"
 
 
 def test_stable_punctuation_rejects_short_transient_candidate():
@@ -961,6 +991,22 @@ def test_stable_punctuation_candidate_is_exact_pending_prefix():
 
     assert tracker.observe(text, now=0.0) is None
     assert tracker.observe(text, now=1.0) == " 这是一个足够长的候选句子。"
+
+
+def test_stable_punctuation_terminator_cluster_revision_resets_timer():
+    tracker = asr_api.StablePunctuationCommitter(True, 1.0, 8, 2)
+
+    assert tracker.observe("这是一个足够长的候选句子。", now=0.0) is None
+    assert tracker.observe("这是一个足够长的候选句子。。", now=1.0) is None
+    assert tracker.observe("这是一个足够长的候选句子。。", now=2.0) == "这是一个足够长的候选句子。。"
+
+
+def test_stable_punctuation_candidate_includes_mixed_terminator_cluster():
+    tracker = asr_api.StablePunctuationCommitter(True, 1.0, 8, 2)
+    text = "这是一个足够长的候选句子？！后续"
+
+    assert tracker.observe(text, now=0.0) is None
+    assert tracker.observe(text, now=1.0) == "这是一个足够长的候选句子？！"
 
 
 def test_stream_segment_clears_pending_audio_buffer():

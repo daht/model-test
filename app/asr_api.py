@@ -111,7 +111,7 @@ class SentenceCommitter:
         if not prefix or not self.pending_text.startswith(prefix):
             return ""
         self.confirmed_texts.append(prefix)
-        self.pending_text = self.pending_text[len(prefix) :].lstrip()
+        self.pending_text = self.pending_text[len(prefix) :]
         return prefix
 
 
@@ -208,9 +208,7 @@ def _split_committed_sentences(text: str) -> tuple[list[str], str]:
     while index < len(text):
         char = text[index]
         if char in SENTENCE_TERMINATORS and _is_sentence_end(text, index):
-            sentence_end = index + 1
-            while sentence_end < len(text) and text[sentence_end] in SENTENCE_CLOSERS:
-                sentence_end += 1
+            sentence_end = _sentence_boundary_end(text, index)
 
             sentence = text[sentence_start:sentence_end].strip()
             if sentence:
@@ -231,9 +229,7 @@ def _first_stable_punctuation_candidate(text: str, min_chars: int) -> str:
     index = 0
     while index < len(text):
         if text[index] in SENTENCE_TERMINATORS and _is_sentence_end(text, index):
-            sentence_end = index + 1
-            while sentence_end < len(text) and text[sentence_end] in SENTENCE_CLOSERS:
-                sentence_end += 1
+            sentence_end = _sentence_boundary_end(text, index)
             candidate = text[:sentence_end]
             if len("".join(candidate.split())) >= min_chars:
                 return candidate
@@ -241,6 +237,16 @@ def _first_stable_punctuation_candidate(text: str, min_chars: int) -> str:
             continue
         index += 1
     return ""
+
+
+def _sentence_boundary_end(text: str, index: int) -> int:
+    sentence_end = index + 1
+    while sentence_end < len(text):
+        char = text[sentence_end]
+        if char not in SENTENCE_TERMINATORS and char not in SENTENCE_CLOSERS:
+            break
+        sentence_end += 1
+    return sentence_end
 
 
 def _is_sentence_end(text: str, index: int) -> bool:
