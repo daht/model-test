@@ -45,6 +45,7 @@ class FakeStreamingSession:
         self.updates = iter(updates)
         self.finished = False
         self.final_text = final_text
+        self.segment_reset = False
 
     def add_pcm_s16le(self, _pcm_bytes, _sample_rate):
         from app.asr import StreamingTranscriptionResult
@@ -57,6 +58,9 @@ class FakeStreamingSession:
 
         self.finished = True
         return StreamingTranscriptionResult(text=self.final_text, language="zh")
+
+    def reset_segment(self):
+        self.segment_reset = True
 
 
 class FakeStatefulTranscriber:
@@ -170,6 +174,7 @@ def test_stream_info_reports_streaming_mode_and_stateful_settings(monkeypatch):
     assert body["audio_format"]["stateful"]["chunk_seconds"] == 1.0
     assert body["audio_format"]["stateful"]["unfixed_chunk_num"] == 2
     assert body["audio_format"]["stateful"]["unfixed_token_num"] == 5
+    assert body["audio_format"]["stateful"]["vllm_gpu_memory_utilization"] == 0.8
     assert body["audio_format"]["stateful"]["vllm_max_new_tokens"] == 32
 
 
@@ -237,6 +242,36 @@ def test_qwen_vllm_streaming_session_feeds_pcm_and_finishes(monkeypatch):
             "chunk_size_sec": 2.0,
         },
     )
+
+
+def test_qwen_vllm_streaming_session_segment_reset_discards_pending_buffer(monkeypatch):
+    import sys
+    import types
+
+    from app.asr import QwenVLLMASRTranscriber
+    from app.config import Settings
+
+    class FakeState:
+        text = ""
+        language = "zh"
+        buffer = [1, 2, 3]
+
+    class FakeModel:
+        def init_streaming_state(self, **_kwargs):
+            return FakeState()
+
+    class FakeQwen3ASRModel:
+        @classmethod
+        def LLM(cls, **_kwargs):
+            return FakeModel()
+
+    monkeypatch.setitem(sys.modules, "qwen_asr", types.SimpleNamespace(Qwen3ASRModel=FakeQwen3ASRModel))
+
+    transcriber = QwenVLLMASRTranscriber(Settings(asr_backend="qwen_vllm"))
+    session = transcriber.create_streaming_session(language="zh")
+    session.reset_segment()
+
+    assert session.state.buffer == []
 
 
 def test_qwen_vllm_file_transcribe_normalizes_language_code(monkeypatch):
@@ -460,6 +495,24 @@ def test_stateful_stream_returns_error_when_streaming_session_rejects_language(m
                 "type": "error",
                 "message": "Unsupported language: Xx",
             }
+    finally:
+        asr_api.get_settings.cache_clear()
+
+
+def test_stateful_stream_segment_resets_streaming_session_buffer(monkeypatch):
+    asr_api.get_settings.cache_clear()
+    monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
+    session = FakeStreamingSession(["hello"], final_text="hello")
+    monkeypatch.setattr(asr_api, "asr_transcriber", FakeStatefulTranscriber(session))
+
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            _start_stream(websocket)
+            websocket.send_json({"type": "segment"})
+            websocket.send_json({"type": "end"})
+            assert websocket.receive_json() == {"type": "partial", "text": "hello"}
+            assert websocket.receive_json() == {"type": "final", "text": "hello"}
+            assert session.segment_reset is True
     finally:
         asr_api.get_settings.cache_clear()
 

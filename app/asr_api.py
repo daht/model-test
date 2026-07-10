@@ -274,6 +274,7 @@ def transcribe_stream_info(current_settings: Settings = Depends(get_settings)) -
                 "chunk_seconds": current_settings.asr_stream_chunk_seconds,
                 "unfixed_chunk_num": current_settings.asr_stream_unfixed_chunk_num,
                 "unfixed_token_num": current_settings.asr_stream_unfixed_token_num,
+                "vllm_gpu_memory_utilization": current_settings.asr_vllm_gpu_memory_utilization,
                 "vllm_max_new_tokens": current_settings.asr_vllm_max_new_tokens,
             },
         },
@@ -440,6 +441,7 @@ async def _run_stateful_transcribe_stream(
                 await websocket.close(code=1000)
                 return
             if payload.get("type") == "segment":
+                session.reset_segment()
                 silence_detector.reset()
         elif message.get("type") == "websocket.disconnect":
             return

@@ -75,6 +75,9 @@ class ASRStreamingSession:
     def finish(self) -> StreamingTranscriptionResult:
         raise NotImplementedError
 
+    def reset_segment(self) -> None:
+        return None
+
 
 class ASRTranscriber:
     def transcribe(self, audio_path: str, language: str | None = None) -> TranscriptionResult:
@@ -226,6 +229,11 @@ class QwenVLLMStreamingSession(ASRStreamingSession):
             text=getattr(state, "text", ""),
             language=getattr(state, "language", self.language),
         )
+
+    def reset_segment(self) -> None:
+        buffer = getattr(self.state, "buffer", None)
+        if buffer is not None:
+            self.state.buffer = buffer[:0]
 
 
 class QwenVLLMASRTranscriber(ASRTranscriber):
