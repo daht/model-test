@@ -6,6 +6,55 @@ from threading import Lock
 
 from app.config import Settings
 
+QWEN_VLLM_LANGUAGE_ALIASES = {
+    "zh": "Chinese",
+    "zh-cn": "Chinese",
+    "zh-hans": "Chinese",
+    "zh-hant": "Chinese",
+    "cmn": "Chinese",
+    "cn": "Chinese",
+    "chinese": "Chinese",
+    "yue": "Cantonese",
+    "zh-yue": "Cantonese",
+    "cantonese": "Cantonese",
+    "en": "English",
+    "eng": "English",
+    "english": "English",
+    "ar": "Arabic",
+    "de": "German",
+    "fr": "French",
+    "es": "Spanish",
+    "pt": "Portuguese",
+    "pt-br": "Portuguese",
+    "pt-pt": "Portuguese",
+    "id": "Indonesian",
+    "in": "Indonesian",
+    "it": "Italian",
+    "ko": "Korean",
+    "kr": "Korean",
+    "ru": "Russian",
+    "th": "Thai",
+    "vi": "Vietnamese",
+    "ja": "Japanese",
+    "jp": "Japanese",
+    "tr": "Turkish",
+    "hi": "Hindi",
+    "ms": "Malay",
+    "nl": "Dutch",
+    "sv": "Swedish",
+    "da": "Danish",
+    "fi": "Finnish",
+    "pl": "Polish",
+    "cs": "Czech",
+    "tl": "Filipino",
+    "fil": "Filipino",
+    "fa": "Persian",
+    "el": "Greek",
+    "ro": "Romanian",
+    "hu": "Hungarian",
+    "mk": "Macedonian",
+}
+
 
 @dataclass
 class TranscriptionResult:
@@ -137,9 +186,9 @@ class QwenASRTranscriber(ASRTranscriber):
 class QwenVLLMStreamingSession(ASRStreamingSession):
     def __init__(self, transcriber: "QwenVLLMASRTranscriber", language: str | None = None) -> None:
         self.transcriber = transcriber
-        self.language = language
+        self.language = transcriber.normalize_language(language)
         # qwen-asr owns the official ASRStreamingState object returned here.
-        self.state = transcriber._init_streaming_state(language=language)
+        self.state = transcriber._init_streaming_state(language=self.language)
 
     def add_pcm_s16le(self, pcm_bytes: bytes, sample_rate: int) -> StreamingTranscriptionResult:
         if sample_rate != 16000:
@@ -197,28 +246,48 @@ class QwenVLLMASRTranscriber(ASRTranscriber):
         )
 
     def transcribe(self, audio_path: str, language: str | None = None) -> TranscriptionResult:
+        normalized_language = self.normalize_language(language)
         with self._lock:
             self._load()
             assert self._model is not None
             kwargs = {"audio": audio_path}
-            if language:
-                kwargs["language"] = language
+            if normalized_language:
+                kwargs["language"] = normalized_language
             results = self._model.transcribe(**kwargs)
             result = results[0] if isinstance(results, list) else results
             return TranscriptionResult(
                 text=getattr(result, "text", ""),
-                language=getattr(result, "language", language),
+                language=getattr(result, "language", normalized_language),
             )
 
     def create_streaming_session(self, language: str | None = None) -> ASRStreamingSession:
         return QwenVLLMStreamingSession(self, language=language)
 
+    def normalize_language(self, language: str | None) -> str | None:
+        if language is None:
+            return None
+
+        stripped = str(language).strip()
+        if not stripped:
+            return None
+
+        key = stripped.lower().replace("_", "-")
+        if key in QWEN_VLLM_LANGUAGE_ALIASES:
+            return QWEN_VLLM_LANGUAGE_ALIASES[key]
+
+        primary_subtag = key.split("-", maxsplit=1)[0]
+        if primary_subtag in QWEN_VLLM_LANGUAGE_ALIASES:
+            return QWEN_VLLM_LANGUAGE_ALIASES[primary_subtag]
+
+        return stripped[:1].upper() + stripped[1:].lower()
+
     def _init_streaming_state(self, language: str | None = None):
+        normalized_language = self.normalize_language(language)
         with self._lock:
             self._load()
             assert self._model is not None
             return self._model.init_streaming_state(
-                language=language,
+                language=normalized_language,
                 unfixed_chunk_num=self.settings.asr_stream_unfixed_chunk_num,
                 unfixed_token_num=self.settings.asr_stream_unfixed_token_num,
                 chunk_size_sec=self.settings.asr_stream_chunk_seconds,

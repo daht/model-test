@@ -68,6 +68,15 @@ class FakeStatefulTranscriber:
         return self.session
 
 
+class RaisingStatefulTranscriber:
+    def __init__(self, exc):
+        self.exc = exc
+
+    def create_streaming_session(self, language=None):
+        self.language = language
+        raise self.exc
+
+
 def test_asr_health_reports_model_name():
     response = client.get("/health")
 
@@ -222,12 +231,78 @@ def test_qwen_vllm_streaming_session_feeds_pcm_and_finishes(monkeypatch):
     assert calls[1] == (
         "init",
         {
-            "language": "zh",
+            "language": "Chinese",
             "unfixed_chunk_num": 2,
             "unfixed_token_num": 5,
             "chunk_size_sec": 2.0,
         },
     )
+
+
+def test_qwen_vllm_file_transcribe_normalizes_language_code(monkeypatch):
+    import sys
+    import types
+
+    from app.asr import QwenVLLMASRTranscriber
+    from app.config import Settings
+
+    calls = []
+
+    class FakeResult:
+        text = "hello"
+        language = "English"
+
+    class FakeModel:
+        def transcribe(self, **kwargs):
+            calls.append(("transcribe", kwargs))
+            return [FakeResult()]
+
+    class FakeQwen3ASRModel:
+        @classmethod
+        def LLM(cls, **kwargs):
+            calls.append(("load", kwargs))
+            return FakeModel()
+
+    monkeypatch.setitem(sys.modules, "qwen_asr", types.SimpleNamespace(Qwen3ASRModel=FakeQwen3ASRModel))
+
+    transcriber = QwenVLLMASRTranscriber(Settings(asr_backend="qwen_vllm"))
+    result = transcriber.transcribe("sample.wav", language="en")
+
+    assert result.text == "hello"
+    assert result.language == "English"
+    assert calls[1] == ("transcribe", {"audio": "sample.wav", "language": "English"})
+
+
+def test_qwen_vllm_file_transcribe_normalizes_regional_language_code(monkeypatch):
+    import sys
+    import types
+
+    from app.asr import QwenVLLMASRTranscriber
+    from app.config import Settings
+
+    calls = []
+
+    class FakeResult:
+        text = "hello"
+        language = "English"
+
+    class FakeModel:
+        def transcribe(self, **kwargs):
+            calls.append(("transcribe", kwargs))
+            return [FakeResult()]
+
+    class FakeQwen3ASRModel:
+        @classmethod
+        def LLM(cls, **kwargs):
+            calls.append(("load", kwargs))
+            return FakeModel()
+
+    monkeypatch.setitem(sys.modules, "qwen_asr", types.SimpleNamespace(Qwen3ASRModel=FakeQwen3ASRModel))
+
+    transcriber = QwenVLLMASRTranscriber(Settings(asr_backend="qwen_vllm"))
+    transcriber.transcribe("sample.wav", language="en-US")
+
+    assert calls[1] == ("transcribe", {"audio": "sample.wav", "language": "English"})
 
 
 def test_stream_rejects_bad_api_key():
@@ -302,6 +377,22 @@ def test_stateful_stream_vad_commit_excludes_confirmed_prefix(monkeypatch):
         asr_api.get_settings.cache_clear()
 
 
+def test_stateful_stream_clears_revised_empty_partial(monkeypatch):
+    asr_api.get_settings.cache_clear()
+    monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
+    monkeypatch.setattr(asr_api, "asr_transcriber", FakeStatefulTranscriber(FakeStreamingSession(["hello", ""])))
+
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            _start_stream(websocket)
+            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
+            assert websocket.receive_json() == {"type": "partial", "text": "hello"}
+            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
+            assert websocket.receive_json() == {"type": "partial", "text": ""}
+    finally:
+        asr_api.get_settings.cache_clear()
+
+
 def test_stateful_stream_finish_flushes_remaining_text(monkeypatch):
     asr_api.get_settings.cache_clear()
     monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
@@ -340,6 +431,34 @@ def test_stateful_stream_rejects_non_16khz_sample_rate(monkeypatch):
             assert websocket.receive_json() == {
                 "type": "error",
                 "message": "Stateful ASR streaming requires sample_rate 16000",
+            }
+    finally:
+        asr_api.get_settings.cache_clear()
+
+
+def test_stateful_stream_returns_error_when_streaming_session_rejects_language(monkeypatch):
+    asr_api.get_settings.cache_clear()
+    monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
+    monkeypatch.setattr(
+        asr_api,
+        "asr_transcriber",
+        RaisingStatefulTranscriber(ValueError("Unsupported language: Xx")),
+    )
+
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            websocket.send_json(
+                {
+                    "type": "start",
+                    "api_key": "test-key",
+                    "language": "xx",
+                    "sample_rate": 16000,
+                    "format": "pcm_s16le",
+                }
+            )
+            assert websocket.receive_json() == {
+                "type": "error",
+                "message": "Unsupported language: Xx",
             }
     finally:
         asr_api.get_settings.cache_clear()

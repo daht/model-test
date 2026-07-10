@@ -57,9 +57,6 @@ class SentenceCommitter:
         return self._commit_complete_sentences()
 
     def append_cumulative(self, text: str) -> list[str]:
-        if not text:
-            return []
-
         self.pending_text = self._tail_after_confirmed_text(text)
         return self._commit_complete_sentences()
 
@@ -419,6 +416,10 @@ async def _run_stateful_transcribe_stream(
         await websocket.send_json({"type": "error", "message": str(exc)})
         await websocket.close(code=1011)
         return
+    except ValueError as exc:
+        await websocket.send_json({"type": "error", "message": str(exc)})
+        await websocket.close(code=1003)
+        return
 
     await websocket.send_json({"type": "ready"})
 
@@ -427,16 +428,14 @@ async def _run_stateful_transcribe_stream(
         if "bytes" in message and message["bytes"] is not None:
             pcm_bytes = message["bytes"]
             result = session.add_pcm_s16le(pcm_bytes, sample_rate)
-            if result.text:
-                await _send_committed_and_partial(websocket, committer, result.text, cumulative=True)
+            await _send_committed_and_partial(websocket, committer, result.text, cumulative=True)
             if silence_detector.add_audio(pcm_bytes, sample_rate):
                 await _send_pending_commit(websocket, committer)
         elif "text" in message and message["text"] is not None:
             payload = json.loads(message["text"])
             if payload.get("type") == "end":
                 result = session.finish()
-                if result.text:
-                    await _send_committed_and_partial(websocket, committer, result.text, cumulative=True)
+                await _send_committed_and_partial(websocket, committer, result.text, cumulative=True)
                 await websocket.send_json({"type": "final", "text": committer.pending_text})
                 await websocket.close(code=1000)
                 return
@@ -457,7 +456,7 @@ async def _send_committed_and_partial(
     append = committer.append_cumulative if cumulative else committer.append
     for sentence in append(text):
         await websocket.send_json({"type": "sentence_final", "text": sentence})
-    if committer.pending_text and committer.pending_text != previous_pending:
+    if committer.pending_text != previous_pending and (committer.pending_text or cumulative):
         await websocket.send_json({"type": "partial", "text": committer.pending_text})
 
 
