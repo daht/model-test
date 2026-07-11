@@ -11,7 +11,7 @@
 **Design source:** `docs/superpowers/specs/2026-07-11-asr-stateful-hardening-design.md`
 
 **Execution status (2026-07-11):** Tasks 1-9 are implemented and locally
-verified in the feature worktree (`136` ASR tests and `149` full-suite tests).
+verified in the feature worktree (`143` ASR tests and `156` full-suite tests).
 Docker, a GPU, and model weights are unavailable in the implementation
 environment, so Compose rendering and real-model checks remain explicit external
 gates. Tasks 10-11 remain separate independent-test-agent and primary-agent
@@ -130,7 +130,7 @@ Update `app/config.py` imports and fields:
 from pydantic import Field, field_validator, model_validator
 
 # Inside Settings
-asr_protocol_version: Literal[2] = 2
+asr_protocol_version: int = Field(default=2, ge=2, le=2)
 asr_eager_load: bool = True
 asr_file_transcribe_enabled: bool = False
 asr_max_active_streams: int = Field(default=2, gt=0, le=64)

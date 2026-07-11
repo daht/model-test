@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     asr_stable_commit_seconds: float = Field(default=1.0, gt=0, le=30)
     asr_stable_commit_min_chars: int = Field(default=8, gt=0, le=10000)
     asr_stable_commit_min_updates: int = Field(default=2, gt=0, le=1000)
-    asr_protocol_version: Literal[2] = 2
+    asr_protocol_version: int = Field(default=2, ge=2, le=2)
     asr_eager_load: bool = True
     asr_file_transcribe_enabled: bool = False
     asr_max_active_streams: int = Field(default=2, gt=0, le=64)

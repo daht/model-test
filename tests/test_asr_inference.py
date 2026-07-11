@@ -28,6 +28,8 @@ class FakeSession(ASRStreamingSession):
 
     def add_pcm_s16le(self, pcm_bytes, sample_rate):
         self.owner.record("add")
+        if pcm_bytes == b"base-exit":
+            raise SystemExit("fake owner-thread termination")
         if pcm_bytes == b"block":
             self.owner.call_started.set()
             self.owner.release_call.wait(2)
@@ -664,6 +666,132 @@ def test_unexpected_worker_exit_clears_cached_readiness():
     assert snapshot.ready is False
     assert snapshot.accepting is False
     assert accounting_completed is True
+
+
+def test_base_exception_resolves_current_job_before_worker_terminates():
+    async def scenario():
+        coordinator, _records, _holder = make_coordinator(
+            asr_stream_inference_timeout_seconds=0.5,
+        )
+        await coordinator.start()
+        session_id = await coordinator.create_stream(None)
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(ASRNotReady):
+            await coordinator.add_audio(session_id, b"base-exit", 16000)
+        elapsed = asyncio.get_running_loop().time() - started
+        await asyncio.to_thread(coordinator._thread.join, 1)
+        queue_joined = threading.Event()
+
+        def join_queue():
+            coordinator._jobs.join()
+            queue_joined.set()
+
+        threading.Thread(target=join_queue, daemon=True).start()
+        accounting_completed = await asyncio.to_thread(queue_joined.wait, 0.2)
+        return (
+            elapsed,
+            coordinator.snapshot(),
+            coordinator.worker_alive,
+            set(coordinator._busy_sessions),
+            accounting_completed,
+        )
+
+    elapsed, snapshot, worker_alive, busy_sessions, accounting_completed = (
+        asyncio.run(scenario())
+    )
+
+    assert elapsed < 0.2
+    assert worker_alive is False
+    assert snapshot.ready is False
+    assert snapshot.accepting is False
+    assert snapshot.queue_depth == 0
+    assert snapshot.queued_audio_seconds == 0.0
+    assert busy_sessions == set()
+    assert accounting_completed is True
+
+
+def test_finalizer_closes_admission_before_draining_queue():
+    async def scenario():
+        coordinator, _records, _holder = make_coordinator()
+        with coordinator._lock:
+            coordinator._accepting = True
+            coordinator._ready = True
+
+        drain_started = threading.Event()
+        release_drain = threading.Event()
+        original_cancel_queued_jobs = coordinator._cancel_queued_jobs
+
+        def blocking_cancel_queued_jobs(error):
+            drain_started.set()
+            release_drain.wait(1)
+            original_cancel_queued_jobs(error)
+
+        coordinator._cancel_queued_jobs = blocking_cancel_queued_jobs
+        finalizer = threading.Thread(
+            target=coordinator._finalize_worker,
+            args=({},),
+            daemon=True,
+        )
+        finalizer.start()
+        assert await asyncio.to_thread(drain_started.wait, 1)
+
+        admission = asyncio.create_task(coordinator.create_stream(None))
+        await asyncio.sleep(0.02)
+        rejected_before_drain = admission.done()
+        queue_depth_during_drain = coordinator.snapshot().queue_depth
+
+        release_drain.set()
+        with pytest.raises(ASRNotReady):
+            await admission
+        await asyncio.to_thread(finalizer.join, 1)
+        return rejected_before_drain, queue_depth_during_drain, coordinator.snapshot()
+
+    rejected, queue_depth, snapshot = asyncio.run(scenario())
+
+    assert rejected is True
+    assert queue_depth == 0
+    assert snapshot.accepting is False
+    assert snapshot.ready is False
+
+
+def test_finalizer_drains_jobs_before_aborting_sessions():
+    class BlockingAbortSession:
+        def __init__(self, abort_started, release_abort):
+            self.abort_started = abort_started
+            self.release_abort = release_abort
+
+        def abort(self):
+            self.abort_started.set()
+            self.release_abort.wait(1)
+
+    coordinator, _records, _holder = make_coordinator()
+    with coordinator._lock:
+        coordinator._accepting = True
+        coordinator._ready = True
+    drain_called = threading.Event()
+    abort_started = threading.Event()
+    release_abort = threading.Event()
+    original_cancel_queued_jobs = coordinator._cancel_queued_jobs
+
+    def recording_cancel_queued_jobs(error):
+        drain_called.set()
+        original_cancel_queued_jobs(error)
+
+    coordinator._cancel_queued_jobs = recording_cancel_queued_jobs
+    finalizer = threading.Thread(
+        target=coordinator._finalize_worker,
+        args=({"session": BlockingAbortSession(abort_started, release_abort)},),
+        daemon=True,
+    )
+    finalizer.start()
+    try:
+        assert abort_started.wait(1)
+        drained_before_abort_completed = drain_called.wait(0.05)
+    finally:
+        release_abort.set()
+        finalizer.join(1)
+
+    assert drained_before_abort_completed is True
 
 
 def test_stop_during_lazy_warmup_never_creates_an_orphan_session():

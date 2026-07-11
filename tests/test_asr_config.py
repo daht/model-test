@@ -19,6 +19,22 @@ def test_asr_hardening_defaults_are_conservative():
     assert settings.asr_ws_max_queue == 4
 
 
+def test_protocol_version_accepts_string_from_environment(monkeypatch):
+    monkeypatch.setenv("ASR_PROTOCOL_VERSION", "2")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.asr_protocol_version == 2
+
+
+@pytest.mark.parametrize("version", ["1", "3"])
+def test_protocol_version_rejects_other_environment_values(monkeypatch, version):
+    monkeypatch.setenv("ASR_PROTOCOL_VERSION", version)
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
 @pytest.mark.parametrize(
     ("name", "value"),
     [

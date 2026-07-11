@@ -548,6 +548,13 @@ class ASRInferenceCoordinator:
                 if not job.result.done():
                     self._release_session_reservation(job)
                     job.result.set_exception(exc)
+            except BaseException:
+                worker_error = ASRNotReady("ASR owner worker stopped unexpectedly")
+                if not job.started.done():
+                    job.started.set_exception(worker_error)
+                if not job.result.done():
+                    job.result.set_exception(worker_error)
+                raise
             finally:
                 try:
                     self._cleanup_poisoned_session(sessions, job.session_id)
@@ -576,13 +583,16 @@ class ASRInferenceCoordinator:
         return True
 
     def _finalize_worker(self, sessions: dict[str, Any]) -> None:
+        with self._lock:
+            self._accepting = False
+            self._ready = False
+        self._cancel_queued_jobs(ASRNotReady("ASR owner worker stopped"))
         for session in list(sessions.values()):
             try:
                 session.abort()
             except Exception:
                 logger.warning("ASR session abort failed during worker cleanup", exc_info=True)
         sessions.clear()
-        self._cancel_queued_jobs(ASRNotReady("ASR owner worker stopped"))
         with self._lock:
             self._active_sessions.clear()
             self._poisoned_sessions.clear()
@@ -592,8 +602,6 @@ class ASRInferenceCoordinator:
             self._batch_running = False
             self._queued_audio_seconds = 0.0
             self._queued_business_jobs = 0
-            self._ready = False
-            self._accepting = False
 
     def _cancel_queued_jobs(self, error: Exception) -> None:
         while True:

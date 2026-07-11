@@ -142,6 +142,10 @@ deadline, and shutdown-admission check before any session object is created.
 - A timed-out or disconnected job may consume capacity until the underlying model call returns, but it cannot mutate a live replacement session.
 - The absolute WebSocket session deadline is checked again after inference and
   synchronous cleanup, before transcript state changes or events are emitted.
+- Every non-error WebSocket send is itself bounded by the remaining absolute
+  session deadline. If sending crosses the deadline, the send is cancelled,
+  the session is aborted/poisoned, and an unbounded `session_timeout` error send
+  is the first event attempted after expiry.
 
 ### Scheduling
 
@@ -226,6 +230,10 @@ Binary frames must be non-empty, even-length PCM and below the configured frame 
 - A reserved queue slot admits the shutdown control job even when all business
   slots are full. Unexpected worker exit clears readiness/admission, completes
   queue accounting, cancels queued futures, and isolates abort failures.
+- Finalization atomically sets readiness and admission false, drains/fails
+  queued jobs, and only then aborts sessions and clears registries. A
+  `BaseException` from a model call resolves the current job as `ASRNotReady`
+  before the owner thread is allowed to terminate.
 
 ## Configuration
 
@@ -250,6 +258,10 @@ ASR_STREAM_INFERENCE_TIMEOUT_SECONDS=15.0
 ASR_FILE_INFERENCE_TIMEOUT_SECONDS=300.0
 ASR_SHUTDOWN_GRACE_SECONDS=10.0
 ```
+
+`ASR_PROTOCOL_VERSION` is parsed as a coercible integer constrained to exactly
+`2`, so the normal environment representation `ASR_PROTOCOL_VERSION=2` is valid
+while all other versions are rejected.
 
 `ASR_MAX_ACTIVE_STREAMS=2` is an intentionally conservative rollout value, not a capacity claim. A10 benchmarks determine the final value.
 

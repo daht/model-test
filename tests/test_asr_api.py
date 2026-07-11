@@ -874,6 +874,49 @@ def test_chunked_post_inference_cleanup_cannot_emit_partial_after_session_deadli
     assert coordinator.abort_count >= 1
 
 
+def test_transcript_send_is_cancelled_when_it_crosses_session_deadline():
+    class DelayedWebSocket:
+        def __init__(self):
+            self.sent = []
+            self.close_code = None
+
+        async def send_json(self, payload):
+            if payload["type"] != "error":
+                await asyncio.sleep(0.06)
+            self.sent.append(payload)
+
+        async def close(self, code):
+            self.close_code = code
+
+    async def scenario():
+        websocket = DelayedWebSocket()
+        coordinator = ProtocolCoordinator()
+        controller = asr_api.StreamingSessionController(
+            websocket,
+            _protocol_settings(asr_max_session_seconds=0.03),
+            coordinator,
+        )
+        controller.session_id = "protocol-session"
+        event = controller.transcript.new_event("partial", "must not be sent")
+
+        with pytest.raises(asr_api._StreamClosed):
+            await controller._send_event(event)
+        return websocket, coordinator
+
+    websocket, coordinator = asyncio.run(scenario())
+
+    assert websocket.sent == [
+        {
+            "type": "error",
+            "code": "session_timeout",
+            "message": "Maximum session duration exceeded",
+            "sequence": 2,
+        }
+    ]
+    assert websocket.close_code == 1008
+    assert coordinator.abort_count == 1
+
+
 def test_stream_v2_maps_segment_reset_failure_to_stable_error():
     coordinator = ProtocolCoordinator(reset_error=RuntimeError("reset failed"))
     _override_protocol(coordinator)

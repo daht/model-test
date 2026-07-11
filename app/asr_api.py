@@ -501,7 +501,17 @@ class StreamingSessionController:
         payload = {"type": event.type, "sequence": event.sequence}
         if event.type in {"partial", "sentence_final", "final"}:
             payload["text"] = event.text
-        await self.websocket.send_json(payload)
+        if event.type == "error":
+            await self.websocket.send_json(payload)
+            return
+        remaining = self.remaining_session_seconds
+        if remaining <= 0:
+            await self._expire_session()
+        try:
+            async with asyncio.timeout(remaining):
+                await self.websocket.send_json(payload)
+        except TimeoutError:
+            await self._expire_session()
 
 
 @app.websocket("/v1/transcribe/stream")
