@@ -1,7 +1,7 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -37,6 +37,21 @@ class Settings(BaseSettings):
     asr_stable_commit_seconds: float = 1.0
     asr_stable_commit_min_chars: int = 8
     asr_stable_commit_min_updates: int = 2
+    asr_protocol_version: Literal[2] = 2
+    asr_eager_load: bool = True
+    asr_file_transcribe_enabled: bool = False
+    asr_max_active_streams: int = Field(default=2, gt=0, le=64)
+    asr_inference_queue_size: int = Field(default=16, gt=0, le=1024)
+    asr_max_queued_audio_seconds: float = Field(default=4.0, gt=0, le=120)
+    asr_max_connection_lag_seconds: float = Field(default=2.0, gt=0, le=30)
+    asr_max_frame_bytes: int = Field(default=32000, gt=0, le=1_048_576)
+    asr_start_timeout_seconds: float = Field(default=10.0, gt=0, le=120)
+    asr_idle_timeout_seconds: float = Field(default=30.0, gt=0, le=3600)
+    asr_max_session_seconds: float = Field(default=1800.0, gt=0, le=86400)
+    asr_max_audio_seconds: float = Field(default=1800.0, gt=0, le=86400)
+    asr_stream_queue_timeout_seconds: float = Field(default=2.0, gt=0, le=60)
+    asr_stream_inference_timeout_seconds: float = Field(default=15.0, gt=0, le=300)
+    asr_file_inference_timeout_seconds: float = Field(default=300.0, gt=0, le=3600)
     tts_model_name: str = "CosyVoice"
     tts_backend: Literal["mock", "cosyvoice"] = "mock"
     tts_model_id: str = "/models/CosyVoice"
@@ -46,6 +61,13 @@ class Settings(BaseSettings):
     tts_default_voice: str = "default"
     tts_cosyvoice_repo: str | None = "/opt/CosyVoice"
     trust_remote_code: bool = True
+
+    @field_validator("asr_max_frame_bytes")
+    @classmethod
+    def require_even_pcm_frame_limit(cls, value: int) -> int:
+        if value % 2:
+            raise ValueError("asr_max_frame_bytes must be even for pcm_s16le")
+        return value
 
 
 @lru_cache
