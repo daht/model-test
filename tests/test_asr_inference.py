@@ -794,6 +794,99 @@ def test_finalizer_drains_jobs_before_aborting_sessions():
     assert drained_before_abort_completed is True
 
 
+def test_stop_during_finalizer_abort_leaves_no_stale_control_job_and_restarts():
+    async def scenario():
+        coordinator, _records, holder = make_coordinator(
+            asr_shutdown_grace_seconds=1.0,
+        )
+        await coordinator.start()
+        session_id = await coordinator.create_stream(None)
+        session = holder["transcriber"].sessions[0]
+        abort_started = threading.Event()
+        release_abort = threading.Event()
+        original_abort = session.abort
+
+        def blocking_abort():
+            abort_started.set()
+            release_abort.wait(1)
+            original_abort()
+
+        session.abort = blocking_abort
+        with pytest.raises(ASRNotReady):
+            await coordinator.add_audio(session_id, b"base-exit", 16000)
+        assert await asyncio.to_thread(abort_started.wait, 1)
+
+        stop_task = asyncio.create_task(coordinator.stop())
+        await asyncio.sleep(0.02)
+        queued_during_finalizer = (
+            coordinator._jobs.qsize(),
+            coordinator._jobs.unfinished_tasks,
+        )
+        release_abort.set()
+        await stop_task
+        queued_after_stop = (
+            coordinator._jobs.qsize(),
+            coordinator._jobs.unfinished_tasks,
+        )
+
+        restarted = False
+        if queued_after_stop == (0, 0):
+            await coordinator.start()
+            restarted_id = await coordinator.create_stream(None)
+            await coordinator.abort_stream(restarted_id)
+            await coordinator.stop()
+            restarted = True
+        return queued_during_finalizer, queued_after_stop, restarted
+
+    during, after, restarted = asyncio.run(scenario())
+
+    assert during == (0, 0)
+    assert after == (0, 0)
+    assert restarted is True
+
+
+def test_concurrent_stop_enqueues_exactly_one_high_priority_control_job():
+    async def scenario():
+        coordinator, _records, holder = make_coordinator(
+            asr_shutdown_grace_seconds=1.0,
+        )
+        await coordinator.start()
+        session_id = await coordinator.create_stream(None)
+        running = asyncio.create_task(
+            coordinator.add_audio(session_id, b"block", 16000)
+        )
+        assert await asyncio.to_thread(holder["transcriber"].call_started.wait, 1)
+
+        shutdown_priorities = []
+        original_new_job = coordinator._new_job
+
+        def recording_new_job(action, *args, **kwargs):
+            if action == "shutdown":
+                shutdown_priorities.append(kwargs["priority"])
+            return original_new_job(action, *args, **kwargs)
+
+        coordinator._new_job = recording_new_job
+        first_stop = asyncio.create_task(coordinator.stop())
+        second_stop = asyncio.create_task(coordinator.stop())
+        await asyncio.sleep(0.02)
+        holder["transcriber"].release_call.set()
+        await running
+        await asyncio.gather(first_stop, second_stop)
+        return (
+            shutdown_priorities,
+            coordinator._jobs.qsize(),
+            coordinator._jobs.unfinished_tasks,
+            coordinator.worker_alive,
+        )
+
+    priorities, queue_size, unfinished, worker_alive = asyncio.run(scenario())
+
+    assert priorities == [-100]
+    assert queue_size == 0
+    assert unfinished == 0
+    assert worker_alive is False
+
+
 def test_stop_during_lazy_warmup_never_creates_an_orphan_session():
     async def scenario():
         records = []

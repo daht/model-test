@@ -11,7 +11,7 @@
 **Design source:** `docs/superpowers/specs/2026-07-11-asr-stateful-hardening-design.md`
 
 **Execution status (2026-07-11):** Tasks 1-9 are implemented and locally
-verified in the feature worktree (`143` ASR tests and `156` full-suite tests).
+verified in the feature worktree (`145` ASR tests and `158` full-suite tests).
 Docker, a GPU, and model weights are unavailable in the implementation
 environment, so Compose rendering and real-model checks remain explicit external
 gates. Tasks 10-11 remain separate independent-test-agent and primary-agent
@@ -629,7 +629,7 @@ The completed `ASRInferenceCoordinator` exposes these exact methods:
 - `async transcribe_file(audio_path: str, language: str | None) -> TranscriptionResult`
 - `snapshot() -> CoordinatorSnapshot`
 
-Internally use a bounded `queue.PriorityQueue`, a monotonically increasing job sequence, `concurrent.futures.Future`, one `threading.Thread`, and a session dictionary owned only by the worker thread. Use numeric priority `0` for lifecycle/stream jobs, `10` for file jobs, and `100` for shutdown.
+Internally use a bounded `queue.PriorityQueue`, a monotonically increasing job sequence, `concurrent.futures.Future`, one `threading.Thread`, and a session dictionary owned only by the worker thread. Use numeric priority `-100` for shutdown, `0` for lifecycle/stream jobs, and `10` for file jobs. Guard the worker-loop-active and shutdown-requested flags together with the single control-job enqueue so concurrent stops cannot create duplicate or stale sentinels.
 
 - [ ] **Step 4: Implement deadline-safe submission**
 

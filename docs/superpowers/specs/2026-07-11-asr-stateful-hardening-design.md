@@ -230,6 +230,11 @@ Binary frames must be non-empty, even-length PCM and below the configured frame 
 - A reserved queue slot admits the shutdown control job even when all business
   slots are full. Unexpected worker exit clears readiness/admission, completes
   queue accounting, cancels queued futures, and isolates abort failures.
+- Shutdown has priority `-100`, ahead of stream (`0`) and file (`10`) work. The
+  worker-loop-active transition, shutdown-requested flag, and single sentinel
+  enqueue share one lock. A thread that is alive only because finalization is
+  aborting sessions can therefore never receive an unconsumable control job,
+  and concurrent `stop()` calls cannot enqueue duplicate sentinels.
 - Finalization atomically sets readiness and admission false, drains/fails
   queued jobs, and only then aborts sessions and clears registries. A
   `BaseException` from a model call resolves the current job as `ASRNotReady`

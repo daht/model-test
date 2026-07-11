@@ -106,6 +106,8 @@ class ASRInferenceCoordinator:
         self._startup: Future[None] | None = None
         self._accepting = False
         self._ready = False
+        self._worker_loop_active = False
+        self._shutdown_requested = False
         self._load_error: str | None = None
         self._queued_audio_seconds = 0.0
         self._queued_business_jobs = 0
@@ -127,6 +129,8 @@ class ASRInferenceCoordinator:
                 return
             self._accepting = True
             self._ready = False
+            self._worker_loop_active = True
+            self._shutdown_requested = False
             self._load_error = None
             self._startup = Future()
             self._thread = threading.Thread(
@@ -143,14 +147,28 @@ class ASRInferenceCoordinator:
         with self._lock:
             self._accepting = False
             thread = self._thread
+            if (
+                thread
+                and thread.is_alive()
+                and self._worker_loop_active
+                and not self._shutdown_requested
+            ):
+                shutdown = self._new_job(
+                    "shutdown",
+                    (),
+                    None,
+                    priority=-100,
+                    queue_timeout=3600,
+                )
+                try:
+                    self._jobs.put_nowait(shutdown)
+                except queue.Full as exc:
+                    raise RuntimeError(
+                        "ASR shutdown control slot is unavailable"
+                    ) from exc
+                self._shutdown_requested = True
         if not thread or not thread.is_alive():
             return
-        self._cancel_queued_jobs(ASRNotReady("ASR coordinator is shutting down"))
-        shutdown = self._new_job("shutdown", (), None, priority=100, queue_timeout=3600)
-        try:
-            self._jobs.put_nowait(shutdown)
-        except queue.Full as exc:
-            raise RuntimeError("ASR shutdown control slot is unavailable") from exc
         remaining = max(
             0.0,
             self.settings.asr_shutdown_grace_seconds - (time.monotonic() - stop_started),
@@ -482,17 +500,6 @@ class ASRInferenceCoordinator:
             try:
                 if job.action == "shutdown":
                     job.started.set_result(None)
-                    for session in list(sessions.values()):
-                        try:
-                            session.abort()
-                        except Exception:
-                            pass
-                    sessions.clear()
-                    with self._lock:
-                        self._active_sessions.clear()
-                        self._poisoned_sessions.clear()
-                        self._last_timings.clear()
-                        self._ready = False
                     job.result.set_result(None)
                     return
 
@@ -586,6 +593,7 @@ class ASRInferenceCoordinator:
         with self._lock:
             self._accepting = False
             self._ready = False
+            self._worker_loop_active = False
         self._cancel_queued_jobs(ASRNotReady("ASR owner worker stopped"))
         for session in list(sessions.values()):
             try:
@@ -602,6 +610,7 @@ class ASRInferenceCoordinator:
             self._batch_running = False
             self._queued_audio_seconds = 0.0
             self._queued_business_jobs = 0
+            self._shutdown_requested = False
 
     def _cancel_queued_jobs(self, error: Exception) -> None:
         while True:
