@@ -7,6 +7,11 @@ MODE="${1:-build}"
 PULL_CODE="${PULL_CODE:-auto}"
 LOG_TAIL="${LOG_TAIL:-120}"
 HEALTH_TIMEOUT_SECONDS="${HEALTH_TIMEOUT_SECONDS:-300}"
+if [[ "${SERVICE}" == "qwen-asr-api" ]]; then
+  CHECK_PATH="/ready"
+else
+  CHECK_PATH="/health"
+fi
 
 if [[ ! -f "docker-compose.yml" ]]; then
   echo "Run this script from the project directory that contains docker-compose.yml."
@@ -53,14 +58,14 @@ maybe_pull_code() {
 }
 
 wait_for_health() {
-  echo "Waiting for ${BASE_URL}/health ..."
+  echo "Waiting for ${BASE_URL}${CHECK_PATH} ..."
   local deadline
   deadline=$((SECONDS + HEALTH_TIMEOUT_SECONDS))
 
   while (( SECONDS < deadline )); do
-    if curl -fsS "${BASE_URL}/health" >/tmp/hy-mt-health.json 2>/dev/null; then
+    if curl -fsS "${BASE_URL}${CHECK_PATH}" >/tmp/service-health.json 2>/dev/null; then
       echo "Health check passed:"
-      cat /tmp/hy-mt-health.json
+      cat /tmp/service-health.json
       echo
       return
     fi
@@ -78,26 +83,41 @@ show_status() {
   compose logs --tail="${LOG_TAIL}" "${SERVICE}"
 }
 
+run_asr_smoke() {
+  if [[ "${SERVICE}" != "qwen-asr-api" ]]; then
+    return
+  fi
+  echo "Running ASR WebSocket smoke..."
+  (
+    set -a
+    source ./.env
+    BASE_URL="${BASE_URL}" scripts/smoke_asr.sh
+  )
+}
+
 case "${MODE}" in
   build)
     maybe_pull_code
     echo "Building ${SERVICE} while the old container keeps running..."
     compose build "${SERVICE}"
     echo "Recreating ${SERVICE}..."
-    compose up -d --no-deps "${SERVICE}"
+    compose up -d --force-recreate --no-deps "${SERVICE}"
     wait_for_health
+    run_asr_smoke
     show_status
     ;;
   env)
     echo "Recreating ${SERVICE} with current .env..."
     compose up -d --force-recreate --no-deps "${SERVICE}"
     wait_for_health
+    run_asr_smoke
     show_status
     ;;
   restart)
     echo "Restarting ${SERVICE}..."
     compose restart "${SERVICE}"
     wait_for_health
+    run_asr_smoke
     show_status
     ;;
   logs)

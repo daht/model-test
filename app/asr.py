@@ -66,6 +66,9 @@ class TranscriptionResult:
 class StreamingTranscriptionResult:
     text: str
     language: str | None
+    processed_samples: int | None = None
+    model_updated: bool = True
+    segment_finished: bool = False
 
 
 class ASRStreamingSession:
@@ -75,8 +78,11 @@ class ASRStreamingSession:
     def finish(self) -> StreamingTranscriptionResult:
         raise NotImplementedError
 
-    def reset_segment(self) -> None:
+    def finish_segment(self) -> StreamingTranscriptionResult:
         raise NotImplementedError
+
+    def reset_segment(self) -> StreamingTranscriptionResult:
+        return self.finish_segment()
 
     def abort(self) -> None:
         raise NotImplementedError
@@ -111,6 +117,53 @@ class MockASRTranscriber(ASRTranscriber):
             text=f"[mock asr {detected_language}] {filename}",
             language=detected_language,
         )
+
+    def create_streaming_session(self, language: str | None = None) -> ASRStreamingSession:
+        return MockASRStreamingSession(language)
+
+
+class MockASRStreamingSession(ASRStreamingSession):
+    def __init__(self, language: str | None) -> None:
+        self.language = language or "auto"
+        self._closed = False
+
+    def add_pcm_s16le(self, pcm_bytes: bytes, sample_rate: int) -> StreamingTranscriptionResult:
+        self._require_open()
+        if sample_rate != 16000:
+            raise ValueError("mock streaming requires 16000 Hz sample_rate")
+        return StreamingTranscriptionResult(
+            text="",
+            language=self.language,
+            processed_samples=len(pcm_bytes) // 2,
+            model_updated=True,
+        )
+
+    def finish_segment(self) -> StreamingTranscriptionResult:
+        self._require_open()
+        return StreamingTranscriptionResult(
+            text="",
+            language=self.language,
+            processed_samples=0,
+            model_updated=False,
+            segment_finished=True,
+        )
+
+    def finish(self) -> StreamingTranscriptionResult:
+        self._require_open()
+        self._closed = True
+        return StreamingTranscriptionResult(
+            text="",
+            language=self.language,
+            processed_samples=0,
+            model_updated=False,
+        )
+
+    def abort(self) -> None:
+        self._closed = True
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("streaming session is closed")
 
 
 class QwenASRTranscriber(ASRTranscriber):
@@ -205,6 +258,11 @@ class QwenVLLMStreamingSession(ASRStreamingSession):
         self.language = transcriber.normalize_language(language)
         self._text_prefix = ""
         self._closed = False
+        self._segment_received_samples = 0
+        self._undecoded_samples = 0
+        self._rollover_samples = int(
+            round(transcriber.settings.asr_stream_rollover_seconds * 16000)
+        )
         self.state = transcriber._init_streaming_state(language=self.language)
 
     def add_pcm_s16le(self, pcm_bytes: bytes, sample_rate: int) -> StreamingTranscriptionResult:
@@ -215,6 +273,8 @@ class QwenVLLMStreamingSession(ASRStreamingSession):
             return StreamingTranscriptionResult(
                 text=self._combined_text(),
                 language=getattr(self.state, "language", self.language),
+                processed_samples=0,
+                model_updated=False,
             )
 
         sample_count = len(pcm_bytes) // 2
@@ -230,27 +290,60 @@ class QwenVLLMStreamingSession(ASRStreamingSession):
             pcm.frombytes(pcm_bytes[: sample_count * 2])
             if sys.byteorder != "little":
                 pcm.byteswap()
+        previous_chunk_id = self._chunk_id()
+        self._segment_received_samples += sample_count
+        self._undecoded_samples += sample_count
         state = self.transcriber._streaming_transcribe(pcm, self.state)
         self.state = state
+        decoded_samples, model_updated = self._decode_progress(previous_chunk_id)
+        if self._segment_received_samples >= self._rollover_samples:
+            flush_samples, flush_updated = self._finish_active_state()
+            decoded_samples += flush_samples
+            model_updated = model_updated or flush_updated
+            text = self._combined_text()
+            language = getattr(self.state, "language", self.language)
+            self._start_fresh_segment(text)
+            return StreamingTranscriptionResult(
+                text=text,
+                language=language,
+                processed_samples=decoded_samples,
+                model_updated=model_updated,
+                segment_finished=True,
+            )
         return StreamingTranscriptionResult(
             text=self._combined_text(),
             language=getattr(state, "language", self.language),
+            processed_samples=decoded_samples,
+            model_updated=model_updated,
         )
 
     def finish(self) -> StreamingTranscriptionResult:
         self._require_open()
-        state = self.transcriber._finish_streaming_transcribe(self.state)
-        self.state = state
+        processed_samples, model_updated = self._finish_active_state()
         self._closed = True
         return StreamingTranscriptionResult(
             text=self._combined_text(),
-            language=getattr(state, "language", self.language),
+            language=getattr(self.state, "language", self.language),
+            processed_samples=processed_samples,
+            model_updated=model_updated,
         )
 
-    def reset_segment(self) -> None:
+    def finish_segment(self) -> StreamingTranscriptionResult:
         self._require_open()
-        self._text_prefix = self._combined_text()
-        self.state = self.transcriber._init_streaming_state(language=self.language)
+        processed_samples, model_updated = self._finish_active_state()
+        text = self._combined_text()
+        language = getattr(self.state, "language", self.language)
+        self._start_fresh_segment(text)
+        return StreamingTranscriptionResult(
+            text=text,
+            language=language,
+            processed_samples=processed_samples,
+            model_updated=model_updated,
+            segment_finished=True,
+        )
+
+    def reset_segment(self) -> StreamingTranscriptionResult:
+        return self.finish_segment()
 
     def abort(self) -> None:
         self.state = None
@@ -258,6 +351,36 @@ class QwenVLLMStreamingSession(ASRStreamingSession):
 
     def _combined_text(self) -> str:
         return self._text_prefix + getattr(self.state, "text", "")
+
+    def _chunk_id(self) -> int:
+        return int(getattr(self.state, "chunk_id", 0))
+
+    def _decode_progress(self, previous_chunk_id: int) -> tuple[int, bool]:
+        decoded_chunks = max(0, self._chunk_id() - previous_chunk_id)
+        chunk_samples = int(
+            getattr(
+                self.state,
+                "chunk_size_samples",
+                round(self.transcriber.settings.asr_stream_chunk_seconds * 16000),
+            )
+        )
+        decoded_samples = min(self._undecoded_samples, decoded_chunks * chunk_samples)
+        self._undecoded_samples -= decoded_samples
+        return decoded_samples, decoded_chunks > 0
+
+    def _finish_active_state(self) -> tuple[int, bool]:
+        previous_chunk_id = self._chunk_id()
+        self.state = self.transcriber._finish_streaming_transcribe(self.state)
+        model_updated = self._chunk_id() > previous_chunk_id
+        processed_samples = self._undecoded_samples if model_updated else 0
+        self._undecoded_samples -= processed_samples
+        return processed_samples, model_updated
+
+    def _start_fresh_segment(self, text_prefix: str) -> None:
+        self._text_prefix = text_prefix
+        self.state = self.transcriber._init_streaming_state(language=self.language)
+        self._segment_received_samples = 0
+        self._undecoded_samples = 0
 
     def _require_open(self) -> None:
         if self._closed:

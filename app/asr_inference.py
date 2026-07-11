@@ -250,9 +250,9 @@ class ASRInferenceCoordinator:
             reserve_session_operation=True,
         )
 
-    async def reset_segment(self, session_id: str) -> None:
-        await self._submit(
-            "reset_segment",
+    async def finish_segment(self, session_id: str) -> StreamingTranscriptionResult:
+        return await self._submit(
+            "finish_segment",
             (session_id,),
             session_id,
             priority=0,
@@ -260,6 +260,9 @@ class ASRInferenceCoordinator:
             inference_timeout=self.settings.asr_stream_inference_timeout_seconds,
             reserve_session_operation=True,
         )
+
+    async def reset_segment(self, session_id: str) -> StreamingTranscriptionResult:
+        return await self.finish_segment(session_id)
 
     async def abort_stream(self, session_id: str) -> None:
         with self._lock:
@@ -411,9 +414,8 @@ class ASRInferenceCoordinator:
             try:
                 await asyncio.wait_for(asyncio.shield(started), timeout=queue_timeout)
             except TimeoutError as exc:
-                if not job.started.done():
+                if job.started.cancel():
                     job.cancelled.set()
-                    job.started.cancel()
                     job.result.cancel()
                     logger.warning(
                         "asr_timeout category=queue session_id=%s",
@@ -433,13 +435,12 @@ class ASRInferenceCoordinator:
                 )
                 raise ASRInferenceTimeout("ASR inference exceeded its execution timeout") from exc
         except asyncio.CancelledError:
-            if job.started.done() and session_id:
+            if job.started.cancel():
+                job.cancelled.set()
+                job.result.cancel()
+            elif session_id:
                 with self._lock:
                     self._poisoned_sessions.add(session_id)
-            else:
-                job.cancelled.set()
-                job.started.cancel()
-                job.result.cancel()
             raise
 
     def _new_job(
@@ -525,7 +526,8 @@ class ASRInferenceCoordinator:
                     continue
 
                 queue_wait = time.monotonic() - job.enqueue_time
-                job.started.set_result(None)
+                if not self._claim_job(job):
+                    continue
                 inference_started = time.monotonic()
                 result = self._execute_job(transcriber, sessions, job)
                 inference_elapsed = time.monotonic() - inference_started
@@ -583,11 +585,22 @@ class ASRInferenceCoordinator:
             error: Exception = ASRNotReady("ASR coordinator stopped before job execution")
         else:
             error = ASRQueueTimeout("ASR job expired before execution")
-        if not job.started.done():
+        self._reject_unclaimed_job(job, error)
+        return True
+
+    def _claim_job(self, job: _Job) -> bool:
+        if not job.started.set_running_or_notify_cancel():
+            if not job.result.done():
+                job.result.cancel()
+            return False
+        job.started.set_result(None)
+        return True
+
+    def _reject_unclaimed_job(self, job: _Job, error: Exception) -> None:
+        if job.started.set_running_or_notify_cancel():
             job.started.set_exception(error)
         if not job.result.done():
             job.result.cancel()
-        return True
 
     def _finalize_worker(self, sessions: dict[str, Any]) -> None:
         with self._lock:
@@ -672,9 +685,9 @@ class ASRInferenceCoordinator:
                 with self._lock:
                     self._active_sessions.discard(session_id)
                     self._last_timings.pop(session_id, None)
-        if job.action == "reset_segment":
+        if job.action == "finish_segment":
             (session_id,) = job.args
-            return sessions[session_id].reset_segment()
+            return sessions[session_id].finish_segment()
         if job.action == "abort_stream":
             (session_id,) = job.args
             session = sessions.pop(session_id, None)

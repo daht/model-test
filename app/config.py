@@ -26,12 +26,13 @@ class Settings(BaseSettings):
     asr_max_new_tokens: int = 512
     asr_max_upload_mb: int = 200
     asr_stream_chunk_seconds: float = Field(default=2.0, gt=0, le=30)
-    asr_vllm_gpu_memory_utilization: float = 0.8
-    asr_vllm_max_new_tokens: int = 32
-    asr_stream_unfixed_chunk_num: int = 2
-    asr_stream_unfixed_token_num: int = 5
+    asr_vllm_gpu_memory_utilization: float = Field(default=0.8, gt=0, lt=1)
+    asr_vllm_max_new_tokens: int = Field(default=32, gt=0)
+    asr_stream_unfixed_chunk_num: int = Field(default=2, ge=0)
+    asr_stream_unfixed_token_num: int = Field(default=5, ge=0)
+    asr_stream_rollover_seconds: float = Field(default=120.0, gt=0, le=3600)
     asr_vad_silence_seconds: float = Field(default=1.5, gt=0, le=30)
-    asr_vad_rms_threshold: int = 200
+    asr_vad_rms_threshold: int = Field(default=200, ge=0, le=32767)
     asr_commit_on_punctuation: bool = False
     asr_stable_commit_enabled: bool = True
     asr_stable_commit_seconds: float = Field(default=1.0, gt=0, le=30)
@@ -79,6 +80,12 @@ class Settings(BaseSettings):
             raise ValueError(
                 "WebSocket buffered audio exceeds asr_max_connection_lag_seconds"
             )
+        if self.asr_backend == "qwen" and self.asr_stream_mode == "stateful":
+            raise ValueError("asr_backend=qwen does not support stateful streaming")
+        if self.asr_stream_rollover_seconds <= self.asr_stream_chunk_seconds:
+            raise ValueError("asr_stream_rollover_seconds must exceed the model chunk duration")
+        if self.asr_stream_rollover_seconds <= frame_audio_seconds:
+            raise ValueError("asr_stream_rollover_seconds must exceed one transport frame")
         return self
 
 

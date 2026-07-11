@@ -162,6 +162,7 @@ def transcribe_stream_info(current_settings: Settings = Depends(get_settings)) -
                 "chunk_seconds": current_settings.asr_stream_chunk_seconds,
                 "unfixed_chunk_num": current_settings.asr_stream_unfixed_chunk_num,
                 "unfixed_token_num": current_settings.asr_stream_unfixed_token_num,
+                "rollover_seconds": current_settings.asr_stream_rollover_seconds,
                 "vllm_gpu_memory_utilization": current_settings.asr_vllm_gpu_memory_utilization,
                 "vllm_max_new_tokens": current_settings.asr_vllm_max_new_tokens,
                 "stable_commit_enabled": current_settings.asr_stable_commit_enabled,
@@ -317,21 +318,27 @@ class StreamingSessionController:
             await self.fail("realtime_lag_exceeded", "ASR can no longer keep up in real time", 1013)
             raise _StreamClosed
         try:
-            await self._send_events(
-                self.transcript.apply_model_update(
-                    result.text,
-                    processed_samples=sample_count,
+            if result.model_updated:
+                processed_samples = (
+                    sample_count
+                    if result.processed_samples is None
+                    else result.processed_samples
                 )
-            )
+                await self._send_events(
+                    self.transcript.apply_model_update(
+                        result.text,
+                        processed_samples=processed_samples,
+                    )
+                )
         except ConfirmedPrefixConflict as exc:
             await self.fail("transcript_conflict", "Model output conflicts with confirmed text", 1011)
             raise _StreamClosed from exc
 
-        if self.silence.add_audio(pcm_bytes, 16000):
-            events = self.transcript.commit_pending()
-            await self._send_events(events)
-            if events:
-                await self.reset_segment()
+        silence_endpoint = self.silence.add_audio(pcm_bytes, 16000)
+        if result.segment_finished:
+            await self._commit_finished_segment()
+        elif silence_endpoint:
+            await self.reset_segment()
 
     async def validate_audio_frame(self, pcm_bytes: bytes) -> int:
         if not pcm_bytes or len(pcm_bytes) % 2:
@@ -391,8 +398,8 @@ class StreamingSessionController:
     async def reset_segment(self) -> None:
         assert self.session_id is not None
         try:
-            await self._await_model_operation(
-                lambda: self.coordinator.reset_segment(self.session_id)
+            result = await self._await_model_operation(
+                lambda: self.coordinator.finish_segment(self.session_id)
             )
         except _StreamClosed:
             raise
@@ -406,6 +413,21 @@ class StreamingSessionController:
             await self.fail("inference_error", "ASR segment reset failed", 1011)
             raise _StreamClosed from exc
         await self._ensure_session_active()
+        try:
+            if result.model_updated:
+                await self._send_events(
+                    self.transcript.apply_model_update(
+                        result.text,
+                        processed_samples=result.processed_samples or 0,
+                    )
+                )
+        except ConfirmedPrefixConflict as exc:
+            await self.fail("transcript_conflict", "Model output conflicts with confirmed text", 1011)
+            raise _StreamClosed from exc
+        await self._commit_finished_segment()
+
+    async def _commit_finished_segment(self) -> None:
+        await self._send_events(self.transcript.commit_pending())
         self.transcript.reset_segment()
         self.silence.reset()
 

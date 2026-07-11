@@ -17,6 +17,7 @@ def test_asr_hardening_defaults_are_conservative():
     assert settings.asr_inference_queue_size == 16
     assert settings.asr_max_frame_bytes == 16000
     assert settings.asr_ws_max_queue == 4
+    assert settings.asr_stream_rollover_seconds == 120.0
 
 
 def test_protocol_version_accepts_string_from_environment(monkeypatch):
@@ -92,3 +93,61 @@ def test_compose_uses_asr_transport_environment_for_uvicorn_bounds():
 
     assert command[command.index("--ws-max-size") + 1] == "${ASR_MAX_FRAME_BYTES:-16000}"
     assert command[command.index("--ws-max-queue") + 1] == "${ASR_WS_MAX_QUEUE:-4}"
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("asr_vllm_gpu_memory_utilization", 0),
+        ("asr_vllm_gpu_memory_utilization", 1),
+        ("asr_vllm_gpu_memory_utilization", 1.5),
+        ("asr_vllm_max_new_tokens", 0),
+        ("asr_stream_unfixed_chunk_num", -1),
+        ("asr_stream_unfixed_token_num", -1),
+        ("asr_vad_rms_threshold", -1),
+        ("asr_stream_rollover_seconds", 0),
+    ],
+)
+def test_asr_model_settings_reject_invalid_numeric_bounds(name, value):
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **{name: value})
+
+
+def test_qwen_transformers_backend_rejects_stateful_streaming():
+    with pytest.raises(ValidationError, match="qwen.*stateful"):
+        Settings(_env_file=None, asr_backend="qwen", asr_stream_mode="stateful")
+
+
+@pytest.mark.parametrize(
+    ("backend", "stream_mode"),
+    [
+        ("mock", "stateful"),
+        ("qwen", "chunked"),
+        ("qwen_vllm", "stateful"),
+    ],
+)
+def test_supported_asr_backend_stream_mode_pairs_pass(backend, stream_mode):
+    settings = Settings(
+        _env_file=None,
+        asr_backend=backend,
+        asr_stream_mode=stream_mode,
+    )
+
+    assert (settings.asr_backend, settings.asr_stream_mode) == (backend, stream_mode)
+
+
+def test_rollover_must_exceed_model_chunk_and_transport_frame():
+    with pytest.raises(ValidationError, match="rollover"):
+        Settings(
+            _env_file=None,
+            asr_stream_chunk_seconds=2.0,
+            asr_stream_rollover_seconds=1.0,
+        )
+
+    with pytest.raises(ValidationError, match="rollover"):
+        Settings(
+            _env_file=None,
+            asr_stream_chunk_seconds=0.1,
+            asr_stream_rollover_seconds=0.4,
+            asr_max_frame_bytes=16000,
+        )

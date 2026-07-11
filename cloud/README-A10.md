@@ -82,6 +82,7 @@ ASR_DEVICE=auto
 ASR_BACKEND=qwen_vllm
 ASR_STREAM_MODE=stateful
 ASR_STREAM_CHUNK_SECONDS=1.0
+ASR_STREAM_ROLLOVER_SECONDS=120.0
 ASR_VLLM_GPU_MEMORY_UTILIZATION=0.8
 ASR_VLLM_MAX_NEW_TOKENS=32
 ASR_STREAM_UNFIXED_CHUNK_NUM=2
@@ -115,6 +116,13 @@ TTS_SAMPLE_RATE=24000
 ```
 
 Keep exactly one ASR process and one Uvicorn worker per GPU. `ASR_MAX_ACTIVE_STREAMS=2` is a conservative rollout setting, not a capacity claim. Calibrate it with 1, 2, 4, and 8 real-time streams while recording first-partial latency, queue wait p50/p95, inference p50/p95, RTF, GPU memory, and disconnect/error counts.
+
+Do not treat three-service GPU colocation as validated. The Compose file exposes the same A10 to translation, ASR, and TTS, while ASR may reserve the fraction configured by `ASR_VLLM_GPU_MEMORY_UTILIZATION`. Before enabling all three on one 24GB GPU, run the real workload gate below and confirm with `nvidia-smi` that peak allocated memory leaves operational headroom:
+
+1. Start each service alone and record idle and peak GPU memory.
+2. Run concurrent translation, WebSocket ASR, and TTS traffic at the intended production concurrency.
+3. Reject the topology if any process OOMs, restarts, exceeds its latency SLO, or leaves less than the team's required GPU headroom.
+4. If the gate fails, lower the configurable ASR fraction or place services on separate GPUs/instances; do not infer safety from mock tests.
 
 At 16 kHz PCM16, the default frame is 0.5 seconds and four Uvicorn queue slots
 buffer at most two seconds of audio. Keep

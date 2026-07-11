@@ -53,13 +53,14 @@ maybe_pull_code() {
 wait_for_health() {
   local service="$1"
   local base_url="$2"
+  local check_path="$3"
   local output_file="/tmp/${service}-health.json"
   local deadline
   deadline=$((SECONDS + HEALTH_TIMEOUT_SECONDS))
 
-  echo "Waiting for ${service}: ${base_url}/health ..."
+  echo "Waiting for ${service}: ${base_url}${check_path} ..."
   while (( SECONDS < deadline )); do
-    if curl -fsS "${base_url}/health" >"${output_file}" 2>/dev/null; then
+    if curl -fsS "${base_url}${check_path}" >"${output_file}" 2>/dev/null; then
       echo "${service} health check passed:"
       cat "${output_file}"
       echo
@@ -77,19 +78,27 @@ wait_for_health() {
 update_service() {
   local service="$1"
   local base_url="$2"
+  local check_path="$3"
 
   echo "Recreating ${service}..."
-  compose up -d --no-deps "${service}"
-  wait_for_health "${service}" "${base_url}"
+  compose up -d --force-recreate --no-deps "${service}"
+  wait_for_health "${service}" "${base_url}" "${check_path}"
 }
 
 maybe_pull_code
 
-echo "Building shared image..."
-compose build hy-mt-api
+echo "Building translation and ASR images..."
+compose build hy-mt-api qwen-asr-api
 
-update_service hy-mt-api http://127.0.0.1:8000
-update_service qwen-asr-api http://127.0.0.1:8002
+update_service hy-mt-api http://127.0.0.1:8000 /health
+update_service qwen-asr-api http://127.0.0.1:8002 /ready
+
+echo "Running ASR WebSocket smoke..."
+(
+  set -a
+  source ./.env
+  BASE_URL=http://127.0.0.1:8002 scripts/smoke_asr.sh
+)
 
 echo "Service status:"
 compose ps

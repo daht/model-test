@@ -54,6 +54,18 @@ class FakeCoordinator:
         return self.result
 
 
+class RecordingWebSocket:
+    def __init__(self):
+        self.events = []
+        self.close_codes = []
+
+    async def send_json(self, payload):
+        self.events.append(payload)
+
+    async def close(self, code):
+        self.close_codes.append(code)
+
+
 class ProtocolCoordinator(FakeCoordinator):
     def __init__(
         self,
@@ -78,6 +90,7 @@ class ProtocolCoordinator(FakeCoordinator):
         self.completed_operations = []
         self.abort_count = 0
         self.reset_count = 0
+        self.latest_text = ""
 
     async def create_stream(self, _language):
         await self._delay("create")
@@ -96,14 +109,19 @@ class ProtocolCoordinator(FakeCoordinator):
         if self.add_error:
             raise self.add_error
         self.completed_operations.append("add")
-        return StreamingTranscriptionResult(next(self.updates), "zh")
+        update = next(self.updates)
+        if isinstance(update, StreamingTranscriptionResult):
+            self.latest_text = update.text
+            return update
+        self.latest_text = update
+        return StreamingTranscriptionResult(update, "zh")
 
     async def finish_stream(self, _session_id):
         from app.asr import StreamingTranscriptionResult
 
         await self._delay("finish")
         self.completed_operations.append("finish")
-        return StreamingTranscriptionResult(self.final_text, "zh")
+        return StreamingTranscriptionResult(self.final_text or self.latest_text, "zh")
 
     async def transcribe_stream_chunk(
         self,
@@ -122,6 +140,12 @@ class ProtocolCoordinator(FakeCoordinator):
             raise self.reset_error
         self.completed_operations.append("reset")
         self.reset_count += 1
+        from app.asr import StreamingTranscriptionResult
+
+        return StreamingTranscriptionResult(self.final_text or self.latest_text, "zh")
+
+    async def finish_segment(self, session_id):
+        return await self.reset_segment(session_id)
 
     async def abort_stream(self, _session_id):
         self.abort_count += 1
@@ -208,6 +232,211 @@ def _monotonic_values(monkeypatch, values):
     monkeypatch.setattr(asr_api, "time", clock, raising=False)
 
 
+def test_vad_segment_finish_flushes_buffered_audio_and_keeps_session_usable():
+    from app.asr import StreamingTranscriptionResult
+
+    class Coordinator(FakeCoordinator):
+        def __init__(self):
+            super().__init__()
+            self.add_results = iter(
+                [
+                    StreamingTranscriptionResult(
+                        "", "zh", processed_samples=0, model_updated=False
+                    ),
+                    StreamingTranscriptionResult(
+                        "尾音继续", "zh", processed_samples=1600, model_updated=True
+                    ),
+                ]
+            )
+            self.segment_finishes = 0
+
+        async def create_stream(self, _language):
+            return "session"
+
+        async def add_audio(self, _session_id, _pcm_bytes, _sample_rate):
+            return next(self.add_results)
+
+        async def finish_segment(self, _session_id):
+            self.segment_finishes += 1
+            return StreamingTranscriptionResult(
+                "尾音",
+                "zh",
+                processed_samples=14400,
+                model_updated=True,
+                segment_finished=True,
+            )
+
+        async def abort_stream(self, _session_id):
+            return None
+
+        def session_timing(self, _session_id):
+            return (0.0, 0.0)
+
+    async def scenario():
+        websocket = RecordingWebSocket()
+        coordinator = Coordinator()
+        controller = asr_api.StreamingSessionController(
+            websocket,
+            _protocol_settings(
+                asr_vad_silence_seconds=0.8,
+                asr_max_frame_bytes=28800,
+                asr_ws_max_queue=2,
+                asr_max_connection_lag_seconds=2.0,
+            ),
+            coordinator,
+        )
+        await controller.start("zh")
+        await controller.add_audio(_pcm_s16le_samples(0, 14400))
+        await controller.add_audio(_pcm_s16le_samples(1000, 1600))
+        return websocket.events, coordinator.segment_finishes
+
+    events, segment_finishes = asyncio.run(scenario())
+
+    assert segment_finishes == 1
+    assert [(event["type"], event.get("text")) for event in events] == [
+        ("ready", None),
+        ("partial", "尾音"),
+        ("sentence_final", "尾音"),
+        ("partial", ""),
+        ("partial", "继续"),
+    ]
+
+
+def test_buffer_only_frame_does_not_advance_stable_punctuation():
+    from app.asr import StreamingTranscriptionResult
+
+    punctuated = "这是一个足够长的候选句子。"
+    retracted = "这是一个足够长的候选句子"
+
+    class Coordinator(FakeCoordinator):
+        def __init__(self):
+            super().__init__()
+            self.results = iter(
+                [
+                    StreamingTranscriptionResult(
+                        punctuated, "zh", processed_samples=16000, model_updated=True
+                    ),
+                    StreamingTranscriptionResult(
+                        punctuated, "zh", processed_samples=0, model_updated=False
+                    ),
+                    StreamingTranscriptionResult(
+                        retracted, "zh", processed_samples=16000, model_updated=True
+                    ),
+                ]
+            )
+
+        async def create_stream(self, _language):
+            return "session"
+
+        async def add_audio(self, _session_id, _pcm_bytes, _sample_rate):
+            return next(self.results)
+
+        async def abort_stream(self, _session_id):
+            return None
+
+        def session_timing(self, _session_id):
+            return (0.0, 0.0)
+
+    async def scenario():
+        websocket = RecordingWebSocket()
+        controller = asr_api.StreamingSessionController(
+            websocket,
+            _protocol_settings(
+                asr_stable_commit_enabled=True,
+                asr_stable_commit_seconds=1.0,
+                asr_stable_commit_min_chars=8,
+                asr_stable_commit_min_updates=2,
+                asr_max_frame_bytes=32000,
+                asr_ws_max_queue=1,
+            ),
+            Coordinator(),
+        )
+        await controller.start("zh")
+        frame = _pcm_s16le_samples(1000, 16000)
+        await controller.add_audio(frame)
+        events_after_decode = list(websocket.events)
+        await controller.add_audio(frame)
+        events_after_buffer = list(websocket.events)
+        await controller.add_audio(frame)
+        return controller, websocket.events, events_after_decode, events_after_buffer
+
+    controller, events, after_decode, after_buffer = asyncio.run(scenario())
+
+    assert after_buffer == after_decode
+    assert not any(event["type"] == "sentence_final" for event in events)
+    assert events[-1] == {"type": "partial", "text": retracted, "sequence": 3}
+    assert controller.transcript.processed_samples == 32000
+    assert controller.transcript.stable.candidate_updates == 0
+
+
+def test_automatic_rollover_emits_ordered_segment_and_exact_final_text():
+    from app.asr import StreamingTranscriptionResult
+
+    class Coordinator(FakeCoordinator):
+        def __init__(self):
+            super().__init__()
+            self.results = iter(
+                [
+                    StreamingTranscriptionResult(
+                        "甲乙",
+                        "zh",
+                        processed_samples=1600,
+                        model_updated=True,
+                        segment_finished=True,
+                    ),
+                    StreamingTranscriptionResult(
+                        "甲乙丙丁", "zh", processed_samples=1600, model_updated=True
+                    ),
+                ]
+            )
+
+        async def create_stream(self, _language):
+            return "session"
+
+        async def add_audio(self, _session_id, _pcm_bytes, _sample_rate):
+            return next(self.results)
+
+        async def finish_stream(self, _session_id):
+            return StreamingTranscriptionResult(
+                "甲乙丙丁", "zh", processed_samples=0, model_updated=False
+            )
+
+        async def abort_stream(self, _session_id):
+            return None
+
+        def session_timing(self, _session_id):
+            return (0.0, 0.0)
+
+    async def scenario():
+        websocket = RecordingWebSocket()
+        controller = asr_api.StreamingSessionController(
+            websocket,
+            _protocol_settings(),
+            Coordinator(),
+        )
+        await controller.start("zh")
+        frame = _pcm_s16le_samples(1000, 1600)
+        await controller.add_audio(frame)
+        await controller.add_audio(frame)
+        await controller.finish()
+        return websocket.events
+
+    events = asyncio.run(scenario())
+
+    assert [(event["type"], event.get("text")) for event in events] == [
+        ("ready", None),
+        ("partial", "甲乙"),
+        ("sentence_final", "甲乙"),
+        ("partial", ""),
+        ("partial", "丙丁"),
+        ("final", "丙丁"),
+    ]
+    reconstructed = "".join(
+        event["text"] for event in events if event["type"] in {"sentence_final", "final"}
+    )
+    assert reconstructed == "甲乙丙丁"
+
+
 class FakeStreamingSession:
     def __init__(self, updates, final_text="hello world"):
         self.updates = iter(updates)
@@ -229,6 +458,12 @@ class FakeStreamingSession:
 
     def reset_segment(self):
         self.segment_reset = True
+
+    def finish_segment(self):
+        self.segment_reset = True
+        from app.asr import StreamingTranscriptionResult
+
+        return StreamingTranscriptionResult(self.final_text, "zh")
 
 
 class FakeStatefulTranscriber:
@@ -1077,6 +1312,26 @@ def test_qwen_vllm_backend_can_be_selected():
     assert isinstance(transcriber, QwenVLLMASRTranscriber)
 
 
+def test_mock_backend_supports_stateful_stream_lifecycle():
+    from app.asr import create_asr_transcriber
+    from app.config import Settings
+
+    session = create_asr_transcriber(
+        Settings(_env_file=None, asr_backend="mock", asr_stream_mode="stateful")
+    ).create_streaming_session("zh")
+
+    update = session.add_pcm_s16le(b"\x00\x00" * 160, 16000)
+    segment = session.finish_segment()
+    continued = session.add_pcm_s16le(b"\x00\x00" * 160, 16000)
+    final = session.finish()
+
+    assert update.processed_samples == 160
+    assert update.model_updated is True
+    assert segment.segment_finished is True
+    assert continued.processed_samples == 160
+    assert final.text == continued.text
+
+
 def test_qwen_vllm_streaming_session_feeds_pcm_and_finishes(monkeypatch):
     import sys
     import types
@@ -1186,6 +1441,9 @@ def test_stateful_segment_reset_reinitializes_official_state(monkeypatch):
             state.text = "hello" if state is states[0] else " world"
             return state
 
+        def finish_streaming_transcribe(self, state):
+            return state
+
     class FakeQwen3ASRModel:
         @classmethod
         def LLM(cls, **_kwargs):
@@ -1201,6 +1459,140 @@ def test_stateful_segment_reset_reinitializes_official_state(monkeypatch):
 
     assert result.text == "hello world"
     assert len(states) == 2
+
+
+def test_stateful_segment_finish_flushes_buffer_before_reinitializing(monkeypatch):
+    import sys
+    import types
+
+    from app.asr import QwenVLLMASRTranscriber
+    from app.config import Settings
+
+    states = []
+    finish_calls = []
+
+    class FakeState:
+        def __init__(self):
+            self.text = ""
+            self.language = "zh"
+            self.buffered_samples = 0
+            self.chunk_id = 0
+
+    class FakeModel:
+        def init_streaming_state(self, **_kwargs):
+            state = FakeState()
+            states.append(state)
+            return state
+
+        def streaming_transcribe(self, pcm, state):
+            state.buffered_samples += len(pcm)
+            return state
+
+        def finish_streaming_transcribe(self, state):
+            finish_calls.append(state)
+            if state.buffered_samples:
+                state.text = "尾音"
+                state.chunk_id += 1
+                state.buffered_samples = 0
+            return state
+
+    class FakeQwen3ASRModel:
+        @classmethod
+        def LLM(cls, **_kwargs):
+            return FakeModel()
+
+    monkeypatch.setitem(sys.modules, "qwen_asr", types.SimpleNamespace(Qwen3ASRModel=FakeQwen3ASRModel))
+    session = QwenVLLMASRTranscriber(
+        Settings(
+            _env_file=None,
+            asr_backend="qwen_vllm",
+            asr_stream_mode="stateful",
+            asr_stream_chunk_seconds=1.0,
+        )
+    ).create_streaming_session("zh")
+
+    buffered = session.add_pcm_s16le(b"\x00\x00" * 14400, 16000)
+    segment = session.finish_segment()
+    continued = session.add_pcm_s16le(b"\x00\x00" * 1600, 16000)
+
+    assert buffered.model_updated is False
+    assert buffered.processed_samples == 0
+    assert segment.text == "尾音"
+    assert segment.model_updated is True
+    assert segment.processed_samples == 14400
+    assert segment.segment_finished is True
+    assert continued.text == "尾音"
+    assert len(states) == 2
+    assert finish_calls == [states[0]]
+
+
+def test_stateful_rollover_bounds_official_state_and_preserves_exact_text(monkeypatch):
+    import sys
+    import types
+
+    from app.asr import QwenVLLMASRTranscriber
+    from app.config import Settings
+
+    states = []
+    finish_calls = []
+    segment_texts = [("甲", "甲乙"), ("丙", "丙丁"), ("戊", "戊")]
+
+    class FakeState:
+        def __init__(self):
+            self.text = ""
+            self.language = "zh"
+            self.buffered_samples = 0
+            self.chunk_id = 0
+            self.total_samples = 0
+
+    class FakeModel:
+        def init_streaming_state(self, **_kwargs):
+            state = FakeState()
+            states.append(state)
+            return state
+
+        def streaming_transcribe(self, pcm, state):
+            state.buffered_samples += len(pcm)
+            state.total_samples += len(pcm)
+            if state.buffered_samples >= 1600:
+                state.buffered_samples = 0
+                state.chunk_id += 1
+                state_index = states.index(state)
+                state.text = segment_texts[state_index][min(state.chunk_id, 2) - 1]
+            return state
+
+        def finish_streaming_transcribe(self, state):
+            finish_calls.append(state)
+            if state.buffered_samples:
+                state.chunk_id += 1
+                state.buffered_samples = 0
+            return state
+
+    class FakeQwen3ASRModel:
+        @classmethod
+        def LLM(cls, **_kwargs):
+            return FakeModel()
+
+    monkeypatch.setitem(sys.modules, "qwen_asr", types.SimpleNamespace(Qwen3ASRModel=FakeQwen3ASRModel))
+    session = QwenVLLMASRTranscriber(
+        Settings(
+            _env_file=None,
+            asr_backend="qwen_vllm",
+            asr_stream_mode="stateful",
+            asr_stream_chunk_seconds=0.1,
+            asr_stream_rollover_seconds=0.25,
+            asr_max_frame_bytes=3200,
+        )
+    ).create_streaming_session("zh")
+
+    results = [session.add_pcm_s16le(b"\x00\x00" * 1600, 16000) for _ in range(6)]
+
+    assert [result.text for result in results if result.segment_finished] == ["甲乙", "甲乙丙丁"]
+    assert len(finish_calls) == 2
+    assert len(states) == 3
+    assert [state.total_samples for state in states[:2]] == [4800, 4800]
+    assert session.add_pcm_s16le(b"\x00\x00" * 1600, 16000).text == "甲乙丙丁戊"
+    assert session.finish().text == "甲乙丙丁戊"
 
 
 def test_stateful_abort_releases_state(monkeypatch):

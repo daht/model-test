@@ -4,7 +4,8 @@ set -euo pipefail
 REMOTE_HOST="${REMOTE_HOST:?Set REMOTE_HOST, for example root@1.2.3.4}"
 REMOTE_DIR="${REMOTE_DIR:-/opt/hy-mt-api}"
 ENV_FILE="${ENV_FILE:-.env}"
-BASE_URL="${BASE_URL:-http://127.0.0.1:8000}"
+SERVICE="${SERVICE:-qwen-asr-api}"
+BASE_URL="${BASE_URL:-http://127.0.0.1:8002}"
 
 if [[ ! -f "${ENV_FILE}" ]]; then
   echo "Missing ${ENV_FILE}. Copy .env.example to .env and edit it first."
@@ -22,7 +23,9 @@ rsync -az --delete \
 
 scp "${ENV_FILE}" "${REMOTE_HOST}:${REMOTE_DIR}/.env"
 
-ssh "${REMOTE_HOST}" "cd '${REMOTE_DIR}' && BASE_URL='${BASE_URL}' PULL_CODE=0 scripts/update_service.sh build"
+ssh "${REMOTE_HOST}" "cd '${REMOTE_DIR}' && SERVICE='${SERVICE}' BASE_URL='${BASE_URL}' PULL_CODE=0 scripts/update_service.sh build"
+if [[ "${SERVICE}" == "qwen-asr-api" ]]; then
+  ssh "${REMOTE_HOST}" "cd '${REMOTE_DIR}' && set -a && source ./.env && BASE_URL='${BASE_URL}' scripts/smoke_asr.sh"
+fi
 
 echo "Deployment command completed."
-echo "Run: REMOTE_HOST=${REMOTE_HOST} API_KEY=<key> scripts/smoke_test.sh"

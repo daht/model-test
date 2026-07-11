@@ -44,8 +44,15 @@ class FakeSession(ASRStreamingSession):
             raise RuntimeError("fake finish failure")
         return StreamingTranscriptionResult(text=b"".join(self.chunks).decode(), language=self.language)
 
-    def reset_segment(self):
+    def finish_segment(self):
         self.owner.record("reset")
+        return StreamingTranscriptionResult(
+            text=b"".join(self.chunks).decode(),
+            language=self.language,
+        )
+
+    def reset_segment(self):
+        self.finish_segment()
 
     def abort(self):
         self.owner.record("abort")
@@ -597,6 +604,88 @@ def test_lazy_warmup_does_not_execute_job_that_expired_during_warmup():
 
     assert snapshot.active_streams == 0
     assert session_count == 0
+
+
+@pytest.mark.parametrize("caller_exit", ["queue_timeout", "cancel"])
+def test_create_stream_caller_exit_cannot_race_worker_claim_into_orphan(caller_exit):
+    async def scenario():
+        coordinator, _records, holder = make_coordinator(
+            asr_stream_queue_timeout_seconds=0.05,
+            asr_stream_inference_timeout_seconds=1.0,
+        )
+        await coordinator.start()
+
+        worker_passed_expiry_check = threading.Event()
+        release_worker = threading.Event()
+        original_expiry_check = coordinator._job_expired_before_start
+        expiry_checks = 0
+
+        def pause_after_validity_check(job):
+            nonlocal expiry_checks
+            expiry_checks += 1
+            expired = original_expiry_check(job)
+            if expiry_checks == 2 and not expired:
+                worker_passed_expiry_check.set()
+                release_worker.wait(1)
+            return expired
+
+        coordinator._job_expired_before_start = pause_after_validity_check
+
+        original_new_job = coordinator._new_job
+        caller_exit_started = threading.Event()
+
+        class InterleavingCancellation:
+            def __init__(self):
+                self._event = threading.Event()
+
+            def is_set(self):
+                return self._event.is_set()
+
+            def set(self):
+                caller_exit_started.set()
+                release_worker.set()
+                holder["transcriber"].call_started.wait(0.3)
+                self._event.set()
+
+        def capture_job(*args, **kwargs):
+            job = original_new_job(*args, **kwargs)
+            if job.action == "create_stream":
+                job.cancelled = InterleavingCancellation()
+            return job
+
+        coordinator._new_job = capture_job
+        original_create = holder["transcriber"].create_streaming_session
+
+        def recording_create(language=None):
+            holder["transcriber"].call_started.set()
+            return original_create(language)
+
+        holder["transcriber"].create_streaming_session = recording_create
+
+        create_task = asyncio.create_task(coordinator.create_stream(None))
+        assert await asyncio.to_thread(worker_passed_expiry_check.wait, 1)
+        if caller_exit == "cancel":
+            create_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await create_task
+        else:
+            with pytest.raises(ASRQueueTimeout):
+                await create_task
+        assert caller_exit_started.is_set()
+        await asyncio.to_thread(coordinator._jobs.join)
+        snapshot = coordinator.snapshot()
+        session_count = len(holder["transcriber"].sessions)
+        poisoned = set(coordinator._poisoned_sessions)
+        await coordinator.stop()
+        return snapshot, session_count, poisoned
+
+    snapshot, session_count, poisoned = asyncio.run(scenario())
+
+    assert snapshot.active_streams == 0
+    assert snapshot.queue_depth == 0
+    assert snapshot.queued_audio_seconds == 0.0
+    assert session_count == 0
+    assert poisoned == set()
 
 
 def test_poison_abort_failure_isolated_and_worker_remains_ready():
