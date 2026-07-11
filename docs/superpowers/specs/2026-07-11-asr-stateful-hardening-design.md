@@ -76,7 +76,7 @@ For each connection:
 
 ### Protocol Version
 
-`/v1/transcribe/stream-info` exposes `protocol_version: 2`. Version 2 adds event sequence numbers, explicit empty partials after commits, and stable error codes. Sequence and error-code fields are additive, and existing clients must tolerate them. The server does not maintain a second version 1 state machine; rollback uses the previous image if a client incompatibility is discovered.
+`/v1/transcribe/stream-info` exposes `protocol_version: 2` and the effective `file_transcribe_enabled` setting. Version 2 adds event sequence numbers, explicit empty partials after commits, and stable error codes. Sequence and error-code fields are additive, and existing clients must tolerate them. The server does not maintain a second version 1 state machine; rollback uses the previous image if a client incompatibility is discovered.
 
 ### Stable Punctuation
 
@@ -219,6 +219,7 @@ ASR_MAX_FRAME_BYTES=32000
 ASR_START_TIMEOUT_SECONDS=10
 ASR_IDLE_TIMEOUT_SECONDS=30
 ASR_MAX_SESSION_SECONDS=1800
+ASR_MAX_AUDIO_SECONDS=1800
 ASR_STREAM_QUEUE_TIMEOUT_SECONDS=2.0
 ASR_STREAM_INFERENCE_TIMEOUT_SECONDS=15.0
 ASR_FILE_INFERENCE_TIMEOUT_SECONDS=300.0
