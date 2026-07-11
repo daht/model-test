@@ -652,6 +652,42 @@ def test_stream_v2_enforces_session_timeout():
         _clear_asr_dependency_overrides()
 
 
+def test_chunked_stream_preserves_repeated_independent_chunks(monkeypatch):
+    coordinator = ProtocolCoordinator()
+    _override_protocol(
+        coordinator,
+        asr_stream_mode="chunked",
+        asr_stream_chunk_seconds=0.01,
+        asr_stable_commit_enabled=False,
+    )
+    results = iter(["你好", "你好"])
+    monkeypatch.setattr(asr_api, "_transcribe_pcm_chunk", lambda *_args: next(results))
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            _start_stream(websocket, expect_sequence=True)
+            websocket.send_bytes(b"\x00\x00" * 160)
+            assert websocket.receive_json() == {
+                "type": "partial",
+                "text": "你好",
+                "sequence": 2,
+            }
+            websocket.send_bytes(b"\x00\x00" * 160)
+            assert websocket.receive_json() == {
+                "type": "partial",
+                "text": "你好你好",
+                "sequence": 3,
+            }
+            websocket.send_json({"type": "end"})
+            assert websocket.receive_json() == {
+                "type": "final",
+                "text": "你好你好",
+                "sequence": 4,
+            }
+            _assert_closed(websocket, 1000)
+    finally:
+        _clear_asr_dependency_overrides()
+
+
 def test_qwen_vllm_backend_can_be_selected():
     from app.asr import QwenVLLMASRTranscriber, create_asr_transcriber
     from app.config import Settings

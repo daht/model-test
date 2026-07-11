@@ -167,6 +167,16 @@ def test_empty_model_revision_clears_partial():
     ]
 
 
+def test_independent_segments_preserve_repeated_text():
+    state = new_state(stable_commit_enabled=False)
+
+    first = state.append_independent_segment("你好")
+    second = state.append_independent_segment("你好")
+
+    assert event_pairs(first) == [("partial", "你好")]
+    assert event_pairs(second) == [("partial", "你好你好")]
+
+
 def test_silence_detector_triggers_once_until_speech_resets_it():
     detector = SilenceEndpointDetector(silence_seconds=0.1, rms_threshold=200)
 

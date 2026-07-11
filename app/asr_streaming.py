@@ -121,6 +121,12 @@ class StreamingTranscriptState:
             self._event("partial", ""),
         ]
 
+    def append_independent_segment(self, text: str) -> list[TranscriptEvent]:
+        if not text:
+            return []
+        self.partial_text += text
+        return [self._event("partial", self.partial_text)]
+
     def finish(self, text: str) -> list[TranscriptEvent]:
         events = self.apply_model_update(text, processed_samples=0)
         events.append(self._event("final", self.partial_text))
