@@ -50,7 +50,6 @@ from app.schemas import (
 logger = logging.getLogger(__name__)
 
 settings = get_settings()
-asr_transcriber = create_asr_transcriber(settings)
 asr_coordinator = ASRInferenceCoordinator(settings, lambda: create_asr_transcriber(settings))
 
 
@@ -223,12 +222,17 @@ class StreamingSessionController:
         self.session_id: str | None = None
         self.finished = False
         self.accepted_samples = 0
+        self.processing_debt_seconds = 0.0
         self.transcript = StreamingTranscriptState(
             sample_rate=16000,
             stable_commit_enabled=current_settings.asr_stable_commit_enabled,
             stable_commit_seconds=current_settings.asr_stable_commit_seconds,
             stable_commit_min_chars=current_settings.asr_stable_commit_min_chars,
             stable_commit_min_updates=current_settings.asr_stable_commit_min_updates,
+            immediate_commit_on_punctuation=(
+                current_settings.asr_commit_on_punctuation
+                and not current_settings.asr_stable_commit_enabled
+            ),
         )
         self.silence = SilenceEndpointDetector(
             silence_seconds=current_settings.asr_vad_silence_seconds,
@@ -236,8 +240,14 @@ class StreamingSessionController:
         )
 
     async def start(self, language: str | None) -> None:
+        await self._start_with(self.coordinator.create_stream, language)
+
+    async def start_chunked(self, language: str | None) -> None:
+        await self._start_with(self.coordinator.create_chunked_stream, language)
+
+    async def _start_with(self, create_session, language: str | None) -> None:
         try:
-            self.session_id = await self.coordinator.create_stream(language)
+            self.session_id = await create_session(language)
         except ValueError as exc:
             await self.fail("invalid_language", "Unsupported language", 1003)
             raise _StreamClosed from exc
@@ -276,7 +286,7 @@ class StreamingSessionController:
             raise _StreamClosed from exc
 
         queue_wait, inference_time = self.coordinator.session_timing(self.session_id)
-        if queue_wait + inference_time > self.settings.asr_max_connection_lag_seconds:
+        if self._lag_exceeded(queue_wait + inference_time, sample_count / 16000):
             await self.fail("realtime_lag_exceeded", "ASR can no longer keep up in real time", 1013)
             raise _StreamClosed
         try:
@@ -294,7 +304,7 @@ class StreamingSessionController:
             events = self.transcript.commit_pending()
             await self._send_events(events)
             if events:
-                await self.coordinator.reset_segment(self.session_id)
+                await self.reset_segment()
 
     async def validate_audio_frame(self, pcm_bytes: bytes) -> int:
         if not pcm_bytes or len(pcm_bytes) % 2:
@@ -311,9 +321,54 @@ class StreamingSessionController:
         self.accepted_samples += sample_count
         return sample_count
 
+    async def transcribe_chunk(self, pcm_bytes: bytes, language: str | None) -> str:
+        temp_path = await asyncio.to_thread(write_pcm_s16le_wav, pcm_bytes, 16000)
+        started = time.monotonic()
+        try:
+            assert self.session_id is not None
+            result = await self.coordinator.transcribe_stream_chunk(
+                self.session_id,
+                temp_path,
+                language,
+                (len(pcm_bytes) // 2) / 16000,
+            )
+        except (ASRQueueFull, ASRQueueTimeout, ASRBatchConflict) as exc:
+            await self.fail("server_busy", "ASR is at capacity", 1013)
+            raise _StreamClosed from exc
+        except ASRInferenceTimeout as exc:
+            await self.fail("inference_timeout", "ASR inference timed out", 1011)
+            raise _StreamClosed from exc
+        except Exception as exc:
+            await self.fail("inference_error", "ASR inference failed", 1011)
+            raise _StreamClosed from exc
+        finally:
+            remove_file(temp_path)
+        elapsed = time.monotonic() - started
+        if self._lag_exceeded(elapsed, (len(pcm_bytes) // 2) / 16000):
+            await self.fail("realtime_lag_exceeded", "ASR can no longer keep up in real time", 1013)
+            raise _StreamClosed
+        return result.text
+
+    def _lag_exceeded(self, processing_seconds: float, audio_seconds: float) -> bool:
+        self.processing_debt_seconds = max(
+            0.0,
+            self.processing_debt_seconds + processing_seconds - audio_seconds,
+        )
+        return self.processing_debt_seconds > self.settings.asr_max_connection_lag_seconds
+
     async def reset_segment(self) -> None:
         assert self.session_id is not None
-        await self.coordinator.reset_segment(self.session_id)
+        try:
+            await self.coordinator.reset_segment(self.session_id)
+        except (ASRQueueFull, ASRQueueTimeout, ASRBatchConflict) as exc:
+            await self.fail("server_busy", "ASR is at capacity", 1013)
+            raise _StreamClosed from exc
+        except ASRInferenceTimeout as exc:
+            await self.fail("inference_timeout", "ASR inference timed out", 1011)
+            raise _StreamClosed from exc
+        except Exception as exc:
+            await self.fail("inference_error", "ASR segment reset failed", 1011)
+            raise _StreamClosed from exc
         self.transcript.reset_segment()
         self.silence.reset()
 
@@ -407,6 +462,7 @@ async def transcribe_stream(
                 silence_seconds=current_settings.asr_vad_silence_seconds,
                 rms_threshold=current_settings.asr_vad_rms_threshold,
             )
+            await controller.start_chunked(start.language)
             await _run_chunked_transcribe_stream(
                 controller,
                 current_settings,
@@ -513,30 +569,33 @@ async def _run_chunked_transcribe_stream(
     websocket = controller.websocket
     min_chunk_bytes = max(1, int(sample_rate * 2 * current_settings.asr_stream_chunk_seconds))
     buffer = bytearray()
-    await controller._send_event(controller.transcript.new_event("ready"))
-
+    session_started = time.monotonic()
     while True:
-        message = await websocket.receive()
+        session_remaining = current_settings.asr_max_session_seconds - (
+            time.monotonic() - session_started
+        )
+        if session_remaining <= 0:
+            await controller.fail("session_timeout", "Maximum session duration exceeded", 1008)
+            raise _StreamClosed
+        receive_timeout = min(current_settings.asr_idle_timeout_seconds, session_remaining)
+        try:
+            async with asyncio.timeout(receive_timeout):
+                message = await websocket.receive()
+        except TimeoutError:
+            if session_remaining <= current_settings.asr_idle_timeout_seconds:
+                await controller.fail("session_timeout", "Maximum session duration exceeded", 1008)
+            else:
+                await controller.fail("idle_timeout", "No audio or command was received in time", 1008)
+            raise _StreamClosed
+        if message.get("type") == "websocket.disconnect":
+            return
         if "bytes" in message and message["bytes"] is not None:
             pcm_bytes = message["bytes"]
             await controller.validate_audio_frame(pcm_bytes)
             buffer.extend(pcm_bytes)
             if len(buffer) >= min_chunk_bytes:
-                started = time.monotonic()
-                segment_text = await asyncio.to_thread(
-                    _transcribe_pcm_chunk,
-                    bytes(buffer),
-                    sample_rate,
-                    language,
-                )
+                segment_text = await controller.transcribe_chunk(bytes(buffer), language)
                 buffer.clear()
-                if time.monotonic() - started > current_settings.asr_max_connection_lag_seconds:
-                    await controller.fail(
-                        "realtime_lag_exceeded",
-                        "ASR can no longer keep up in real time",
-                        1013,
-                    )
-                    raise _StreamClosed
                 if segment_text:
                     await controller._send_events(
                         controller.transcript.append_independent_segment(segment_text)
@@ -549,14 +608,12 @@ async def _run_chunked_transcribe_stream(
             except json.JSONDecodeError:
                 await controller.fail("invalid_message", "Expected a JSON command", 1003)
                 raise _StreamClosed
+            if not isinstance(payload, dict):
+                await controller.fail("invalid_message", "Expected a JSON object", 1003)
+                raise _StreamClosed
             if payload.get("type") == "end":
                 if buffer:
-                    segment_text = await asyncio.to_thread(
-                        _transcribe_pcm_chunk,
-                        bytes(buffer),
-                        sample_rate,
-                        language,
-                    )
+                    segment_text = await controller.transcribe_chunk(bytes(buffer), language)
                     if segment_text:
                         await controller._send_events(
                             controller.transcript.append_independent_segment(segment_text)
@@ -564,6 +621,7 @@ async def _run_chunked_transcribe_stream(
                 await controller._send_event(
                     controller.transcript.new_event("final", controller.transcript.partial_text)
                 )
+                await controller.abort()
                 await websocket.close(code=1000)
                 return
             if payload.get("type") == "segment":
@@ -571,12 +629,3 @@ async def _run_chunked_transcribe_stream(
                 silence_detector.reset()
         elif message.get("type") == "websocket.disconnect":
             return
-
-
-def _transcribe_pcm_chunk(pcm_bytes: bytes, sample_rate: int, language: str | None) -> str:
-    temp_path = write_pcm_s16le_wav(pcm_bytes, sample_rate)
-    try:
-        result = asr_transcriber.transcribe(temp_path, language=language)
-        return result.text
-    finally:
-        remove_file(temp_path)

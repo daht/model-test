@@ -21,6 +21,7 @@ def new_state(**overrides):
         "stable_commit_seconds": 1.0,
         "stable_commit_min_chars": 8,
         "stable_commit_min_updates": 2,
+        "immediate_commit_on_punctuation": False,
     }
     values.update(overrides)
     return StreamingTranscriptState(**values)
@@ -70,6 +71,18 @@ def test_vad_commit_emits_sentence_and_empty_partial():
 
     assert event_pairs(state.commit_pending()) == [
         ("sentence_final", "hello world"),
+        ("partial", ""),
+    ]
+
+
+def test_legacy_immediate_punctuation_commit_remains_available():
+    state = new_state(
+        stable_commit_enabled=False,
+        immediate_commit_on_punctuation=True,
+    )
+
+    assert event_pairs(state.apply_model_update("你好。", processed_samples=1600)) == [
+        ("sentence_final", "你好。"),
         ("partial", ""),
     ]
 
@@ -175,6 +188,18 @@ def test_independent_segments_preserve_repeated_text():
 
     assert event_pairs(first) == [("partial", "你好")]
     assert event_pairs(second) == [("partial", "你好你好")]
+
+
+def test_independent_segment_can_use_legacy_immediate_punctuation_commit():
+    state = new_state(
+        stable_commit_enabled=False,
+        immediate_commit_on_punctuation=True,
+    )
+
+    assert event_pairs(state.append_independent_segment("你好。")) == [
+        ("sentence_final", "你好。"),
+        ("partial", ""),
+    ]
 
 
 def test_silence_detector_triggers_once_until_speech_resets_it():

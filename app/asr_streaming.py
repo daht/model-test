@@ -76,12 +76,14 @@ class StreamingTranscriptState:
         stable_commit_seconds: float,
         stable_commit_min_chars: int,
         stable_commit_min_updates: int,
+        immediate_commit_on_punctuation: bool = False,
     ) -> None:
         self.sample_rate = sample_rate
         self.confirmed_text = ""
         self.partial_text = ""
         self.processed_samples = 0
         self._sequence = 0
+        self.immediate_commit_on_punctuation = immediate_commit_on_punctuation
         self.stable = StablePunctuationTracker(
             stable_commit_enabled,
             stable_commit_seconds,
@@ -104,6 +106,10 @@ class StreamingTranscriptState:
         stable_prefix = self.stable.observe(self.partial_text, self.audio_time)
         if stable_prefix:
             return self._commit_prefix(stable_prefix)
+        if self.immediate_commit_on_punctuation:
+            immediate_prefix = first_punctuation_candidate(self.partial_text, 1)
+            if immediate_prefix:
+                return self._commit_prefix(immediate_prefix)
         if self.partial_text != previous:
             return [self._event("partial", self.partial_text)]
         return []
@@ -125,6 +131,10 @@ class StreamingTranscriptState:
         if not text:
             return []
         self.partial_text += text
+        if self.immediate_commit_on_punctuation:
+            immediate_prefix = first_punctuation_candidate(self.partial_text, 1)
+            if immediate_prefix:
+                return self._commit_prefix(immediate_prefix)
         return [self._event("partial", self.partial_text)]
 
     def finish(self, text: str) -> list[TranscriptEvent]:

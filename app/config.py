@@ -25,18 +25,18 @@ class Settings(BaseSettings):
     asr_torch_dtype: Literal["auto", "float16", "bfloat16", "float32"] = "bfloat16"
     asr_max_new_tokens: int = 512
     asr_max_upload_mb: int = 200
-    asr_stream_chunk_seconds: float = 2.0
+    asr_stream_chunk_seconds: float = Field(default=2.0, gt=0, le=30)
     asr_vllm_gpu_memory_utilization: float = 0.8
     asr_vllm_max_new_tokens: int = 32
     asr_stream_unfixed_chunk_num: int = 2
     asr_stream_unfixed_token_num: int = 5
-    asr_vad_silence_seconds: float = 1.5
+    asr_vad_silence_seconds: float = Field(default=1.5, gt=0, le=30)
     asr_vad_rms_threshold: int = 200
     asr_commit_on_punctuation: bool = False
     asr_stable_commit_enabled: bool = True
-    asr_stable_commit_seconds: float = 1.0
-    asr_stable_commit_min_chars: int = 8
-    asr_stable_commit_min_updates: int = 2
+    asr_stable_commit_seconds: float = Field(default=1.0, gt=0, le=30)
+    asr_stable_commit_min_chars: int = Field(default=8, gt=0, le=10000)
+    asr_stable_commit_min_updates: int = Field(default=2, gt=0, le=1000)
     asr_protocol_version: Literal[2] = 2
     asr_eager_load: bool = True
     asr_file_transcribe_enabled: bool = False

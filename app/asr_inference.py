@@ -63,6 +63,11 @@ class CoordinatorSnapshot:
     load_error: str | None
 
 
+class _ChunkedSession:
+    def abort(self) -> None:
+        return None
+
+
 @dataclass(order=True)
 class _Job:
     priority: int
@@ -113,6 +118,8 @@ class ASRInferenceCoordinator:
             if self._thread and self._thread.is_alive():
                 return
             self._accepting = True
+            self._ready = False
+            self._load_error = None
             self._startup = Future()
             self._thread = threading.Thread(
                 target=self._worker_main,
@@ -127,7 +134,13 @@ class ASRInferenceCoordinator:
         with self._lock:
             self._accepting = False
             thread = self._thread
-        if not thread:
+            load_failed = self._load_error is not None
+        if not thread or not thread.is_alive():
+            return
+        if load_failed:
+            await asyncio.to_thread(thread.join, 10)
+            if thread.is_alive():
+                raise RuntimeError("ASR inference worker did not stop after load failure")
             return
         shutdown = self._new_job("shutdown", (), None, priority=100, queue_timeout=3600)
         await asyncio.to_thread(self._jobs.put, shutdown)
@@ -147,6 +160,28 @@ class ASRInferenceCoordinator:
         try:
             return await self._submit(
                 "create_stream",
+                (session_id, language),
+                session_id,
+                priority=0,
+                queue_timeout=self.settings.asr_stream_queue_timeout_seconds,
+                inference_timeout=self.settings.asr_stream_inference_timeout_seconds,
+            )
+        finally:
+            with self._lock:
+                self._pending_streams -= 1
+
+    async def create_chunked_stream(self, language: str | None) -> str:
+        with self._lock:
+            self._require_accepting_locked()
+            if self._batch_pending or self._batch_running:
+                raise ASRBatchConflict("batch transcription owns the model")
+            if len(self._active_sessions) + self._pending_streams >= self.settings.asr_max_active_streams:
+                raise ASRSessionLimit("maximum active ASR streams reached")
+            self._pending_streams += 1
+        session_id = uuid.uuid4().hex[:12]
+        try:
+            return await self._submit(
+                "create_chunked_stream",
                 (session_id, language),
                 session_id,
                 priority=0,
@@ -236,6 +271,27 @@ class ASRInferenceCoordinator:
         finally:
             with self._lock:
                 self._batch_pending = False
+
+    async def transcribe_stream_chunk(
+        self,
+        session_id: str,
+        audio_path: str,
+        language: str | None,
+        audio_seconds: float,
+    ) -> TranscriptionResult:
+        self._require_session_admissible(session_id)
+        with self._lock:
+            if self._batch_pending or self._batch_running:
+                raise ASRBatchConflict("batch transcription owns the model")
+        return await self._submit(
+            "transcribe_stream_chunk",
+            (session_id, audio_path, language),
+            session_id,
+            priority=0,
+            queue_timeout=self.settings.asr_stream_queue_timeout_seconds,
+            inference_timeout=self.settings.asr_stream_inference_timeout_seconds,
+            audio_seconds=audio_seconds,
+        )
 
     def snapshot(self) -> CoordinatorSnapshot:
         with self._lock:
@@ -440,6 +496,12 @@ class ASRInferenceCoordinator:
             with self._lock:
                 self._active_sessions.add(session_id)
             return session_id
+        if job.action == "create_chunked_stream":
+            session_id, _language = job.args
+            sessions[session_id] = _ChunkedSession()
+            with self._lock:
+                self._active_sessions.add(session_id)
+            return session_id
         if job.action == "add_audio":
             session_id, pcm_bytes, sample_rate = job.args
             return sessions[session_id].add_pcm_s16le(pcm_bytes, sample_rate)
@@ -475,6 +537,9 @@ class ASRInferenceCoordinator:
             finally:
                 with self._lock:
                     self._batch_running = False
+        if job.action == "transcribe_stream_chunk":
+            _session_id, audio_path, language = job.args
+            return transcriber.transcribe(audio_path, language=language)
         raise RuntimeError(f"unknown ASR coordinator action: {job.action}")
 
     def _cleanup_poisoned_session(self, sessions: dict[str, Any], session_id: str | None) -> None:
@@ -513,6 +578,6 @@ class ASRInferenceCoordinator:
         with self._lock:
             self._queued_audio_seconds = max(0.0, self._queued_audio_seconds - audio_seconds)
 
+
 def _sanitize_error(exc: Exception) -> str:
-    message = f"{type(exc).__name__}: {exc}".replace("\r", " ").replace("\n", " ")
-    return message[:300]
+    return f"{type(exc).__name__}: model warmup failed"

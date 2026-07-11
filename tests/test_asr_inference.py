@@ -308,3 +308,69 @@ def test_operational_logs_include_timings_without_transcript_or_api_key(caplog):
     assert "inference_ms=" in messages
     assert "distinctive-transcript" not in messages
     assert "distinctive-api-key" not in messages
+
+
+def test_readiness_load_error_does_not_expose_exception_content():
+    async def scenario():
+        def factory():
+            raise RuntimeError("/secret/model/path api_key=distinctive-api-key\nprivate")
+
+        coordinator = ASRInferenceCoordinator(settings(), factory)
+        await coordinator.start()
+        snapshot = coordinator.snapshot()
+        await coordinator.stop()
+        return snapshot
+
+    snapshot = asyncio.run(scenario())
+
+    assert snapshot.ready is False
+    assert snapshot.load_error == "RuntimeError: model warmup failed"
+
+
+def test_coordinator_can_restart_cleanly_after_load_failure():
+    async def scenario():
+        records = []
+        attempts = 0
+
+        def factory():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("first load fails")
+            return FakeTranscriber(records)
+
+        coordinator = ASRInferenceCoordinator(settings(), factory)
+        await coordinator.start()
+        assert coordinator.snapshot().ready is False
+        await coordinator.stop()
+        await coordinator.start()
+        snapshot = coordinator.snapshot()
+        session_id = await coordinator.create_stream(None)
+        await coordinator.abort_stream(session_id)
+        await coordinator.stop()
+        return snapshot
+
+    snapshot = asyncio.run(scenario())
+
+    assert snapshot.ready is True
+    assert snapshot.load_error is None
+
+
+def test_stream_chunk_transcription_runs_on_owner_thread_when_file_upload_is_disabled():
+    async def scenario():
+        coordinator, records, _holder = make_coordinator(asr_file_transcribe_enabled=False)
+        await coordinator.start()
+        session_id = await coordinator.create_chunked_stream("zh")
+        assert coordinator.snapshot().active_streams == 1
+        result = await coordinator.transcribe_stream_chunk(session_id, "chunk.wav", "zh", 1.0)
+        await coordinator.abort_stream(session_id)
+        assert coordinator.snapshot().active_streams == 0
+        await coordinator.stop()
+        return records, result
+
+    records, result = asyncio.run(scenario())
+
+    file_thread = next(thread_id for name, thread_id in records if name == "file")
+    constructor_thread = next(thread_id for name, thread_id in records if name == "constructor")
+    assert file_thread == constructor_thread
+    assert result.text == "file result"

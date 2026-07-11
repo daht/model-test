@@ -29,6 +29,11 @@ def test_asr_hardening_defaults_are_conservative():
         ("asr_max_audio_seconds", 0),
         ("asr_stream_queue_timeout_seconds", 0),
         ("asr_stream_inference_timeout_seconds", 0),
+        ("asr_stream_chunk_seconds", 0),
+        ("asr_vad_silence_seconds", 0),
+        ("asr_stable_commit_seconds", 0),
+        ("asr_stable_commit_min_chars", 0),
+        ("asr_stable_commit_min_updates", 0),
     ],
 )
 def test_asr_hardening_settings_must_be_positive(name, value):
