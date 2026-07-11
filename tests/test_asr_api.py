@@ -272,9 +272,80 @@ def test_qwen_vllm_streaming_session_feeds_pcm_and_finishes(monkeypatch):
     )
 
 
-def test_qwen_vllm_streaming_session_segment_reset_discards_pending_buffer(monkeypatch):
+def test_qwen_vllm_warmup_loads_model_once(monkeypatch):
     import sys
     import types
+
+    from app.asr import QwenVLLMASRTranscriber
+    from app.config import Settings
+
+    constructor_count = 0
+
+    class FakeModel:
+        pass
+
+    class FakeQwen3ASRModel:
+        @classmethod
+        def LLM(cls, **_kwargs):
+            nonlocal constructor_count
+            constructor_count += 1
+            return FakeModel()
+
+    monkeypatch.setitem(sys.modules, "qwen_asr", types.SimpleNamespace(Qwen3ASRModel=FakeQwen3ASRModel))
+
+    transcriber = QwenVLLMASRTranscriber(Settings(asr_backend="qwen_vllm"))
+    transcriber.warmup()
+    transcriber.warmup()
+
+    assert constructor_count == 1
+
+
+def test_stateful_segment_reset_reinitializes_official_state(monkeypatch):
+    import sys
+    import types
+
+    from app.asr import QwenVLLMASRTranscriber
+    from app.config import Settings
+
+    states = []
+
+    class FakeState:
+        def __init__(self):
+            self.text = ""
+            self.language = "zh"
+
+    class FakeModel:
+        def init_streaming_state(self, **_kwargs):
+            state = FakeState()
+            states.append(state)
+            return state
+
+        def streaming_transcribe(self, _pcm, state):
+            state.text = "hello" if state is states[0] else " world"
+            return state
+
+    class FakeQwen3ASRModel:
+        @classmethod
+        def LLM(cls, **_kwargs):
+            return FakeModel()
+
+    monkeypatch.setitem(sys.modules, "qwen_asr", types.SimpleNamespace(Qwen3ASRModel=FakeQwen3ASRModel))
+
+    transcriber = QwenVLLMASRTranscriber(Settings(asr_backend="qwen_vllm"))
+    session = transcriber.create_streaming_session(language="zh")
+    session.add_pcm_s16le(b"\x00\x00", 16000)
+    session.reset_segment()
+    result = session.add_pcm_s16le(b"\x00\x00", 16000)
+
+    assert result.text == "hello world"
+    assert len(states) == 2
+
+
+def test_stateful_abort_releases_state(monkeypatch):
+    import sys
+    import types
+
+    import pytest
 
     from app.asr import QwenVLLMASRTranscriber
     from app.config import Settings
@@ -282,7 +353,6 @@ def test_qwen_vllm_streaming_session_segment_reset_discards_pending_buffer(monke
     class FakeState:
         text = ""
         language = "zh"
-        buffer = [1, 2, 3]
 
     class FakeModel:
         def init_streaming_state(self, **_kwargs):
@@ -297,9 +367,10 @@ def test_qwen_vllm_streaming_session_segment_reset_discards_pending_buffer(monke
 
     transcriber = QwenVLLMASRTranscriber(Settings(asr_backend="qwen_vllm"))
     session = transcriber.create_streaming_session(language="zh")
-    session.reset_segment()
+    session.abort()
 
-    assert session.state.buffer == []
+    with pytest.raises(RuntimeError, match="streaming session is closed"):
+        session.add_pcm_s16le(b"\x00\x00", 16000)
 
 
 def test_qwen_vllm_file_transcribe_normalizes_language_code(monkeypatch):

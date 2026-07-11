@@ -76,10 +76,16 @@ class ASRStreamingSession:
         raise NotImplementedError
 
     def reset_segment(self) -> None:
-        return None
+        raise NotImplementedError
+
+    def abort(self) -> None:
+        raise NotImplementedError
 
 
 class ASRTranscriber:
+    def warmup(self) -> None:
+        raise NotImplementedError
+
     def transcribe(self, audio_path: str, language: str | None = None) -> TranscriptionResult:
         raise NotImplementedError
 
@@ -89,6 +95,9 @@ class ASRTranscriber:
 
 @dataclass
 class MockASRTranscriber(ASRTranscriber):
+    def warmup(self) -> None:
+        return None
+
     def transcribe(self, audio_path: str, language: str | None = None) -> TranscriptionResult:
         detected_language = language or "auto"
         filename = Path(audio_path).name
@@ -152,6 +161,10 @@ class QwenASRTranscriber(ASRTranscriber):
             )
         self._model.eval()
 
+    def warmup(self) -> None:
+        with self._lock:
+            self._load()
+
     def transcribe(self, audio_path: str, language: str | None = None) -> TranscriptionResult:
         with self._lock:
             self._load()
@@ -190,15 +203,17 @@ class QwenVLLMStreamingSession(ASRStreamingSession):
     def __init__(self, transcriber: "QwenVLLMASRTranscriber", language: str | None = None) -> None:
         self.transcriber = transcriber
         self.language = transcriber.normalize_language(language)
-        # qwen-asr owns the official ASRStreamingState object returned here.
+        self._text_prefix = ""
+        self._closed = False
         self.state = transcriber._init_streaming_state(language=self.language)
 
     def add_pcm_s16le(self, pcm_bytes: bytes, sample_rate: int) -> StreamingTranscriptionResult:
+        self._require_open()
         if sample_rate != 16000:
             raise ValueError("Qwen vLLM streaming requires 16000 Hz sample_rate")
         if not pcm_bytes:
             return StreamingTranscriptionResult(
-                text=getattr(self.state, "text", ""),
+                text=self._combined_text(),
                 language=getattr(self.state, "language", self.language),
             )
 
@@ -218,22 +233,35 @@ class QwenVLLMStreamingSession(ASRStreamingSession):
         state = self.transcriber._streaming_transcribe(pcm, self.state)
         self.state = state
         return StreamingTranscriptionResult(
-            text=getattr(state, "text", ""),
+            text=self._combined_text(),
             language=getattr(state, "language", self.language),
         )
 
     def finish(self) -> StreamingTranscriptionResult:
+        self._require_open()
         state = self.transcriber._finish_streaming_transcribe(self.state)
         self.state = state
+        self._closed = True
         return StreamingTranscriptionResult(
-            text=getattr(state, "text", ""),
+            text=self._combined_text(),
             language=getattr(state, "language", self.language),
         )
 
     def reset_segment(self) -> None:
-        buffer = getattr(self.state, "buffer", None)
-        if buffer is not None:
-            self.state.buffer = buffer[:0]
+        self._require_open()
+        self._text_prefix = self._combined_text()
+        self.state = self.transcriber._init_streaming_state(language=self.language)
+
+    def abort(self) -> None:
+        self.state = None
+        self._closed = True
+
+    def _combined_text(self) -> str:
+        return self._text_prefix + getattr(self.state, "text", "")
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("streaming session is closed")
 
 
 class QwenVLLMASRTranscriber(ASRTranscriber):
@@ -252,6 +280,10 @@ class QwenVLLMASRTranscriber(ASRTranscriber):
             gpu_memory_utilization=self.settings.asr_vllm_gpu_memory_utilization,
             max_new_tokens=self.settings.asr_vllm_max_new_tokens,
         )
+
+    def warmup(self) -> None:
+        with self._lock:
+            self._load()
 
     def transcribe(self, audio_path: str, language: str | None = None) -> TranscriptionResult:
         normalized_language = self.normalize_language(language)
