@@ -129,6 +129,9 @@ class StreamingTranscriptState:
     def reset_segment(self) -> None:
         self.stable.reset()
 
+    def new_event(self, event_type: str, text: str = "") -> TranscriptEvent:
+        return self._event(event_type, text)
+
     def _unconfirmed_tail(self, text: str) -> str:
         if not self.confirmed_text:
             return text

@@ -111,6 +111,16 @@ def test_sequences_increase_across_all_events():
     assert [event.sequence for event in first + second] == [1, 2, 3]
 
 
+def test_protocol_events_and_transcript_events_share_one_sequence():
+    state = new_state(stable_commit_enabled=False)
+
+    ready = state.new_event("ready")
+    partial = state.apply_model_update("hello", processed_samples=1600)
+
+    assert ready.sequence == 1
+    assert partial[0].sequence == 2
+
+
 def test_transient_or_removed_punctuation_resets_candidate():
     state = new_state(stable_commit_seconds=0.5)
     punctuated = "这是一个足够长的临时句子。"

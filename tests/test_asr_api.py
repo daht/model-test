@@ -2,7 +2,9 @@ import os
 import threading
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 os.environ["API_KEY"] = "test-key"
 os.environ["ASR_BACKEND"] = "mock"
@@ -19,6 +21,7 @@ from app.asr_api import app  # noqa: E402
 from app.asr import TranscriptionResult  # noqa: E402
 from app.asr_inference import (  # noqa: E402
     ASRFileTranscriptionDisabled,
+    ASRQueueFull,
     CoordinatorSnapshot,
 )
 from app.config import Settings  # noqa: E402
@@ -49,6 +52,75 @@ class FakeCoordinator:
         return self.result
 
 
+class ProtocolCoordinator(FakeCoordinator):
+    def __init__(
+        self,
+        updates=(),
+        final_text="",
+        add_error=None,
+        create_error=None,
+        timing=(0.0, 0.0),
+    ):
+        super().__init__()
+        self.updates = iter(updates)
+        self.final_text = final_text
+        self.add_error = add_error
+        self.create_error = create_error
+        self.timing = timing
+        self.abort_count = 0
+        self.reset_count = 0
+
+    async def create_stream(self, _language):
+        if self.create_error:
+            raise self.create_error
+        return "protocol-session"
+
+    async def add_audio(self, _session_id, _pcm_bytes, _sample_rate):
+        from app.asr import StreamingTranscriptionResult
+
+        if self.add_error:
+            raise self.add_error
+        return StreamingTranscriptionResult(next(self.updates), "zh")
+
+    async def finish_stream(self, _session_id):
+        from app.asr import StreamingTranscriptionResult
+
+        return StreamingTranscriptionResult(self.final_text, "zh")
+
+    async def reset_segment(self, _session_id):
+        self.reset_count += 1
+
+    async def abort_stream(self, _session_id):
+        self.abort_count += 1
+
+    def session_timing(self, _session_id):
+        return self.timing
+
+
+def _protocol_settings(**overrides):
+    values = {
+        "api_key": "test-key",
+        "asr_backend": "mock",
+        "asr_stream_mode": "stateful",
+        "asr_stable_commit_enabled": False,
+        "asr_max_frame_bytes": 32000,
+    }
+    values.update(overrides)
+    return Settings(_env_file=None, **values)
+
+
+def _override_protocol(coordinator, **setting_overrides):
+    current = _protocol_settings(**setting_overrides)
+    app.dependency_overrides[asr_api.get_asr_coordinator] = lambda: coordinator
+    app.dependency_overrides[get_settings] = lambda: current
+
+
+def _assert_closed(websocket, code):
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        websocket.receive_json()
+    assert exc_info.value.code == code
+
+
 def _override_asr_dependencies(coordinator, **setting_overrides):
     current = Settings(
         _env_file=None,
@@ -64,7 +136,7 @@ def _clear_asr_dependency_overrides():
     app.dependency_overrides.clear()
 
 
-def _start_stream(websocket):
+def _start_stream(websocket, *, expect_sequence=False):
     websocket.send_json(
         {
             "type": "start",
@@ -74,7 +146,10 @@ def _start_stream(websocket):
             "format": "pcm_s16le",
         }
     )
-    assert websocket.receive_json() == {"type": "ready"}
+    expected = {"type": "ready"}
+    if expect_sequence:
+        expected["sequence"] = 1
+    assert websocket.receive_json() == expected
 
 
 def _send_transcribable_chunk(websocket):
@@ -360,6 +435,223 @@ def test_stream_info_reports_streaming_mode_and_stateful_settings(monkeypatch):
     assert body["audio_format"]["stateful"]["stable_commit_min_updates"] == 2
 
 
+@pytest.mark.parametrize(
+    ("raw_message", "code"),
+    [
+        ("not json", "invalid_start"),
+        ('{"type":"start","api_key":"test-key","sample_rate":"bad"}', "invalid_start"),
+        ('{"type":"start","api_key":"test-key","language":{}}', "invalid_language"),
+    ],
+)
+def test_stream_v2_rejects_invalid_start_messages(raw_message, code):
+    coordinator = ProtocolCoordinator()
+    _override_protocol(coordinator)
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            websocket.send_text(raw_message)
+            event = websocket.receive_json()
+            assert event["type"] == "error"
+            assert event["code"] == code
+            assert event["sequence"] == 1
+            _assert_closed(websocket, 1003)
+    finally:
+        _clear_asr_dependency_overrides()
+
+
+def test_stream_v2_rejects_unsupported_sample_rate():
+    coordinator = ProtocolCoordinator()
+    _override_protocol(coordinator)
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            websocket.send_json(
+                {
+                    "type": "start",
+                    "api_key": "test-key",
+                    "sample_rate": 8000,
+                    "format": "pcm_s16le",
+                }
+            )
+            event = websocket.receive_json()
+            assert event["code"] == "unsupported_sample_rate"
+            assert event["sequence"] == 1
+            _assert_closed(websocket, 1003)
+    finally:
+        _clear_asr_dependency_overrides()
+
+
+def test_stream_v2_rejects_bad_api_key_with_policy_close():
+    coordinator = ProtocolCoordinator()
+    _override_protocol(coordinator)
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            websocket.send_json(
+                {
+                    "type": "start",
+                    "api_key": "bad-key",
+                    "sample_rate": 16000,
+                    "format": "pcm_s16le",
+                }
+            )
+            event = websocket.receive_json()
+            assert event["code"] == "invalid_api_key"
+            assert event["sequence"] == 1
+            _assert_closed(websocket, 1008)
+    finally:
+        _clear_asr_dependency_overrides()
+
+
+@pytest.mark.parametrize(
+    ("frame", "expected_code", "close_code"),
+    [
+        (b"", "invalid_audio_frame", 1003),
+        (b"\x00", "invalid_audio_frame", 1003),
+        (b"\x00\x00" * 17, "frame_too_large", 1009),
+    ],
+)
+def test_stream_v2_validates_pcm_frames(frame, expected_code, close_code):
+    coordinator = ProtocolCoordinator()
+    _override_protocol(coordinator, asr_max_frame_bytes=32)
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            _start_stream(websocket, expect_sequence=True)
+            websocket.send_bytes(frame)
+            event = websocket.receive_json()
+            assert event["code"] == expected_code
+            assert event["sequence"] == 2
+            _assert_closed(websocket, close_code)
+    finally:
+        _clear_asr_dependency_overrides()
+
+
+def test_stream_v2_rejects_malformed_json_after_ready():
+    coordinator = ProtocolCoordinator()
+    _override_protocol(coordinator)
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            _start_stream(websocket, expect_sequence=True)
+            websocket.send_text("not json")
+            event = websocket.receive_json()
+            assert event["code"] == "invalid_message"
+            assert event["sequence"] == 2
+            _assert_closed(websocket, 1003)
+    finally:
+        _clear_asr_dependency_overrides()
+
+
+def test_stream_v2_maps_queue_overload_to_1013():
+    coordinator = ProtocolCoordinator(add_error=ASRQueueFull("full"))
+    _override_protocol(coordinator)
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            _start_stream(websocket, expect_sequence=True)
+            websocket.send_bytes(b"\x00\x00")
+            event = websocket.receive_json()
+            assert event["code"] == "server_busy"
+            assert event["sequence"] == 2
+            _assert_closed(websocket, 1013)
+    finally:
+        _clear_asr_dependency_overrides()
+
+
+def test_stream_v2_closes_when_realtime_lag_limit_is_exceeded():
+    coordinator = ProtocolCoordinator(["late"], timing=(0.6, 0.5))
+    _override_protocol(coordinator, asr_max_connection_lag_seconds=1.0)
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            _start_stream(websocket, expect_sequence=True)
+            websocket.send_bytes(b"\x00\x00")
+            event = websocket.receive_json()
+            assert event["code"] == "realtime_lag_exceeded"
+            assert event["sequence"] == 2
+            _assert_closed(websocket, 1013)
+        assert coordinator.abort_count == 1
+    finally:
+        _clear_asr_dependency_overrides()
+
+
+def test_stream_v2_enforces_cumulative_audio_limit():
+    coordinator = ProtocolCoordinator(["first"])
+    _override_protocol(coordinator, asr_max_audio_seconds=0.001)
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            _start_stream(websocket, expect_sequence=True)
+            websocket.send_bytes(b"\x00\x00" * 16)
+            assert websocket.receive_json()["type"] == "partial"
+            websocket.send_bytes(b"\x00\x00")
+            event = websocket.receive_json()
+            assert event["code"] == "audio_limit_exceeded"
+            _assert_closed(websocket, 1008)
+    finally:
+        _clear_asr_dependency_overrides()
+
+
+def test_stream_v2_sequences_reconstruct_without_duplication():
+    text = "这是一个足够长的稳定句子。"
+    coordinator = ProtocolCoordinator([text, text, text], final_text=text)
+    _override_protocol(
+        coordinator,
+        asr_stable_commit_enabled=True,
+        asr_stable_commit_seconds=1.0,
+        asr_stable_commit_min_updates=2,
+    )
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            _start_stream(websocket, expect_sequence=True)
+            websocket.send_bytes(_pcm_s16le_samples(1000, 8000))
+            first = websocket.receive_json()
+            websocket.send_bytes(_pcm_s16le_samples(1000, 8000))
+            websocket.send_bytes(_pcm_s16le_samples(1000, 8000))
+            committed = websocket.receive_json()
+            empty_partial = websocket.receive_json()
+            websocket.send_json({"type": "end"})
+            final = websocket.receive_json()
+
+            assert first == {"type": "partial", "text": text, "sequence": 2}
+            assert committed == {"type": "sentence_final", "text": text, "sequence": 3}
+            assert empty_partial == {"type": "partial", "text": "", "sequence": 4}
+            assert final == {"type": "final", "text": "", "sequence": 5}
+            _assert_closed(websocket, 1000)
+    finally:
+        _clear_asr_dependency_overrides()
+
+
+def test_stream_v2_confirmed_prefix_conflict_closes_session():
+    coordinator = ProtocolCoordinator(["confirmed", "confirmed", "unsafe"])
+    _override_protocol(
+        coordinator,
+        asr_vad_silence_seconds=0.001,
+    )
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            _start_stream(websocket, expect_sequence=True)
+            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
+            assert websocket.receive_json()["type"] == "partial"
+            websocket.send_bytes(_pcm_s16le_samples(0, 160))
+            assert websocket.receive_json()["type"] == "sentence_final"
+            assert websocket.receive_json() == {"type": "partial", "text": "", "sequence": 4}
+            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
+            event = websocket.receive_json()
+            assert event["code"] == "transcript_conflict"
+            assert event["sequence"] == 5
+            _assert_closed(websocket, 1011)
+    finally:
+        _clear_asr_dependency_overrides()
+
+
+def test_stream_v2_enforces_session_timeout():
+    coordinator = ProtocolCoordinator()
+    _override_protocol(coordinator, asr_max_session_seconds=0.01, asr_idle_timeout_seconds=1.0)
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            _start_stream(websocket, expect_sequence=True)
+            event = websocket.receive_json()
+            assert event["code"] == "session_timeout"
+            assert event["sequence"] == 2
+            _assert_closed(websocket, 1008)
+    finally:
+        _clear_asr_dependency_overrides()
+
+
 def test_qwen_vllm_backend_can_be_selected():
     from app.asr import QwenVLLMASRTranscriber, create_asr_transcriber
     from app.config import Settings
@@ -560,7 +852,6 @@ def test_qwen_vllm_file_transcribe_normalizes_language_code(monkeypatch):
     assert result.language == "English"
     assert calls[1] == ("transcribe", {"audio": "sample.wav", "language": "English"})
 
-
 def test_qwen_vllm_file_transcribe_normalizes_regional_language_code(monkeypatch):
     import sys
     import types
@@ -591,666 +882,3 @@ def test_qwen_vllm_file_transcribe_normalizes_regional_language_code(monkeypatch
     transcriber.transcribe("sample.wav", language="en-US")
 
     assert calls[1] == ("transcribe", {"audio": "sample.wav", "language": "English"})
-
-
-def test_stream_rejects_bad_api_key():
-    with client.websocket_connect("/v1/transcribe/stream") as websocket:
-        websocket.send_json(
-            {
-                "type": "start",
-                "api_key": "bad-key",
-                "language": "zh",
-                "sample_rate": 16000,
-                "format": "pcm_s16le",
-            }
-        )
-
-        assert websocket.receive_json() == {
-            "type": "error",
-            "message": "Invalid or missing API key",
-        }
-
-
-def test_stateful_stream_returns_replaceable_partial(monkeypatch):
-    asr_api.get_settings.cache_clear()
-    monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
-    monkeypatch.setattr(asr_api, "asr_transcriber", FakeStatefulTranscriber(FakeStreamingSession(["可以到店", "可以到店使用"])))
-
-    try:
-        with client.websocket_connect("/v1/transcribe/stream") as websocket:
-            _start_stream(websocket)
-            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
-            assert websocket.receive_json() == {"type": "partial", "text": "可以到店"}
-            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
-            assert websocket.receive_json() == {"type": "partial", "text": "可以到店使用"}
-    finally:
-        asr_api.get_settings.cache_clear()
-
-
-def test_stateful_stream_replaces_revised_partial_text(monkeypatch):
-    asr_api.get_settings.cache_clear()
-    monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
-    monkeypatch.setattr(
-        asr_api,
-        "asr_transcriber",
-        FakeStatefulTranscriber(FakeStreamingSession(["可以到店。", "可以到店使用"])),
-    )
-
-    try:
-        with client.websocket_connect("/v1/transcribe/stream") as websocket:
-            _start_stream(websocket)
-            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
-            assert websocket.receive_json() == {"type": "partial", "text": "可以到店。"}
-            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
-            assert websocket.receive_json() == {"type": "partial", "text": "可以到店使用"}
-    finally:
-        asr_api.get_settings.cache_clear()
-
-
-def test_stateful_stream_commits_stable_punctuation_and_keeps_tail(monkeypatch):
-    asr_api.get_settings.cache_clear()
-    monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
-    monkeypatch.setenv("ASR_STABLE_COMMIT_SECONDS", "1.0")
-    monkeypatch.setenv("ASR_STABLE_COMMIT_MIN_UPDATES", "2")
-    session = FakeStreamingSession(
-        [
-            "这是一个足够长的稳定句子。后续",
-            "这是一个足够长的稳定句子。后续文本",
-            "这是一个足够长的稳定句子。后续文本继续",
-        ]
-    )
-    monkeypatch.setattr(asr_api, "asr_transcriber", FakeStatefulTranscriber(session))
-    _monotonic_values(monkeypatch, [0.0, 1.0, 2.0])
-
-    try:
-        with client.websocket_connect("/v1/transcribe/stream") as websocket:
-            _start_stream(websocket)
-            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
-            assert websocket.receive_json() == {
-                "type": "partial",
-                "text": "这是一个足够长的稳定句子。后续",
-            }
-            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
-            assert websocket.receive_json() == {
-                "type": "sentence_final",
-                "text": "这是一个足够长的稳定句子。",
-            }
-            assert websocket.receive_json() == {"type": "partial", "text": "后续文本"}
-            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
-            assert websocket.receive_json() == {"type": "partial", "text": "后续文本继续"}
-    finally:
-        asr_api.get_settings.cache_clear()
-
-
-def test_stateful_stable_commit_preserves_separator_for_future_cumulative_text(monkeypatch):
-    asr_api.get_settings.cache_clear()
-    monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
-    session = FakeStreamingSession(
-        [
-            "This is stable. tail",
-            "This is stable. tail",
-            "This is stable. tail",
-            "This is stable. tail next",
-        ]
-    )
-    monkeypatch.setattr(asr_api, "asr_transcriber", FakeStatefulTranscriber(session))
-    _monotonic_values(monkeypatch, [0.0, 1.0, 2.0, 3.0])
-
-    try:
-        with client.websocket_connect("/v1/transcribe/stream") as websocket:
-            _start_stream(websocket)
-            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
-            assert websocket.receive_json() == {"type": "partial", "text": "This is stable. tail"}
-            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
-            assert websocket.receive_json() == {"type": "sentence_final", "text": "This is stable."}
-            assert websocket.receive_json() == {"type": "partial", "text": " tail"}
-            websocket.send_bytes(_pcm_s16le_samples(0, 24000))
-            assert websocket.receive_json() == {"type": "sentence_final", "text": " tail"}
-            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
-            assert websocket.receive_json() == {"type": "partial", "text": " next"}
-    finally:
-        asr_api.get_settings.cache_clear()
-
-
-def test_stateful_stream_does_not_commit_transient_short_punctuation(monkeypatch):
-    asr_api.get_settings.cache_clear()
-    monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
-    session = FakeStreamingSession(["肯德基。", "肯德基双人餐八件套兑换券。"])
-    monkeypatch.setattr(asr_api, "asr_transcriber", FakeStatefulTranscriber(session))
-    _monotonic_values(monkeypatch, [0.0, 2.0])
-
-    try:
-        with client.websocket_connect("/v1/transcribe/stream") as websocket:
-            _start_stream(websocket)
-            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
-            assert websocket.receive_json() == {"type": "partial", "text": "肯德基。"}
-            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
-            assert websocket.receive_json() == {
-                "type": "partial",
-                "text": "肯德基双人餐八件套兑换券。",
-            }
-    finally:
-        asr_api.get_settings.cache_clear()
-
-
-def test_stateful_stream_vad_commit_resets_stable_tracker(monkeypatch):
-    asr_api.get_settings.cache_clear()
-    monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
-    tracker = RecordingStableCommitter()
-    session = FakeStreamingSession(["hello", "hello"])
-    monkeypatch.setattr(asr_api, "StablePunctuationCommitter", lambda **_kwargs: tracker)
-    monkeypatch.setattr(asr_api, "asr_transcriber", FakeStatefulTranscriber(session))
-    _monotonic_values(monkeypatch, [0.0, 0.5])
-
-    try:
-        with client.websocket_connect("/v1/transcribe/stream") as websocket:
-            _start_stream(websocket)
-            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
-            assert websocket.receive_json() == {"type": "partial", "text": "hello"}
-            websocket.send_bytes(_pcm_s16le_samples(0, 24000))
-            assert websocket.receive_json() == {"type": "sentence_final", "text": "hello"}
-            assert tracker.reset_count == 1
-    finally:
-        asr_api.get_settings.cache_clear()
-
-
-def test_stateful_stream_segment_resets_stable_tracker(monkeypatch):
-    asr_api.get_settings.cache_clear()
-    monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
-    tracker = RecordingStableCommitter()
-    session = FakeStreamingSession([], final_text="")
-    monkeypatch.setattr(asr_api, "StablePunctuationCommitter", lambda **_kwargs: tracker)
-    monkeypatch.setattr(asr_api, "asr_transcriber", FakeStatefulTranscriber(session))
-    _monotonic_values(monkeypatch, [0.0])
-
-    try:
-        with client.websocket_connect("/v1/transcribe/stream") as websocket:
-            _start_stream(websocket)
-            websocket.send_json({"type": "segment"})
-            websocket.send_json({"type": "end"})
-            assert websocket.receive_json() == {"type": "final", "text": ""}
-            assert session.segment_reset is True
-            assert tracker.reset_count == 1
-    finally:
-        asr_api.get_settings.cache_clear()
-
-
-def test_stateful_stream_stable_commit_blocks_legacy_immediate_punctuation(monkeypatch):
-    asr_api.get_settings.cache_clear()
-    monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
-    monkeypatch.setenv("ASR_COMMIT_ON_PUNCTUATION", "true")
-    monkeypatch.setenv("ASR_STABLE_COMMIT_ENABLED", "true")
-    session = FakeStreamingSession(["这是一个足够长的句子。"])
-    monkeypatch.setattr(asr_api, "asr_transcriber", FakeStatefulTranscriber(session))
-    _monotonic_values(monkeypatch, [0.0])
-
-    try:
-        with client.websocket_connect("/v1/transcribe/stream") as websocket:
-            _start_stream(websocket)
-            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
-            assert websocket.receive_json() == {"type": "partial", "text": "这是一个足够长的句子。"}
-    finally:
-        asr_api.get_settings.cache_clear()
-
-
-def test_stateful_stream_stable_commit_disabled_preserves_legacy_punctuation(monkeypatch):
-    asr_api.get_settings.cache_clear()
-    monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
-    monkeypatch.setenv("ASR_COMMIT_ON_PUNCTUATION", "true")
-    monkeypatch.setenv("ASR_STABLE_COMMIT_ENABLED", "false")
-    session = FakeStreamingSession(["你好。"])
-    monkeypatch.setattr(asr_api, "asr_transcriber", FakeStatefulTranscriber(session))
-    _monotonic_values(monkeypatch, [0.0])
-
-    try:
-        with client.websocket_connect("/v1/transcribe/stream") as websocket:
-            _start_stream(websocket)
-            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
-            assert websocket.receive_json() == {"type": "sentence_final", "text": "你好。"}
-    finally:
-        asr_api.get_settings.cache_clear()
-
-
-def test_stateful_stream_vad_commit_excludes_confirmed_prefix(monkeypatch):
-    asr_api.get_settings.cache_clear()
-    monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
-    monkeypatch.setattr(asr_api, "asr_transcriber", FakeStatefulTranscriber(FakeStreamingSession(["hello", "hello", "hello world"])))
-
-    try:
-        with client.websocket_connect("/v1/transcribe/stream") as websocket:
-            _start_stream(websocket)
-            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
-            assert websocket.receive_json() == {"type": "partial", "text": "hello"}
-            websocket.send_bytes(_pcm_s16le_samples(0, 24000))
-            assert websocket.receive_json() == {"type": "sentence_final", "text": "hello"}
-            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
-            assert websocket.receive_json() == {"type": "partial", "text": " world"}
-    finally:
-        asr_api.get_settings.cache_clear()
-
-
-def test_stateful_stream_clears_revised_empty_partial(monkeypatch):
-    asr_api.get_settings.cache_clear()
-    monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
-    monkeypatch.setattr(asr_api, "asr_transcriber", FakeStatefulTranscriber(FakeStreamingSession(["hello", ""])))
-
-    try:
-        with client.websocket_connect("/v1/transcribe/stream") as websocket:
-            _start_stream(websocket)
-            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
-            assert websocket.receive_json() == {"type": "partial", "text": "hello"}
-            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
-            assert websocket.receive_json() == {"type": "partial", "text": ""}
-    finally:
-        asr_api.get_settings.cache_clear()
-
-
-def test_stateful_stream_finish_flushes_remaining_text(monkeypatch):
-    asr_api.get_settings.cache_clear()
-    monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
-    session = FakeStreamingSession(["hello"], final_text="hello world")
-    monkeypatch.setattr(asr_api, "asr_transcriber", FakeStatefulTranscriber(session))
-
-    try:
-        with client.websocket_connect("/v1/transcribe/stream") as websocket:
-            _start_stream(websocket)
-            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
-            assert websocket.receive_json() == {"type": "partial", "text": "hello"}
-            websocket.send_json({"type": "end"})
-            assert websocket.receive_json() == {"type": "partial", "text": "hello world"}
-            assert websocket.receive_json() == {"type": "final", "text": "hello world"}
-            assert session.finished is True
-    finally:
-        asr_api.get_settings.cache_clear()
-
-
-def test_stateful_stream_rejects_non_16khz_sample_rate(monkeypatch):
-    asr_api.get_settings.cache_clear()
-    monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
-    monkeypatch.setattr(asr_api, "asr_transcriber", FakeStatefulTranscriber(FakeStreamingSession([])))
-
-    try:
-        with client.websocket_connect("/v1/transcribe/stream") as websocket:
-            websocket.send_json(
-                {
-                    "type": "start",
-                    "api_key": "test-key",
-                    "language": "zh",
-                    "sample_rate": 8000,
-                    "format": "pcm_s16le",
-                }
-            )
-            assert websocket.receive_json() == {
-                "type": "error",
-                "message": "Stateful ASR streaming requires sample_rate 16000",
-            }
-    finally:
-        asr_api.get_settings.cache_clear()
-
-
-def test_stateful_stream_returns_error_when_streaming_session_rejects_language(monkeypatch):
-    asr_api.get_settings.cache_clear()
-    monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
-    monkeypatch.setattr(
-        asr_api,
-        "asr_transcriber",
-        RaisingStatefulTranscriber(ValueError("Unsupported language: Xx")),
-    )
-
-    try:
-        with client.websocket_connect("/v1/transcribe/stream") as websocket:
-            websocket.send_json(
-                {
-                    "type": "start",
-                    "api_key": "test-key",
-                    "language": "xx",
-                    "sample_rate": 16000,
-                    "format": "pcm_s16le",
-                }
-            )
-            assert websocket.receive_json() == {
-                "type": "error",
-                "message": "Unsupported language: Xx",
-            }
-    finally:
-        asr_api.get_settings.cache_clear()
-
-
-def test_stateful_stream_segment_resets_streaming_session_buffer(monkeypatch):
-    asr_api.get_settings.cache_clear()
-    monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
-    session = FakeStreamingSession(["hello"], final_text="hello")
-    monkeypatch.setattr(asr_api, "asr_transcriber", FakeStatefulTranscriber(session))
-
-    try:
-        with client.websocket_connect("/v1/transcribe/stream") as websocket:
-            _start_stream(websocket)
-            websocket.send_json({"type": "segment"})
-            websocket.send_json({"type": "end"})
-            assert websocket.receive_json() == {"type": "partial", "text": "hello"}
-            assert websocket.receive_json() == {"type": "final", "text": "hello"}
-            assert session.segment_reset is True
-    finally:
-        asr_api.get_settings.cache_clear()
-
-
-def test_stream_returns_partial_and_final_transcripts(monkeypatch):
-    monkeypatch.setattr(asr_api, "_transcribe_pcm_chunk", lambda *_args: "未完成文本")
-
-    with client.websocket_connect("/v1/transcribe/stream") as websocket:
-        _start_stream(websocket)
-
-        _send_transcribable_chunk(websocket)
-        partial = websocket.receive_json()
-        assert partial["type"] == "partial"
-        assert partial["text"] == "未完成文本"
-
-        websocket.send_json({"type": "end"})
-        final = websocket.receive_json()
-        assert final["type"] == "final"
-        assert final["text"] == "未完成文本"
-
-
-def test_stream_keeps_punctuated_text_partial_by_default(monkeypatch):
-    monkeypatch.setattr(asr_api, "_transcribe_pcm_chunk", lambda *_args: "你好。")
-
-    with client.websocket_connect("/v1/transcribe/stream") as websocket:
-        _start_stream(websocket)
-
-        _send_transcribable_chunk(websocket)
-
-        assert websocket.receive_json() == {"type": "partial", "text": "你好。"}
-
-
-def test_stream_can_commit_punctuation_when_enabled(monkeypatch):
-    asr_api.get_settings.cache_clear()
-    monkeypatch.setenv("ASR_COMMIT_ON_PUNCTUATION", "true")
-    monkeypatch.setattr(asr_api, "_transcribe_pcm_chunk", lambda *_args: "你好。")
-
-    try:
-        with client.websocket_connect("/v1/transcribe/stream") as websocket:
-            _start_stream(websocket)
-
-            _send_transcribable_chunk(websocket)
-
-            assert websocket.receive_json() == {"type": "sentence_final", "text": "你好。"}
-    finally:
-        asr_api.get_settings.cache_clear()
-
-
-def test_stream_partial_excludes_previously_committed_text_when_punctuation_commit_enabled(monkeypatch):
-    asr_api.get_settings.cache_clear()
-    monkeypatch.setenv("ASR_COMMIT_ON_PUNCTUATION", "true")
-    texts = iter(["你好。", "继续说"])
-    monkeypatch.setattr(asr_api, "_transcribe_pcm_chunk", lambda *_args: next(texts))
-
-    try:
-        with client.websocket_connect("/v1/transcribe/stream") as websocket:
-            _start_stream(websocket)
-
-            _send_transcribable_chunk(websocket)
-            assert websocket.receive_json() == {"type": "sentence_final", "text": "你好。"}
-
-            _send_transcribable_chunk(websocket)
-            assert websocket.receive_json() == {"type": "partial", "text": "继续说"}
-    finally:
-        asr_api.get_settings.cache_clear()
-
-
-def test_stream_handles_cumulative_asr_text_without_recommitting_when_punctuation_commit_enabled(monkeypatch):
-    asr_api.get_settings.cache_clear()
-    monkeypatch.setenv("ASR_COMMIT_ON_PUNCTUATION", "true")
-    texts = iter(["你好。", "你好。继续说"])
-    monkeypatch.setattr(asr_api, "_transcribe_pcm_chunk", lambda *_args: next(texts))
-
-    try:
-        with client.websocket_connect("/v1/transcribe/stream") as websocket:
-            _start_stream(websocket)
-
-            _send_transcribable_chunk(websocket)
-            assert websocket.receive_json() == {"type": "sentence_final", "text": "你好。"}
-
-            _send_transcribable_chunk(websocket)
-            assert websocket.receive_json() == {"type": "partial", "text": "继续说"}
-    finally:
-        asr_api.get_settings.cache_clear()
-
-
-def test_stream_keeps_multiple_punctuated_sentences_partial_by_default(monkeypatch):
-    monkeypatch.setattr(asr_api, "_transcribe_pcm_chunk", lambda *_args: "你好。再见！还有半句")
-
-    with client.websocket_connect("/v1/transcribe/stream") as websocket:
-        _start_stream(websocket)
-
-        _send_transcribable_chunk(websocket)
-
-        assert websocket.receive_json() == {"type": "partial", "text": "你好。再见！还有半句"}
-
-
-def test_stream_commits_multiple_sentences_and_partial_remainder_when_punctuation_commit_enabled(monkeypatch):
-    asr_api.get_settings.cache_clear()
-    monkeypatch.setenv("ASR_COMMIT_ON_PUNCTUATION", "true")
-    monkeypatch.setattr(asr_api, "_transcribe_pcm_chunk", lambda *_args: "你好。再见！还有半句")
-
-    try:
-        with client.websocket_connect("/v1/transcribe/stream") as websocket:
-            _start_stream(websocket)
-
-            _send_transcribable_chunk(websocket)
-
-            assert websocket.receive_json() == {"type": "sentence_final", "text": "你好。"}
-            assert websocket.receive_json() == {"type": "sentence_final", "text": "再见！"}
-            assert websocket.receive_json() == {"type": "partial", "text": "还有半句"}
-    finally:
-        asr_api.get_settings.cache_clear()
-
-
-def test_stream_end_final_only_returns_remaining_uncommitted_text_when_punctuation_commit_enabled(monkeypatch):
-    asr_api.get_settings.cache_clear()
-    monkeypatch.setenv("ASR_COMMIT_ON_PUNCTUATION", "true")
-    texts = iter(["你好。", "最后半句"])
-    monkeypatch.setattr(asr_api, "_transcribe_pcm_chunk", lambda *_args: next(texts))
-
-    try:
-        with client.websocket_connect("/v1/transcribe/stream") as websocket:
-            _start_stream(websocket)
-
-            _send_transcribable_chunk(websocket)
-            assert websocket.receive_json() == {"type": "sentence_final", "text": "你好。"}
-
-            websocket.send_bytes(b"\x00\x00" * 80)
-            websocket.send_json({"type": "end"})
-
-            assert websocket.receive_json() == {"type": "partial", "text": "最后半句"}
-            assert websocket.receive_json() == {"type": "final", "text": "最后半句"}
-    finally:
-        asr_api.get_settings.cache_clear()
-
-
-def test_stream_commits_pending_text_after_silence(monkeypatch):
-    texts = iter(["还没有标点。", ""])
-    monkeypatch.setattr(asr_api, "_transcribe_pcm_chunk", lambda *_args: next(texts))
-
-    with client.websocket_connect("/v1/transcribe/stream") as websocket:
-        _start_stream(websocket)
-
-        websocket.send_bytes(_pcm_s16le_samples(1000, 160))
-        assert websocket.receive_json() == {"type": "partial", "text": "还没有标点。"}
-
-        websocket.send_bytes(_pcm_s16le_samples(0, 24000))
-        assert websocket.receive_json() == {"type": "sentence_final", "text": "还没有标点。"}
-
-        websocket.send_json({"type": "end"})
-        assert websocket.receive_json() == {"type": "final", "text": ""}
-
-
-def test_stream_preserves_leading_separator_after_vad_commit_for_cumulative_text(monkeypatch):
-    texts = iter(["hello", "", "hello world", ""])
-    monkeypatch.setattr(asr_api, "_transcribe_pcm_chunk", lambda *_args: next(texts))
-
-    with client.websocket_connect("/v1/transcribe/stream") as websocket:
-        _start_stream(websocket)
-
-        websocket.send_bytes(_pcm_s16le_samples(1000, 160))
-        assert websocket.receive_json() == {"type": "partial", "text": "hello"}
-
-        websocket.send_bytes(_pcm_s16le_samples(0, 24000))
-        assert websocket.receive_json() == {"type": "sentence_final", "text": "hello"}
-
-        websocket.send_bytes(_pcm_s16le_samples(1000, 160))
-        assert websocket.receive_json() == {"type": "partial", "text": " world"}
-
-        websocket.send_bytes(_pcm_s16le_samples(0, 24000))
-        assert websocket.receive_json() == {"type": "sentence_final", "text": " world"}
-
-        websocket.send_json({"type": "end"})
-        assert websocket.receive_json() == {"type": "final", "text": ""}
-
-
-def test_sentence_committer_keeps_punctuation_pending_by_default():
-    committer = asr_api.SentenceCommitter()
-
-    committed = committer.append("你好。")
-
-    assert committed == []
-    assert committer.pending_text == "你好。"
-
-
-def test_sentence_committer_can_commit_punctuation_for_compatibility():
-    committer = asr_api.SentenceCommitter(commit_on_punctuation=True)
-
-    committed = committer.append("你好。")
-
-    assert committed == ["你好。"]
-    assert committer.pending_text == ""
-
-
-def test_sentence_committer_does_not_split_decimal_abbreviations_or_domains():
-    committer = asr_api.SentenceCommitter(commit_on_punctuation=True)
-
-    committed = committer.append("pi is 3.14 and Dr. Smith uses e.g. example.com as a domain in the U.S.A.")
-
-    assert committed == []
-    assert committer.pending_text == "pi is 3.14 and Dr. Smith uses e.g. example.com as a domain in the U.S.A."
-
-
-def test_sentence_committer_includes_closing_quotes_in_committed_sentence():
-    committer = asr_api.SentenceCommitter(commit_on_punctuation=True)
-
-    committed = committer.append("他说“你好。”后续")
-
-    assert committed == ["他说“你好。”"]
-    assert committer.pending_text == "后续"
-
-
-def test_sentence_committer_commit_prefix_preserves_pending_tail():
-    committer = asr_api.SentenceCommitter(pending_text="这是一个足够长的稳定句子。 后续文本")
-
-    committed = committer.commit_prefix("这是一个足够长的稳定句子。")
-
-    assert committed == "这是一个足够长的稳定句子。"
-    assert committer.confirmed_texts == ["这是一个足够长的稳定句子。"]
-    assert committer.pending_text == " 后续文本"
-
-
-def test_stable_punctuation_rejects_short_transient_candidate():
-    tracker = asr_api.StablePunctuationCommitter(
-        enabled=True,
-        stable_seconds=1.0,
-        min_chars=8,
-        min_updates=2,
-    )
-
-    assert tracker.observe("肯德基。", now=0.0) is None
-    assert tracker.observe("肯德基。", now=2.0) is None
-
-
-def test_stable_punctuation_commits_after_time_and_update_thresholds():
-    tracker = asr_api.StablePunctuationCommitter(True, 1.0, 8, 2)
-    text = "肯德基双人餐八件套兑换券，限时优惠。仅需七十九元"
-
-    assert tracker.observe(text, now=0.0) is None
-    assert tracker.observe(text, now=0.5) is None
-    assert tracker.observe(text, now=1.0) == "肯德基双人餐八件套兑换券，限时优惠。"
-
-
-def test_stable_punctuation_revision_resets_candidate_timer():
-    tracker = asr_api.StablePunctuationCommitter(True, 1.0, 8, 2)
-
-    assert tracker.observe("这是第一版稳定候选。后续", now=0.0) is None
-    assert tracker.observe("这是修订后的稳定候选。后续", now=1.0) is None
-    assert tracker.observe("这是修订后的稳定候选。后续", now=1.5) is None
-    assert tracker.observe("这是修订后的稳定候选。后续", now=2.0) == "这是修订后的稳定候选。"
-
-
-def test_stable_punctuation_reset_discards_candidate():
-    tracker = asr_api.StablePunctuationCommitter(True, 1.0, 8, 2)
-    text = "这是一个足够长的候选句子。后续"
-
-    assert tracker.observe(text, now=0.0) is None
-    tracker.reset()
-    assert tracker.observe(text, now=2.0) is None
-
-
-def test_stable_punctuation_disappearing_candidate_resets_timer():
-    tracker = asr_api.StablePunctuationCommitter(True, 1.0, 8, 2)
-    text = "这是一个足够长的候选句子。后续"
-
-    assert tracker.observe(text, now=0.0) is None
-    assert tracker.observe("这是一个没有标点的修订", now=0.5) is None
-    assert tracker.observe(text, now=2.0) is None
-
-
-def test_stable_punctuation_empty_text_resets_timer():
-    tracker = asr_api.StablePunctuationCommitter(True, 1.0, 8, 2)
-    text = "这是一个足够长的候选句子。后续"
-
-    assert tracker.observe(text, now=0.0) is None
-    assert tracker.observe("", now=0.5) is None
-    assert tracker.observe(text, now=2.0) is None
-
-
-def test_stable_punctuation_candidate_is_exact_pending_prefix():
-    tracker = asr_api.StablePunctuationCommitter(True, 1.0, 8, 2)
-    text = " 这是一个足够长的候选句子。后续"
-
-    assert tracker.observe(text, now=0.0) is None
-    assert tracker.observe(text, now=1.0) == " 这是一个足够长的候选句子。"
-
-
-def test_stable_punctuation_terminator_cluster_revision_resets_timer():
-    tracker = asr_api.StablePunctuationCommitter(True, 1.0, 8, 2)
-
-    assert tracker.observe("这是一个足够长的候选句子。", now=0.0) is None
-    assert tracker.observe("这是一个足够长的候选句子。。", now=1.0) is None
-    assert tracker.observe("这是一个足够长的候选句子。。", now=2.0) == "这是一个足够长的候选句子。。"
-
-
-def test_stable_punctuation_candidate_includes_mixed_terminator_cluster():
-    tracker = asr_api.StablePunctuationCommitter(True, 1.0, 8, 2)
-    text = "这是一个足够长的候选句子？！后续"
-
-    assert tracker.observe(text, now=0.0) is None
-    assert tracker.observe(text, now=1.0) == "这是一个足够长的候选句子？！"
-
-
-def test_stream_segment_clears_pending_audio_buffer():
-    with client.websocket_connect("/v1/transcribe/stream") as websocket:
-        websocket.send_json(
-            {
-                "type": "start",
-                "api_key": "test-key",
-                "language": "zh",
-                "sample_rate": 16000,
-                "format": "pcm_s16le",
-            }
-        )
-        assert websocket.receive_json() == {"type": "ready"}
-
-        websocket.send_bytes(b"\x00\x00" * 80)
-        websocket.send_json({"type": "segment"})
-        websocket.send_json({"type": "end"})
-
-        final = websocket.receive_json()
-        assert final["type"] == "final"
-        assert final["text"] == ""

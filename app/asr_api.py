@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from typing import Literal
 
 from fastapi import (
     Depends,
@@ -16,6 +18,7 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.asr import ASRTranscriber, create_asr_transcriber
 from app.audio import remove_file, save_upload_to_tempfile, write_pcm_s16le_wav
@@ -30,7 +33,9 @@ from app.asr_inference import (
     ASRQueueFull,
     ASRQueueTimeout,
     ASRSessionLimit,
+    ASRSessionPoisoned,
 )
+from app.asr_streaming import ConfirmedPrefixConflict, StreamingTranscriptState
 from app.schemas import (
     ASRHealthResponse,
     ASRReadyResponse,
@@ -451,78 +456,296 @@ def _http_asr_unavailable(code: str, message: str) -> HTTPException:
     )
 
 
+class ASRStreamStart(BaseModel):
+    type: Literal["start"]
+    api_key: str
+    language: str | None = Field(default=None, max_length=32)
+    sample_rate: int = Field(default=16000, strict=True)
+    format: Literal["pcm_s16le"] = "pcm_s16le"
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class _StreamClosed(RuntimeError):
+    pass
+
+
+class StreamingSessionController:
+    def __init__(
+        self,
+        websocket: WebSocket,
+        current_settings: Settings,
+        coordinator: ASRInferenceCoordinator,
+    ) -> None:
+        self.websocket = websocket
+        self.settings = current_settings
+        self.coordinator = coordinator
+        self.session_id: str | None = None
+        self.finished = False
+        self.accepted_samples = 0
+        self.transcript = StreamingTranscriptState(
+            sample_rate=16000,
+            stable_commit_enabled=current_settings.asr_stable_commit_enabled,
+            stable_commit_seconds=current_settings.asr_stable_commit_seconds,
+            stable_commit_min_chars=current_settings.asr_stable_commit_min_chars,
+            stable_commit_min_updates=current_settings.asr_stable_commit_min_updates,
+        )
+        self.silence = SilenceEndpointDetector(
+            silence_seconds=current_settings.asr_vad_silence_seconds,
+            rms_threshold=current_settings.asr_vad_rms_threshold,
+        )
+
+    async def start(self, language: str | None) -> None:
+        try:
+            self.session_id = await self.coordinator.create_stream(language)
+        except ValueError as exc:
+            await self.fail("invalid_language", "Unsupported language", 1003)
+            raise _StreamClosed from exc
+        except (ASRQueueFull, ASRQueueTimeout, ASRSessionLimit, ASRBatchConflict) as exc:
+            await self.fail("server_busy", "ASR is at capacity", 1013)
+            raise _StreamClosed from exc
+        except ASRNotReady as exc:
+            await self.fail("not_ready", "ASR is not ready", 1013)
+            raise _StreamClosed from exc
+        except Exception as exc:
+            await self.fail("inference_error", "Unable to create ASR session", 1011)
+            raise _StreamClosed from exc
+        await self._send_event(self.transcript.new_event("ready"))
+
+    async def add_audio(self, pcm_bytes: bytes) -> None:
+        if not pcm_bytes or len(pcm_bytes) % 2:
+            await self.fail("invalid_audio_frame", "Audio frames must contain aligned PCM samples", 1003)
+            raise _StreamClosed
+        if len(pcm_bytes) > self.settings.asr_max_frame_bytes:
+            await self.fail("frame_too_large", "Audio frame exceeds the configured limit", 1009)
+            raise _StreamClosed
+        sample_count = len(pcm_bytes) // 2
+        max_samples = int(self.settings.asr_max_audio_seconds * 16000)
+        if self.accepted_samples + sample_count > max_samples:
+            await self.fail("audio_limit_exceeded", "Maximum audio duration exceeded", 1008)
+            raise _StreamClosed
+        self.accepted_samples += sample_count
+        assert self.session_id is not None
+        try:
+            result = await self.coordinator.add_audio(self.session_id, pcm_bytes, 16000)
+        except (ASRQueueFull, ASRQueueTimeout, ASRSessionLimit, ASRBatchConflict) as exc:
+            await self.fail("server_busy", "ASR is at capacity", 1013)
+            raise _StreamClosed from exc
+        except ASRInferenceTimeout as exc:
+            await self.fail("inference_timeout", "ASR inference timed out", 1011)
+            raise _StreamClosed from exc
+        except ASRSessionPoisoned as exc:
+            await self.fail("session_poisoned", "ASR session can no longer be used", 1011)
+            raise _StreamClosed from exc
+        except Exception as exc:
+            await self.fail("inference_error", "ASR inference failed", 1011)
+            raise _StreamClosed from exc
+
+        queue_wait, inference_time = self.coordinator.session_timing(self.session_id)
+        if queue_wait + inference_time > self.settings.asr_max_connection_lag_seconds:
+            await self.fail("realtime_lag_exceeded", "ASR can no longer keep up in real time", 1013)
+            raise _StreamClosed
+        try:
+            await self._send_events(
+                self.transcript.apply_model_update(
+                    result.text,
+                    processed_samples=sample_count,
+                )
+            )
+        except ConfirmedPrefixConflict as exc:
+            await self.fail("transcript_conflict", "Model output conflicts with confirmed text", 1011)
+            raise _StreamClosed from exc
+
+        if self.silence.add_audio(pcm_bytes, 16000):
+            events = self.transcript.commit_pending()
+            await self._send_events(events)
+            if events:
+                await self.coordinator.reset_segment(self.session_id)
+
+    async def reset_segment(self) -> None:
+        assert self.session_id is not None
+        await self.coordinator.reset_segment(self.session_id)
+        self.transcript.reset_segment()
+        self.silence.reset()
+
+    async def finish(self) -> None:
+        assert self.session_id is not None
+        try:
+            result = await self.coordinator.finish_stream(self.session_id)
+            await self._send_events(self.transcript.finish(result.text))
+        except ConfirmedPrefixConflict as exc:
+            await self.fail("transcript_conflict", "Model output conflicts with confirmed text", 1011)
+            raise _StreamClosed from exc
+        except (ASRQueueFull, ASRQueueTimeout) as exc:
+            await self.fail("server_busy", "ASR is at capacity", 1013)
+            raise _StreamClosed from exc
+        except ASRInferenceTimeout as exc:
+            await self.fail("inference_timeout", "ASR inference timed out", 1011)
+            raise _StreamClosed from exc
+        except Exception as exc:
+            await self.fail("inference_error", "ASR finalization failed", 1011)
+            raise _StreamClosed from exc
+        self.finished = True
+        self.session_id = None
+        await self.websocket.close(code=1000)
+
+    async def abort(self) -> None:
+        if self.session_id is None:
+            return
+        session_id, self.session_id = self.session_id, None
+        try:
+            await self.coordinator.abort_stream(session_id)
+        except Exception:
+            return
+
+    async def fail(self, code: str, message: str, close_code: int) -> None:
+        event = self.transcript.new_event("error")
+        await self.websocket.send_json(
+            {
+                "type": "error",
+                "code": code,
+                "message": message,
+                "sequence": event.sequence,
+            }
+        )
+        await self.websocket.close(code=close_code)
+
+    async def _send_events(self, events) -> None:
+        for event in events:
+            await self._send_event(event)
+
+    async def _send_event(self, event) -> None:
+        payload = {"type": event.type, "sequence": event.sequence}
+        if event.type in {"partial", "sentence_final", "final"}:
+            payload["text"] = event.text
+        await self.websocket.send_json(payload)
+
+
 @app.websocket("/v1/transcribe/stream")
-async def transcribe_stream(websocket: WebSocket) -> None:
+async def transcribe_stream(
+    websocket: WebSocket,
+    current_settings: Settings = Depends(get_settings),
+    current_coordinator: ASRInferenceCoordinator = Depends(get_asr_coordinator),
+) -> None:
     await websocket.accept()
-    current_settings = get_settings()
+    controller = StreamingSessionController(websocket, current_settings, current_coordinator)
 
     try:
-        start_message = await websocket.receive_text()
-        start_payload = json.loads(start_message)
-    except Exception:
-        await websocket.send_json({"type": "error", "message": "Expected JSON start message"})
-        await websocket.close(code=1003)
-        return
+        try:
+            async with asyncio.timeout(current_settings.asr_start_timeout_seconds):
+                raw_start = await websocket.receive_text()
+        except TimeoutError:
+            await controller.fail("start_timeout", "Start message was not received in time", 1008)
+            return
+        except Exception:
+            await controller.fail("invalid_start", "Expected a JSON start message", 1003)
+            return
 
-    if start_payload.get("type") != "start":
-        await websocket.send_json({"type": "error", "message": "Expected start message"})
-        await websocket.close(code=1003)
-        return
+        start = await _parse_stream_start(raw_start, controller, current_settings)
+        if start is None:
+            return
 
-    if not is_valid_api_key(start_payload.get("api_key"), current_settings):
-        await websocket.send_json({"type": "error", "message": "Invalid or missing API key"})
-        await websocket.close(code=1008)
-        return
-
-    audio_format = start_payload.get("format", "pcm_s16le")
-    if audio_format != "pcm_s16le":
-        await websocket.send_json({"type": "error", "message": "Only pcm_s16le stream format is supported"})
-        await websocket.close(code=1003)
-        return
-
-    sample_rate = int(start_payload.get("sample_rate", 16000))
-    language = start_payload.get("language")
-    stateful_stable_commit_enabled = (
-        current_settings.asr_stream_mode == "stateful" and current_settings.asr_stable_commit_enabled
-    )
-    committer = SentenceCommitter(
-        commit_on_punctuation=(
-            current_settings.asr_commit_on_punctuation and not stateful_stable_commit_enabled
-        ),
-    )
-    silence_detector = SilenceEndpointDetector(
-        silence_seconds=current_settings.asr_vad_silence_seconds,
-        rms_threshold=current_settings.asr_vad_rms_threshold,
-    )
-
-    try:
-        if current_settings.asr_stream_mode == "stateful":
-            stable_committer = StablePunctuationCommitter(
-                enabled=current_settings.asr_stable_commit_enabled,
-                stable_seconds=current_settings.asr_stable_commit_seconds,
-                min_chars=current_settings.asr_stable_commit_min_chars,
-                min_updates=current_settings.asr_stable_commit_min_updates,
+        if current_settings.asr_stream_mode != "stateful":
+            committer = SentenceCommitter(commit_on_punctuation=current_settings.asr_commit_on_punctuation)
+            silence_detector = SilenceEndpointDetector(
+                silence_seconds=current_settings.asr_vad_silence_seconds,
+                rms_threshold=current_settings.asr_vad_rms_threshold,
             )
-            await _run_stateful_transcribe_stream(
-                websocket,
-                language,
-                sample_rate,
-                committer,
-                stable_committer,
-                silence_detector,
-            )
-        else:
-            await websocket.send_json({"type": "ready"})
             await _run_chunked_transcribe_stream(
                 websocket,
                 current_settings,
-                language,
-                sample_rate,
+                start.language,
+                start.sample_rate,
                 committer,
                 silence_detector,
             )
+            return
+
+        await controller.start(start.language)
+        session_started = time.monotonic()
+        while True:
+            session_remaining = current_settings.asr_max_session_seconds - (
+                time.monotonic() - session_started
+            )
+            if session_remaining <= 0:
+                await controller.fail("session_timeout", "Maximum session duration exceeded", 1008)
+                return
+            receive_timeout = min(current_settings.asr_idle_timeout_seconds, session_remaining)
+            try:
+                async with asyncio.timeout(receive_timeout):
+                    message = await websocket.receive()
+            except TimeoutError:
+                if session_remaining <= current_settings.asr_idle_timeout_seconds:
+                    await controller.fail("session_timeout", "Maximum session duration exceeded", 1008)
+                else:
+                    await controller.fail("idle_timeout", "No audio or command was received in time", 1008)
+                return
+
+            if message.get("type") == "websocket.disconnect":
+                return
+            if "bytes" in message and message["bytes"] is not None:
+                await controller.add_audio(message["bytes"])
+                continue
+            if "text" not in message or message["text"] is None:
+                await controller.fail("invalid_message", "Expected audio or a JSON command", 1003)
+                return
+            try:
+                payload = json.loads(message["text"])
+            except (json.JSONDecodeError, TypeError):
+                await controller.fail("invalid_message", "Expected a JSON command", 1003)
+                return
+            if not isinstance(payload, dict):
+                await controller.fail("invalid_message", "Expected a JSON object", 1003)
+                return
+            if payload.get("type") == "end":
+                await controller.finish()
+                return
+            if payload.get("type") == "segment":
+                await controller.reset_segment()
+                continue
+            await controller.fail("invalid_message", "Unsupported stream command", 1003)
+            return
+    except _StreamClosed:
+        return
     except WebSocketDisconnect:
         return
+    finally:
+        await controller.abort()
+
+
+async def _parse_stream_start(
+    raw_start: str,
+    controller: StreamingSessionController,
+    current_settings: Settings,
+) -> ASRStreamStart | None:
+    try:
+        payload = json.loads(raw_start)
+    except (json.JSONDecodeError, TypeError):
+        await controller.fail("invalid_start", "Expected a JSON start message", 1003)
+        return None
+    if not isinstance(payload, dict):
+        await controller.fail("invalid_start", "Expected a JSON object", 1003)
+        return None
+    language = payload.get("language")
+    if language is not None and not isinstance(language, str):
+        await controller.fail("invalid_language", "Language must be a string or null", 1003)
+        return None
+    sample_rate = payload.get("sample_rate", 16000)
+    if isinstance(sample_rate, int) and not isinstance(sample_rate, bool) and sample_rate != 16000:
+        await controller.fail("unsupported_sample_rate", "Only 16000 Hz audio is supported", 1003)
+        return None
+    try:
+        start = ASRStreamStart.model_validate(payload)
+    except ValidationError:
+        await controller.fail("invalid_start", "Invalid start message", 1003)
+        return None
+    if start.sample_rate != 16000:
+        await controller.fail("unsupported_sample_rate", "Only 16000 Hz audio is supported", 1003)
+        return None
+    if not is_valid_api_key(start.api_key, current_settings):
+        await controller.fail("invalid_api_key", "Invalid or missing API key", 1008)
+        return None
+    return start
 
 
 async def _run_chunked_transcribe_stream(
