@@ -438,7 +438,14 @@ class StreamingSessionController:
                 lambda: self.coordinator.finish_stream(self.session_id)
             )
             await self._ensure_session_active()
-            await self._send_events(self.transcript.finish(result.text))
+            if result.model_updated:
+                await self._send_events(
+                    self.transcript.apply_model_update(
+                        result.text,
+                        processed_samples=result.processed_samples or 0,
+                    )
+                )
+            await self._send_event(self.transcript.final_event())
         except _StreamClosed:
             raise
         except ConfirmedPrefixConflict as exc:

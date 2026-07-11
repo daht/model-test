@@ -132,6 +132,19 @@ def receive_frame(connection):
     return opcode, payload
 
 
+def require_sequence(event, previous_sequence):
+    if not isinstance(event, dict):
+        raise SystemExit(f"expected JSON object event, got {event!r}")
+    sequence = event.get("sequence")
+    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence <= 0:
+        raise SystemExit(f"event sequence must be a positive integer, got {sequence!r}")
+    if sequence <= previous_sequence:
+        raise SystemExit(
+            f"event sequence must strictly increase: previous={previous_sequence}, got={sequence}"
+        )
+    return sequence
+
+
 base = urlsplit(os.environ["BASE_URL"])
 secure = base.scheme == "https"
 host = base.hostname or "127.0.0.1"
@@ -180,6 +193,7 @@ opcode, payload = receive_frame(connection)
 ready = json.loads(payload)
 if opcode != 1 or ready.get("type") != "ready":
     raise SystemExit(f"expected ready, got {ready!r}")
+last_sequence = require_sequence(ready, 0)
 
 send_frame(connection, 1, json.dumps({"type": "end"}))
 while True:
@@ -192,6 +206,7 @@ while True:
     if opcode != 1:
         continue
     event = json.loads(payload)
+    last_sequence = require_sequence(event, last_sequence)
     if event.get("type") == "error":
         raise SystemExit(f"ASR WebSocket error: {event!r}")
     if event.get("type") == "final":

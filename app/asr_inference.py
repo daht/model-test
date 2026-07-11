@@ -589,18 +589,23 @@ class ASRInferenceCoordinator:
         return True
 
     def _claim_job(self, job: _Job) -> bool:
-        if not job.started.set_running_or_notify_cancel():
-            if not job.result.done():
-                job.result.cancel()
+        try:
+            claimed = job.started.set_running_or_notify_cancel()
+        except RuntimeError:
+            claimed = False
+        if not claimed:
+            job.result.cancel()
             return False
         job.started.set_result(None)
         return True
 
     def _reject_unclaimed_job(self, job: _Job, error: Exception) -> None:
-        if job.started.set_running_or_notify_cancel():
-            job.started.set_exception(error)
-        if not job.result.done():
-            job.result.cancel()
+        try:
+            if job.started.set_running_or_notify_cancel():
+                job.started.set_exception(error)
+        except RuntimeError:
+            pass
+        job.result.cancel()
 
     def _finalize_worker(self, sessions: dict[str, Any]) -> None:
         with self._lock:
@@ -631,15 +636,14 @@ class ASRInferenceCoordinator:
                 job = self._jobs.get_nowait()
             except queue.Empty:
                 return
-            self._release_queue_slot(job)
-            job.cancelled.set()
-            if not job.started.done():
-                job.started.set_exception(error)
-            if not job.result.done():
-                job.result.cancel()
-            self._release_audio_reservation(job.audio_seconds)
-            self._release_session_reservation(job)
-            self._jobs.task_done()
+            try:
+                self._release_queue_slot(job)
+                job.cancelled.set()
+                self._reject_unclaimed_job(job, error)
+            finally:
+                self._release_audio_reservation(job.audio_seconds)
+                self._release_session_reservation(job)
+                self._jobs.task_done()
 
     def _release_queue_slot(self, job: _Job) -> None:
         if job.action == "shutdown":

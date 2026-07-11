@@ -437,6 +437,110 @@ def test_automatic_rollover_emits_ordered_segment_and_exact_final_text():
     assert reconstructed == "甲乙丙丁"
 
 
+def test_noop_finish_does_not_count_as_stable_punctuation_update():
+    from app.asr import StreamingTranscriptionResult
+
+    text = "这是一个足够长的候选句子。"
+
+    class Coordinator(FakeCoordinator):
+        def __init__(self):
+            super().__init__()
+            self.results = iter(
+                [
+                    StreamingTranscriptionResult(text, "zh", 16000, True),
+                    StreamingTranscriptionResult(text, "zh", 16000, True),
+                ]
+            )
+
+        async def create_stream(self, _language):
+            return "session"
+
+        async def add_audio(self, _session_id, _pcm_bytes, _sample_rate):
+            return next(self.results)
+
+        async def finish_stream(self, _session_id):
+            return StreamingTranscriptionResult(text, "zh", 0, False)
+
+        async def abort_stream(self, _session_id):
+            return None
+
+        def session_timing(self, _session_id):
+            return (0.0, 0.0)
+
+    async def scenario():
+        websocket = RecordingWebSocket()
+        controller = asr_api.StreamingSessionController(
+            websocket,
+            _protocol_settings(
+                asr_stable_commit_enabled=True,
+                asr_stable_commit_seconds=0.1,
+                asr_stable_commit_min_chars=8,
+                asr_stable_commit_min_updates=3,
+                asr_max_frame_bytes=32000,
+                asr_ws_max_queue=1,
+            ),
+            Coordinator(),
+        )
+        await controller.start("zh")
+        frame = _pcm_s16le_samples(1000, 16000)
+        await controller.add_audio(frame)
+        await controller.add_audio(frame)
+        await controller.finish()
+        return controller, websocket.events
+
+    controller, events = asyncio.run(scenario())
+
+    assert not any(event["type"] == "sentence_final" for event in events)
+    assert events[-1] == {"type": "final", "text": text, "sequence": 3}
+    assert controller.transcript.processed_samples == 32000
+
+
+def test_finish_applies_real_flush_progress_before_final_event():
+    from app.asr import StreamingTranscriptionResult
+
+    class Coordinator(FakeCoordinator):
+        async def create_stream(self, _language):
+            return "session"
+
+        async def add_audio(self, _session_id, _pcm_bytes, _sample_rate):
+            return StreamingTranscriptionResult("hello", "en", 16000, True)
+
+        async def finish_stream(self, _session_id):
+            return StreamingTranscriptionResult("hello world", "en", 8000, True)
+
+        async def abort_stream(self, _session_id):
+            return None
+
+        def session_timing(self, _session_id):
+            return (0.0, 0.0)
+
+    async def scenario():
+        websocket = RecordingWebSocket()
+        controller = asr_api.StreamingSessionController(
+            websocket,
+            _protocol_settings(
+                asr_stable_commit_enabled=False,
+                asr_max_frame_bytes=32000,
+                asr_ws_max_queue=1,
+            ),
+            Coordinator(),
+        )
+        await controller.start("en")
+        await controller.add_audio(_pcm_s16le_samples(1000, 16000))
+        await controller.finish()
+        return controller, websocket.events
+
+    controller, events = asyncio.run(scenario())
+
+    assert controller.transcript.processed_samples == 24000
+    assert [(event["type"], event.get("text")) for event in events] == [
+        ("ready", None),
+        ("partial", "hello"),
+        ("partial", "hello world"),
+        ("final", "hello world"),
+    ]
+
+
 class FakeStreamingSession:
     def __init__(self, updates, final_text="hello world"):
         self.updates = iter(updates)

@@ -141,8 +141,11 @@ class StreamingTranscriptState:
 
     def finish(self, text: str) -> list[TranscriptEvent]:
         events = self.apply_model_update(text, processed_samples=0)
-        events.append(self._event("final", self.partial_text))
+        events.append(self.final_event())
         return events
+
+    def final_event(self) -> TranscriptEvent:
+        return self._event("final", self.partial_text)
 
     def reset_segment(self) -> None:
         self.stable.reset()

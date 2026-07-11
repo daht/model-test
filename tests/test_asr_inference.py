@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import threading
+from concurrent.futures import Future
 
 import pytest
 
@@ -881,6 +882,91 @@ def test_finalizer_drains_jobs_before_aborting_sessions():
         finalizer.join(1)
 
     assert drained_before_abort_completed is True
+
+
+def test_stop_drain_atomically_rejects_caller_cancelled_job_and_restarts():
+    async def scenario():
+        coordinator, _records, holder = make_coordinator(
+            asr_max_active_streams=2,
+            asr_shutdown_grace_seconds=1.0,
+            asr_stream_inference_timeout_seconds=1.0,
+        )
+        await coordinator.start()
+        blocking_id = await coordinator.create_stream(None)
+        queued_id = await coordinator.create_stream(None)
+
+        drain_transition = threading.Event()
+        caller_cancelled = threading.Event()
+        captured = {}
+        original_new_job = coordinator._new_job
+
+        class InterleavingFuture(Future):
+            def done(self):
+                completed = super().done()
+                if (
+                    threading.current_thread().name == "asr-model-owner"
+                    and not drain_transition.is_set()
+                ):
+                    drain_transition.set()
+                    caller_cancelled.wait(1)
+                return completed
+
+            def set_running_or_notify_cancel(self):
+                if (
+                    threading.current_thread().name == "asr-model-owner"
+                    and not drain_transition.is_set()
+                ):
+                    drain_transition.set()
+                    caller_cancelled.wait(1)
+                return super().set_running_or_notify_cancel()
+
+        def capture_job(*args, **kwargs):
+            job = original_new_job(*args, **kwargs)
+            if job.action == "add_audio" and job.args[1] == b"queued":
+                job.started = InterleavingFuture()
+                captured["job"] = job
+            return job
+
+        coordinator._new_job = capture_job
+        blocking = asyncio.create_task(coordinator.add_audio(blocking_id, b"block", 16000))
+        assert await asyncio.to_thread(holder["transcriber"].call_started.wait, 1)
+        queued = asyncio.create_task(coordinator.add_audio(queued_id, b"queued", 16000))
+        while coordinator.snapshot().queue_depth < 1:
+            await asyncio.sleep(0)
+        stopping = asyncio.create_task(coordinator.stop())
+        holder["transcriber"].release_call.set()
+        await blocking
+        assert await asyncio.to_thread(drain_transition.wait, 1)
+        queued.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await queued
+        caller_cancelled.set()
+        await stopping
+
+        job = captured["job"]
+        stopped_state = (
+            job.started.done(),
+            job.result.done(),
+            coordinator._jobs.unfinished_tasks,
+            coordinator.snapshot(),
+            set(coordinator._busy_sessions),
+        )
+        await coordinator.start()
+        restarted_id = await coordinator.create_stream(None)
+        await coordinator.abort_stream(restarted_id)
+        await coordinator.stop()
+        return stopped_state, coordinator.worker_alive
+
+    stopped_state, worker_alive = asyncio.run(scenario())
+    started_done, result_done, unfinished_tasks, snapshot, busy_sessions = stopped_state
+
+    assert started_done is True
+    assert result_done is True
+    assert unfinished_tasks == 0
+    assert snapshot.queue_depth == 0
+    assert snapshot.queued_audio_seconds == 0.0
+    assert busy_sessions == set()
+    assert worker_alive is False
 
 
 def test_stop_during_finalizer_abort_leaves_no_stale_control_job_and_restarts():
