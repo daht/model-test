@@ -1,4 +1,6 @@
 import os
+import threading
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
@@ -14,9 +16,52 @@ get_settings.cache_clear()
 
 import app.asr_api as asr_api  # noqa: E402
 from app.asr_api import app  # noqa: E402
+from app.asr import TranscriptionResult  # noqa: E402
+from app.asr_inference import (  # noqa: E402
+    ASRFileTranscriptionDisabled,
+    CoordinatorSnapshot,
+)
+from app.config import Settings  # noqa: E402
 
 
 client = TestClient(app)
+
+
+class FakeCoordinator:
+    def __init__(self, *, snapshot=None, result=None, error=None, release=None):
+        self._snapshot = snapshot or CoordinatorSnapshot(True, True, 0, 0, 0.0, None)
+        self.result = result or TranscriptionResult("coordinated", "en")
+        self.error = error
+        self.release = release
+        self.transcribe_calls = []
+        self.transcribe_started = threading.Event()
+
+    def snapshot(self):
+        return self._snapshot
+
+    async def transcribe_file(self, path, language):
+        self.transcribe_calls.append((path, language))
+        self.transcribe_started.set()
+        if self.error:
+            raise self.error
+        if self.release:
+            await __import__("asyncio").to_thread(self.release.wait)
+        return self.result
+
+
+def _override_asr_dependencies(coordinator, **setting_overrides):
+    current = Settings(
+        _env_file=None,
+        api_key="test-key",
+        asr_backend="mock",
+        **setting_overrides,
+    )
+    app.dependency_overrides[asr_api.get_asr_coordinator] = lambda: coordinator
+    app.dependency_overrides[get_settings] = lambda: current
+
+
+def _clear_asr_dependency_overrides():
+    app.dependency_overrides.clear()
 
 
 def _start_stream(websocket):
@@ -110,6 +155,105 @@ def test_asr_health_reports_model_name():
     assert response.json()["backend"] == "mock"
 
 
+def test_ready_returns_503_before_model_warmup():
+    coordinator = FakeCoordinator(
+        snapshot=CoordinatorSnapshot(False, True, 0, 0, 0.0, None)
+    )
+    _override_asr_dependencies(coordinator)
+    try:
+        response = client.get("/ready")
+    finally:
+        _clear_asr_dependency_overrides()
+
+    assert response.status_code == 503
+    assert response.json()["status"] == "not_ready"
+
+
+def test_ready_returns_snapshot_after_warmup():
+    coordinator = FakeCoordinator(
+        snapshot=CoordinatorSnapshot(True, True, 2, 3, 1.25, None)
+    )
+    _override_asr_dependencies(coordinator)
+    try:
+        response = client.get("/ready")
+    finally:
+        _clear_asr_dependency_overrides()
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ready",
+        "model": "Qwen3-ASR-1.7B",
+        "backend": "mock",
+        "active_streams": 2,
+        "queue_depth": 3,
+        "queued_audio_seconds": 1.25,
+        "detail": None,
+    }
+
+
+def test_file_transcribe_returns_503_when_disabled():
+    coordinator = FakeCoordinator(error=ASRFileTranscriptionDisabled("disabled"))
+    _override_asr_dependencies(coordinator, asr_file_transcribe_enabled=False)
+    try:
+        response = client.post(
+            "/v1/transcribe",
+            headers={"X-API-Key": "test-key"},
+            files={"file": ("sample.wav", b"fake wav", "audio/wav")},
+        )
+    finally:
+        _clear_asr_dependency_overrides()
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "file_transcription_disabled"
+
+
+def test_file_transcribe_uses_async_coordinator_and_removes_upload():
+    coordinator = FakeCoordinator(result=TranscriptionResult("hello", "en"))
+    _override_asr_dependencies(coordinator, asr_file_transcribe_enabled=True)
+    try:
+        response = client.post(
+            "/v1/transcribe",
+            headers={"X-API-Key": "test-key"},
+            data={"language": "en"},
+            files={"file": ("sample.wav", b"fake wav", "audio/wav")},
+        )
+    finally:
+        _clear_asr_dependency_overrides()
+
+    assert response.status_code == 200
+    assert response.json()["text"] == "hello"
+    assert len(coordinator.transcribe_calls) == 1
+    assert not Path(coordinator.transcribe_calls[0][0]).exists()
+
+
+def test_health_remains_responsive_during_fake_slow_inference():
+    release = threading.Event()
+    coordinator = FakeCoordinator(release=release)
+    _override_asr_dependencies(coordinator, asr_file_transcribe_enabled=True)
+    response_holder = {}
+
+    def transcribe_request():
+        response_holder["response"] = client.post(
+            "/v1/transcribe",
+            headers={"X-API-Key": "test-key"},
+            files={"file": ("sample.wav", b"fake wav", "audio/wav")},
+        )
+
+    thread = threading.Thread(target=transcribe_request)
+    thread.start()
+    try:
+        assert coordinator.transcribe_started.wait(1)
+        health_response = client.get("/health")
+        assert health_response.status_code == 200
+        assert thread.is_alive()
+    finally:
+        release.set()
+        thread.join(1)
+        _clear_asr_dependency_overrides()
+
+    assert response_holder["response"].status_code == 200
+
+
 def test_transcribe_rejects_missing_api_key():
     response = client.post(
         "/v1/transcribe",
@@ -121,12 +265,19 @@ def test_transcribe_rejects_missing_api_key():
 
 
 def test_transcribe_accepts_audio_upload_with_language_hint():
-    response = client.post(
-        "/v1/transcribe",
-        headers={"X-API-Key": "test-key"},
-        data={"language": "en"},
-        files={"file": ("sample.wav", b"fake wav", "audio/wav")},
+    coordinator = FakeCoordinator(
+        result=TranscriptionResult("[mock asr en] sample.wav", "en")
     )
+    _override_asr_dependencies(coordinator, asr_file_transcribe_enabled=True)
+    try:
+        response = client.post(
+            "/v1/transcribe",
+            headers={"X-API-Key": "test-key"},
+            data={"language": "en"},
+            files={"file": ("sample.wav", b"fake wav", "audio/wav")},
+        )
+    finally:
+        _clear_asr_dependency_overrides()
 
     assert response.status_code == 200
     assert response.json() == {
@@ -158,7 +309,10 @@ def test_stream_info_is_available_in_http_docs():
     assert body["start_message"]["type"] == "start"
     assert body["segment_message"] == {"type": "segment"}
     assert body["end_message"] == {"type": "end"}
-    assert {"type": "sentence_final", "text": "..."} in body["server_messages"]
+    assert any(
+        message["type"] == "sentence_final" and message["text"] == "..."
+        for message in body["server_messages"]
+    )
 
 
 def test_stream_info_reports_punctuation_commit_setting():

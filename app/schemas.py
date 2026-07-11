@@ -36,6 +36,16 @@ class ASRHealthResponse(BaseModel):
     backend: str
 
 
+class ASRReadyResponse(BaseModel):
+    status: str
+    model: str
+    backend: str
+    active_streams: int
+    queue_depth: int
+    queued_audio_seconds: float
+    detail: str | None = None
+
+
 class TranscribeResponse(BaseModel):
     text: str
     language: str | None
@@ -43,12 +53,14 @@ class TranscribeResponse(BaseModel):
 
 
 class TranscribeStreamInfoResponse(BaseModel):
+    protocol_version: int
+    file_transcribe_enabled: bool
     websocket_url: str
     audio_format: dict[str, object]
     start_message: dict[str, int | str]
     end_message: dict[str, str]
     segment_message: dict[str, str]
-    server_messages: list[dict[str, str]]
+    server_messages: list[dict[str, object]]
 
 
 class TTSRequest(BaseModel):

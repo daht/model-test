@@ -2,18 +2,45 @@ from __future__ import annotations
 
 import json
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
-from fastapi import Depends, FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
 
 from app.asr import ASRTranscriber, create_asr_transcriber
 from app.audio import remove_file, save_upload_to_tempfile, write_pcm_s16le_wav
 from app.auth import is_valid_api_key, require_api_key
 from app.config import Settings, get_settings
-from app.schemas import ASRHealthResponse, TranscribeResponse, TranscribeStreamInfoResponse
+from app.asr_inference import (
+    ASRBatchConflict,
+    ASRFileTranscriptionDisabled,
+    ASRInferenceCoordinator,
+    ASRInferenceTimeout,
+    ASRNotReady,
+    ASRQueueFull,
+    ASRQueueTimeout,
+    ASRSessionLimit,
+)
+from app.schemas import (
+    ASRHealthResponse,
+    ASRReadyResponse,
+    TranscribeResponse,
+    TranscribeStreamInfoResponse,
+)
 
 settings = get_settings()
 asr_transcriber = create_asr_transcriber(settings)
+asr_coordinator = ASRInferenceCoordinator(settings, lambda: create_asr_transcriber(settings))
 
 SENTENCE_TERMINATORS = set("。？！｡?!؟۔।॥။.")
 SENTENCE_CLOSERS = set("\"'”’」』）)】]》〉")
@@ -33,15 +60,29 @@ DOT_ABBREVIATIONS = {
     "ph.d.",
 }
 
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await asr_coordinator.start()
+    try:
+        yield
+    finally:
+        await asr_coordinator.stop()
+
+
 app = FastAPI(
     title="Qwen ASR REST API",
     version="0.1.0",
     description="REST and WebSocket API template for Qwen3-ASR-1.7B deployment.",
+    lifespan=lifespan,
 )
 
 
 def get_asr_transcriber() -> ASRTranscriber:
     return asr_transcriber
+
+
+def get_asr_coordinator() -> ASRInferenceCoordinator:
+    return asr_coordinator
 
 
 @dataclass
@@ -298,6 +339,28 @@ def health(current_settings: Settings = Depends(get_settings)) -> ASRHealthRespo
     )
 
 
+@app.get("/ready", response_model=ASRReadyResponse)
+def ready(
+    current_settings: Settings = Depends(get_settings),
+    current_coordinator: ASRInferenceCoordinator = Depends(get_asr_coordinator),
+):
+    snapshot = current_coordinator.snapshot()
+    payload = ASRReadyResponse(
+        status="ready" if snapshot.ready and snapshot.accepting else "not_ready",
+        model=current_settings.asr_model_name,
+        backend=current_settings.asr_backend,
+        active_streams=snapshot.active_streams,
+        queue_depth=snapshot.queue_depth,
+        queued_audio_seconds=snapshot.queued_audio_seconds,
+        detail=snapshot.load_error,
+    )
+    if not snapshot.ready or not snapshot.accepting:
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content=payload.model_dump())
+    return payload
+
+
 @app.post(
     "/v1/transcribe",
     response_model=TranscribeResponse,
@@ -307,14 +370,24 @@ async def transcribe(
     file: UploadFile = File(...),
     language: str | None = Form(default=None),
     current_settings: Settings = Depends(get_settings),
-    current_transcriber: ASRTranscriber = Depends(get_asr_transcriber),
+    current_coordinator: ASRInferenceCoordinator = Depends(get_asr_coordinator),
 ) -> TranscribeResponse:
     temp_path = await save_upload_to_tempfile(
         file,
         max_bytes=current_settings.asr_max_upload_mb * 1024 * 1024,
     )
     try:
-        result = current_transcriber.transcribe(temp_path, language=language)
+        result = await current_coordinator.transcribe_file(temp_path, language)
+    except ASRFileTranscriptionDisabled as exc:
+        raise _http_asr_unavailable("file_transcription_disabled", str(exc)) from exc
+    except ASRBatchConflict as exc:
+        raise _http_asr_unavailable("batch_conflict", str(exc)) from exc
+    except (ASRQueueFull, ASRQueueTimeout) as exc:
+        raise _http_asr_unavailable("server_busy", str(exc)) from exc
+    except ASRInferenceTimeout as exc:
+        raise _http_asr_unavailable("inference_timeout", str(exc)) from exc
+    except (ASRNotReady, ASRSessionLimit) as exc:
+        raise _http_asr_unavailable("not_ready", str(exc)) from exc
     finally:
         remove_file(temp_path)
 
@@ -328,6 +401,8 @@ async def transcribe(
 @app.get("/v1/transcribe/stream-info", response_model=TranscribeStreamInfoResponse)
 def transcribe_stream_info(current_settings: Settings = Depends(get_settings)) -> TranscribeStreamInfoResponse:
     return TranscribeStreamInfoResponse(
+        protocol_version=current_settings.asr_protocol_version,
+        file_transcribe_enabled=current_settings.asr_file_transcribe_enabled,
         websocket_url="/v1/transcribe/stream",
         audio_format={
             "format": "pcm_s16le",
@@ -360,12 +435,19 @@ def transcribe_stream_info(current_settings: Settings = Depends(get_settings)) -
         end_message={"type": "end"},
         segment_message={"type": "segment"},
         server_messages=[
-            {"type": "ready"},
-            {"type": "partial", "text": "..."},
-            {"type": "sentence_final", "text": "..."},
-            {"type": "final", "text": "..."},
-            {"type": "error", "message": "..."},
+            {"type": "ready", "sequence": 1},
+            {"type": "partial", "text": "...", "sequence": 2},
+            {"type": "sentence_final", "text": "...", "sequence": 3},
+            {"type": "final", "text": "...", "sequence": 4},
+            {"type": "error", "code": "...", "message": "...", "sequence": 5},
         ],
+    )
+
+
+def _http_asr_unavailable(code: str, message: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail={"code": code, "message": message},
     )
 
 
