@@ -82,10 +82,15 @@ class Settings(BaseSettings):
             )
         if self.asr_backend == "qwen" and self.asr_stream_mode == "stateful":
             raise ValueError("asr_backend=qwen does not support stateful streaming")
-        if self.asr_stream_rollover_seconds <= self.asr_stream_chunk_seconds:
-            raise ValueError("asr_stream_rollover_seconds must exceed the model chunk duration")
-        if self.asr_stream_rollover_seconds <= frame_audio_seconds:
-            raise ValueError("asr_stream_rollover_seconds must exceed one transport frame")
+        if self.asr_stream_mode == "stateful":
+            if self.asr_stream_rollover_seconds <= self.asr_stream_chunk_seconds:
+                raise ValueError(
+                    "asr_stream_rollover_seconds must exceed the model chunk duration"
+                )
+            if self.asr_stream_rollover_seconds <= frame_audio_seconds:
+                raise ValueError(
+                    "asr_stream_rollover_seconds must exceed one transport frame"
+                )
         return self
 
 

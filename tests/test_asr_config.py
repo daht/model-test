@@ -140,6 +140,8 @@ def test_rollover_must_exceed_model_chunk_and_transport_frame():
     with pytest.raises(ValidationError, match="rollover"):
         Settings(
             _env_file=None,
+            asr_backend="qwen_vllm",
+            asr_stream_mode="stateful",
             asr_stream_chunk_seconds=2.0,
             asr_stream_rollover_seconds=1.0,
         )
@@ -147,7 +149,21 @@ def test_rollover_must_exceed_model_chunk_and_transport_frame():
     with pytest.raises(ValidationError, match="rollover"):
         Settings(
             _env_file=None,
+            asr_backend="qwen_vllm",
+            asr_stream_mode="stateful",
             asr_stream_chunk_seconds=0.1,
             asr_stream_rollover_seconds=0.4,
             asr_max_frame_bytes=16000,
         )
+
+
+def test_chunked_stream_does_not_apply_stateful_rollover_relationships():
+    settings = Settings(
+        _env_file=None,
+        asr_backend="qwen",
+        asr_stream_mode="chunked",
+        asr_stream_chunk_seconds=2.0,
+        asr_stream_rollover_seconds=1.0,
+    )
+
+    assert settings.asr_stream_rollover_seconds == 1.0
