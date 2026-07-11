@@ -107,9 +107,9 @@ class StreamingTranscriptState:
         if stable_prefix:
             return self._commit_prefix(stable_prefix)
         if self.immediate_commit_on_punctuation:
-            immediate_prefix = first_punctuation_candidate(self.partial_text, 1)
-            if immediate_prefix:
-                return self._commit_prefix(immediate_prefix)
+            immediate_events = self._commit_all_complete_sentences()
+            if immediate_events:
+                return immediate_events
         if self.partial_text != previous:
             return [self._event("partial", self.partial_text)]
         return []
@@ -134,9 +134,9 @@ class StreamingTranscriptState:
             return []
         self.partial_text += text
         if self.immediate_commit_on_punctuation:
-            immediate_prefix = first_punctuation_candidate(self.partial_text, 1)
-            if immediate_prefix:
-                return self._commit_prefix(immediate_prefix)
+            immediate_events = self._commit_all_complete_sentences()
+            if immediate_events:
+                return immediate_events
         return [self._event("partial", self.partial_text)]
 
     def finish(self, text: str) -> list[TranscriptEvent]:
@@ -167,6 +167,32 @@ class StreamingTranscriptState:
             self._event("sentence_final", prefix),
             self._event("partial", self.partial_text),
         ]
+
+    def _commit_all_complete_sentences(self) -> list[TranscriptEvent]:
+        committed, tail = split_committed_sentences(self.partial_text)
+        if not committed:
+            return []
+
+        confirmed_length = len(self.partial_text) - len(tail)
+        confirmed_prefix = self.partial_text[:confirmed_length]
+        remaining_prefix = confirmed_prefix
+        exact_sentences: list[str] = []
+        for index in range(len(committed)):
+            if index == len(committed) - 1:
+                exact_sentence = remaining_prefix
+            else:
+                exact_sentence = first_punctuation_candidate(remaining_prefix, 1)
+            if not exact_sentence:
+                return []
+            exact_sentences.append(exact_sentence)
+            remaining_prefix = remaining_prefix[len(exact_sentence) :]
+
+        self.confirmed_text += confirmed_prefix
+        self.partial_text = tail
+        self.stable.reset()
+        events = [self._event("sentence_final", sentence) for sentence in exact_sentences]
+        events.append(self._event("partial", self.partial_text))
+        return events
 
     def _event(self, event_type: str, text: str) -> TranscriptEvent:
         self._sequence += 1

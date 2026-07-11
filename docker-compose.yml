@@ -36,9 +36,9 @@ services:
       - --workers
       - "1"
       - --ws-max-size
-      - "32000"
+      - "${ASR_MAX_FRAME_BYTES:-16000}"
       - --ws-max-queue
-      - "4"
+      - "${ASR_WS_MAX_QUEUE:-4}"
     env_file:
       - .env
     ports:

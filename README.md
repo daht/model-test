@@ -12,6 +12,13 @@ Live streaming defaults to `ASR_FILE_TRANSCRIBE_ENABLED=false` because an in-pro
 
 Protocol version 2 guarantees monotonically increasing `sequence` values. Append `sentence_final` events permanently and replace the displayed tail with every `partial` or `final`. A commit is followed by `partial: ""` when no unconfirmed tail remains.
 
+The default WebSocket transport accepts frames up to `ASR_MAX_FRAME_BYTES=16000`
+(0.5 seconds of PCM) and queues at most `ASR_WS_MAX_QUEUE=4` frames. Settings
+validation requires their worst-case buffered audio to fit within
+`ASR_MAX_CONNECTION_LAG_SECONDS`; change all three values together. Shutdown
+stops admission immediately and waits at most `ASR_SHUTDOWN_GRACE_SECONDS` for
+an already-running model call.
+
 ## Files
 
 - `app/main.py`: FastAPI routes, health check, API key guard.

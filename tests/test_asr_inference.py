@@ -13,6 +13,7 @@ from app.asr_inference import (
     ASRNotReady,
     ASRQueueFull,
     ASRQueueTimeout,
+    ASRSessionBusy,
     ASRSessionPoisoned,
 )
 from app.config import Settings
@@ -48,6 +49,8 @@ class FakeSession(ASRStreamingSession):
         self.owner.record("abort")
         self.abort_count += 1
         self.owner.abort_called.set()
+        if getattr(self.owner, "abort_raises", False):
+            raise RuntimeError("fake abort failure")
 
 
 class FakeTranscriber(ASRTranscriber):
@@ -130,19 +133,18 @@ def test_model_construction_and_calls_share_owner_thread():
     asyncio.run(scenario())
 
 
-def test_same_session_calls_complete_in_submission_order():
+def test_same_session_sequential_calls_complete_in_submission_order():
     async def scenario():
         coordinator, _records, holder = make_coordinator()
         await coordinator.start()
         session_id = await coordinator.create_stream("en")
-        results = await asyncio.gather(
-            coordinator.add_audio(session_id, b"first", 16000),
-            coordinator.add_audio(session_id, b"second", 16000),
-        )
+        first = await coordinator.add_audio(session_id, b"first", 16000)
+        second = await coordinator.add_audio(session_id, b"second", 16000)
         await coordinator.stop()
 
         assert holder["transcriber"].sessions[0].chunks == [b"first", b"second"]
-        assert results[-1].text == "firstsecond"
+        assert first.text == "first"
+        assert second.text == "firstsecond"
 
     asyncio.run(scenario())
 
@@ -151,16 +153,20 @@ def test_queue_full_raises_asr_queue_full():
     async def scenario():
         coordinator, _records, holder = make_coordinator(
             asr_inference_queue_size=1,
+            asr_max_active_streams=3,
             asr_stream_inference_timeout_seconds=1.0,
         )
         await coordinator.start()
-        session_id = await coordinator.create_stream(None)
-        first = asyncio.create_task(coordinator.add_audio(session_id, b"block", 16000))
+        first_id = await coordinator.create_stream(None)
+        second_id = await coordinator.create_stream(None)
+        third_id = await coordinator.create_stream(None)
+        first = asyncio.create_task(coordinator.add_audio(first_id, b"block", 16000))
         assert await asyncio.to_thread(holder["transcriber"].call_started.wait, 1)
-        second = asyncio.create_task(coordinator.add_audio(session_id, b"second", 16000))
-        await asyncio.sleep(0)
+        second = asyncio.create_task(coordinator.add_audio(second_id, b"second", 16000))
+        while coordinator.snapshot().queue_depth < 1:
+            await asyncio.sleep(0)
         with pytest.raises(ASRQueueFull):
-            await coordinator.add_audio(session_id, b"third", 16000)
+            await coordinator.add_audio(third_id, b"third", 16000)
         holder["transcriber"].release_call.set()
         await first
         await second
@@ -176,11 +182,12 @@ def test_expired_queued_job_never_calls_model():
             asr_stream_inference_timeout_seconds=1.0,
         )
         await coordinator.start()
-        session_id = await coordinator.create_stream(None)
-        first = asyncio.create_task(coordinator.add_audio(session_id, b"block", 16000))
+        blocking_id = await coordinator.create_stream(None)
+        expiring_id = await coordinator.create_stream(None)
+        first = asyncio.create_task(coordinator.add_audio(blocking_id, b"block", 16000))
         assert await asyncio.to_thread(holder["transcriber"].call_started.wait, 1)
         with pytest.raises(ASRQueueTimeout):
-            await coordinator.add_audio(session_id, b"expired", 16000)
+            await coordinator.add_audio(expiring_id, b"expired", 16000)
         holder["transcriber"].release_call.set()
         await first
         await coordinator.stop()
@@ -234,6 +241,127 @@ def test_worker_continues_after_one_job_raises():
         assert result.text == "ok"
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("operation", ["add", "reset", "finish"])
+def test_second_operation_for_busy_session_is_rejected_before_queueing(operation):
+    async def scenario():
+        coordinator, _records, holder = make_coordinator(
+            asr_stream_inference_timeout_seconds=1.0,
+        )
+        await coordinator.start()
+        session_id = await coordinator.create_stream(None)
+        first = asyncio.create_task(coordinator.add_audio(session_id, b"block", 16000))
+        assert await asyncio.to_thread(holder["transcriber"].call_started.wait, 1)
+        queue_depth_before = coordinator.snapshot().queue_depth
+        with pytest.raises(ASRSessionBusy):
+            if operation == "add":
+                await coordinator.add_audio(session_id, b"second", 16000)
+            elif operation == "reset":
+                await coordinator.reset_segment(session_id)
+            else:
+                await coordinator.finish_stream(session_id)
+        queue_depth_after = coordinator.snapshot().queue_depth
+        holder["transcriber"].release_call.set()
+        await first
+        result = await coordinator.add_audio(session_id, b"later", 16000)
+        await coordinator.abort_stream(session_id)
+        await coordinator.stop()
+        return queue_depth_before, queue_depth_after, result
+
+    before, after, result = asyncio.run(scenario())
+
+    assert before == after == 0
+    assert result.text.endswith("later")
+
+
+def test_queue_full_releases_session_operation_reservation():
+    async def scenario():
+        coordinator, _records, holder = make_coordinator(
+            asr_inference_queue_size=1,
+            asr_max_active_streams=3,
+            asr_stream_inference_timeout_seconds=1.0,
+        )
+        await coordinator.start()
+        first_id = await coordinator.create_stream(None)
+        queued_id = await coordinator.create_stream(None)
+        rejected_id = await coordinator.create_stream(None)
+        first = asyncio.create_task(coordinator.add_audio(first_id, b"block", 16000))
+        assert await asyncio.to_thread(holder["transcriber"].call_started.wait, 1)
+        queued = asyncio.create_task(coordinator.add_audio(queued_id, b"queued", 16000))
+        while coordinator.snapshot().queue_depth < 1:
+            await asyncio.sleep(0)
+        with pytest.raises(ASRQueueFull):
+            await coordinator.add_audio(rejected_id, b"rejected", 16000)
+        holder["transcriber"].release_call.set()
+        await first
+        await queued
+        retried = await coordinator.add_audio(rejected_id, b"retried", 16000)
+        await coordinator.abort_stream(first_id)
+        await coordinator.abort_stream(queued_id)
+        await coordinator.abort_stream(rejected_id)
+        await coordinator.stop()
+        return retried
+
+    result = asyncio.run(scenario())
+
+    assert result.text == "retried"
+
+
+def test_queue_timeout_reservation_releases_only_after_worker_discards_job():
+    async def scenario():
+        coordinator, _records, holder = make_coordinator(
+            asr_stream_queue_timeout_seconds=0.05,
+            asr_stream_inference_timeout_seconds=1.0,
+        )
+        await coordinator.start()
+        blocking_id = await coordinator.create_stream(None)
+        expiring_id = await coordinator.create_stream(None)
+        blocking = asyncio.create_task(coordinator.add_audio(blocking_id, b"block", 16000))
+        assert await asyncio.to_thread(holder["transcriber"].call_started.wait, 1)
+        with pytest.raises(ASRQueueTimeout):
+            await coordinator.add_audio(expiring_id, b"expired", 16000)
+        with pytest.raises(ASRSessionBusy):
+            await coordinator.add_audio(expiring_id, b"too-soon", 16000)
+        holder["transcriber"].release_call.set()
+        await blocking
+        await asyncio.to_thread(coordinator._jobs.join)
+        retried = await coordinator.add_audio(expiring_id, b"retried", 16000)
+        await coordinator.abort_stream(blocking_id)
+        await coordinator.abort_stream(expiring_id)
+        await coordinator.stop()
+        return retried
+
+    result = asyncio.run(scenario())
+
+    assert result.text == "retried"
+
+
+def test_abort_of_busy_timed_out_session_marks_poison_and_returns_immediately():
+    async def scenario():
+        coordinator, _records, holder = make_coordinator(
+            asr_stream_inference_timeout_seconds=0.05,
+        )
+        await coordinator.start()
+        session_id = await coordinator.create_stream(None)
+        running = asyncio.create_task(coordinator.add_audio(session_id, b"block", 16000))
+        assert await asyncio.to_thread(holder["transcriber"].call_started.wait, 1)
+        with pytest.raises(ASRInferenceTimeout):
+            await running
+        await asyncio.wait_for(coordinator.abort_stream(session_id), timeout=0.1)
+        poisoned_before_release = session_id in coordinator._poisoned_sessions
+        holder["transcriber"].release_call.set()
+        assert await asyncio.to_thread(holder["transcriber"].abort_called.wait, 1)
+        barrier_id = await coordinator.create_stream(None)
+        await coordinator.abort_stream(barrier_id)
+        cleaned = session_id not in coordinator._poisoned_sessions
+        await coordinator.stop()
+        return poisoned_before_release, cleaned
+
+    poisoned, cleaned = asyncio.run(scenario())
+
+    assert poisoned is True
+    assert cleaned is True
 
 
 def test_finish_failure_aborts_and_removes_session():
@@ -422,6 +550,201 @@ def test_lazy_warmup_failure_stops_without_leaking_worker_thread():
     assert snapshot.accepting is False
     assert snapshot.load_error == "RuntimeError: model warmup failed"
     assert coordinator.worker_alive is False
+
+
+def test_lazy_warmup_does_not_execute_job_that_expired_during_warmup():
+    async def scenario():
+        records = []
+        warmup_started = threading.Event()
+        release_warmup = threading.Event()
+
+        class SlowWarmupTranscriber(FakeTranscriber):
+            def warmup(self):
+                self.record("warmup")
+                warmup_started.set()
+                release_warmup.wait(1)
+
+        holder = {}
+
+        def factory():
+            transcriber = SlowWarmupTranscriber(records)
+            holder["transcriber"] = transcriber
+            return transcriber
+
+        coordinator = ASRInferenceCoordinator(
+            settings(
+                asr_eager_load=False,
+                asr_stream_queue_timeout_seconds=0.05,
+                asr_stream_inference_timeout_seconds=1.0,
+            ),
+            factory,
+        )
+        await coordinator.start()
+        create_task = asyncio.create_task(coordinator.create_stream(None))
+        assert await asyncio.to_thread(warmup_started.wait, 1)
+        with pytest.raises(ASRQueueTimeout):
+            await create_task
+        release_warmup.set()
+        await asyncio.to_thread(coordinator._jobs.join)
+        snapshot = coordinator.snapshot()
+        session_count = len(holder["transcriber"].sessions)
+        await coordinator.stop()
+        return snapshot, session_count
+
+    snapshot, session_count = asyncio.run(scenario())
+
+    assert snapshot.active_streams == 0
+    assert session_count == 0
+
+
+def test_poison_abort_failure_isolated_and_worker_remains_ready():
+    async def scenario():
+        coordinator, _records, holder = make_coordinator(
+            asr_stream_queue_timeout_seconds=0.5,
+            asr_stream_inference_timeout_seconds=0.05,
+        )
+        await coordinator.start()
+        session_id = await coordinator.create_stream(None)
+        holder["transcriber"].abort_raises = True
+        task = asyncio.create_task(coordinator.add_audio(session_id, b"block", 16000))
+        assert await asyncio.to_thread(holder["transcriber"].call_started.wait, 1)
+        with pytest.raises(ASRInferenceTimeout):
+            await task
+        holder["transcriber"].release_call.set()
+        assert await asyncio.to_thread(holder["transcriber"].abort_called.wait, 1)
+        await asyncio.sleep(0.02)
+        snapshot = coordinator.snapshot()
+        registries = (
+            set(coordinator._poisoned_sessions),
+            set(coordinator._active_sessions),
+            dict(coordinator._last_timings),
+        )
+        worker_alive = coordinator.worker_alive
+        if worker_alive:
+            holder["transcriber"].abort_raises = False
+            next_id = await coordinator.create_stream(None)
+            await coordinator.abort_stream(next_id)
+            await coordinator.stop()
+        return snapshot, registries, worker_alive
+
+    snapshot, registries, worker_alive = asyncio.run(scenario())
+
+    assert worker_alive is True
+    assert snapshot.ready is True
+    assert snapshot.accepting is True
+    assert registries == (set(), set(), {})
+
+
+def test_unexpected_worker_exit_clears_cached_readiness():
+    async def scenario():
+        coordinator, _records, _holder = make_coordinator()
+        await coordinator.start()
+        session_id = await coordinator.create_stream(None)
+
+        def raise_after_job(*_args):
+            raise RuntimeError("unexpected cleanup failure")
+
+        coordinator._cleanup_poisoned_session = raise_after_job
+        result = await coordinator.add_audio(session_id, b"ok", 16000)
+        await asyncio.to_thread(coordinator._thread.join, 1)
+        queue_joined = threading.Event()
+
+        def join_queue():
+            coordinator._jobs.join()
+            queue_joined.set()
+
+        threading.Thread(target=join_queue, daemon=True).start()
+        accounting_completed = await asyncio.to_thread(queue_joined.wait, 0.2)
+        return result, coordinator.snapshot(), coordinator.worker_alive, accounting_completed
+
+    result, snapshot, worker_alive, accounting_completed = asyncio.run(scenario())
+
+    assert result.text == "ok"
+    assert worker_alive is False
+    assert snapshot.ready is False
+    assert snapshot.accepting is False
+    assert accounting_completed is True
+
+
+def test_stop_during_lazy_warmup_never_creates_an_orphan_session():
+    async def scenario():
+        records = []
+        warmup_started = threading.Event()
+        release_warmup = threading.Event()
+
+        class SlowWarmupTranscriber(FakeTranscriber):
+            def warmup(self):
+                self.record("warmup")
+                warmup_started.set()
+                release_warmup.wait(1)
+
+        holder = {}
+
+        def factory():
+            transcriber = SlowWarmupTranscriber(records)
+            holder["transcriber"] = transcriber
+            return transcriber
+
+        coordinator = ASRInferenceCoordinator(
+            settings(
+                asr_eager_load=False,
+                asr_stream_queue_timeout_seconds=1.0,
+                asr_shutdown_grace_seconds=1.0,
+            ),
+            factory,
+        )
+        await coordinator.start()
+        create_task = asyncio.create_task(coordinator.create_stream(None))
+        assert await asyncio.to_thread(warmup_started.wait, 1)
+        stop_task = asyncio.create_task(coordinator.stop())
+        while coordinator.snapshot().accepting:
+            await asyncio.sleep(0)
+        release_warmup.set()
+        with pytest.raises(ASRNotReady):
+            await create_task
+        await stop_task
+        return len(holder["transcriber"].sessions), coordinator.snapshot()
+
+    session_count, snapshot = asyncio.run(scenario())
+
+    assert session_count == 0
+    assert snapshot.ready is False
+    assert snapshot.accepting is False
+
+
+def test_stop_is_bounded_when_running_call_blocks_and_business_queue_is_full():
+    async def scenario():
+        coordinator, _records, holder = make_coordinator(
+            asr_inference_queue_size=1,
+            asr_max_active_streams=2,
+            asr_stream_inference_timeout_seconds=2.0,
+            asr_shutdown_grace_seconds=0.1,
+        )
+        await coordinator.start()
+        first_id = await coordinator.create_stream(None)
+        second_id = await coordinator.create_stream(None)
+        first = asyncio.create_task(coordinator.add_audio(first_id, b"block", 16000))
+        assert await asyncio.to_thread(holder["transcriber"].call_started.wait, 1)
+        second = asyncio.create_task(coordinator.add_audio(second_id, b"queued", 16000))
+        while coordinator.snapshot().queue_depth < 1:
+            await asyncio.sleep(0)
+        started = asyncio.get_running_loop().time()
+        try:
+            with pytest.raises(RuntimeError, match="did not stop"):
+                await asyncio.wait_for(coordinator.stop(), timeout=0.5)
+            elapsed = asyncio.get_running_loop().time() - started
+        finally:
+            holder["transcriber"].release_call.set()
+        await first
+        with pytest.raises(ASRNotReady):
+            await second
+        await asyncio.to_thread(coordinator._thread.join, 1)
+        return elapsed, coordinator.worker_alive
+
+    elapsed, worker_alive = asyncio.run(scenario())
+
+    assert elapsed < 0.5
+    assert worker_alive is False
 
 
 def test_finished_and_aborted_sessions_do_not_leave_timing_entries():

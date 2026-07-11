@@ -1,7 +1,7 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -44,7 +44,8 @@ class Settings(BaseSettings):
     asr_inference_queue_size: int = Field(default=16, gt=0, le=1024)
     asr_max_queued_audio_seconds: float = Field(default=4.0, gt=0, le=120)
     asr_max_connection_lag_seconds: float = Field(default=2.0, gt=0, le=30)
-    asr_max_frame_bytes: int = Field(default=32000, gt=0, le=1_048_576)
+    asr_max_frame_bytes: int = Field(default=16000, gt=0, le=1_048_576)
+    asr_ws_max_queue: int = Field(default=4, gt=0, le=1024)
     asr_start_timeout_seconds: float = Field(default=10.0, gt=0, le=120)
     asr_idle_timeout_seconds: float = Field(default=30.0, gt=0, le=3600)
     asr_max_session_seconds: float = Field(default=1800.0, gt=0, le=86400)
@@ -52,6 +53,7 @@ class Settings(BaseSettings):
     asr_stream_queue_timeout_seconds: float = Field(default=2.0, gt=0, le=60)
     asr_stream_inference_timeout_seconds: float = Field(default=15.0, gt=0, le=300)
     asr_file_inference_timeout_seconds: float = Field(default=300.0, gt=0, le=3600)
+    asr_shutdown_grace_seconds: float = Field(default=10.0, gt=0, le=300)
     tts_model_name: str = "CosyVoice"
     tts_backend: Literal["mock", "cosyvoice"] = "mock"
     tts_model_id: str = "/models/CosyVoice"
@@ -68,6 +70,16 @@ class Settings(BaseSettings):
         if value % 2:
             raise ValueError("asr_max_frame_bytes must be even for pcm_s16le")
         return value
+
+    @model_validator(mode="after")
+    def bound_websocket_buffered_audio(self) -> "Settings":
+        frame_audio_seconds = self.asr_max_frame_bytes / (2 * 16000)
+        buffered_audio_seconds = self.asr_ws_max_queue * frame_audio_seconds
+        if buffered_audio_seconds > self.asr_max_connection_lag_seconds:
+            raise ValueError(
+                "WebSocket buffered audio exceeds asr_max_connection_lag_seconds"
+            )
+        return self
 
 
 @lru_cache

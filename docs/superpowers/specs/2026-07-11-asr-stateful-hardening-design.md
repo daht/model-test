@@ -128,12 +128,20 @@ Each job contains:
 
 The queue is bounded before submission. A job whose deadline expires before execution is discarded without touching model state.
 
+Session operations reserve the session atomically during admission, before queue
+capacity is consumed. The reservation remains until the worker executes or
+discards the job, so a second add/reset/finish operation cannot enter the queue
+for the same session. Lazy warmup is followed by a second cancellation,
+deadline, and shutdown-admission check before any session object is created.
+
 ### Timeout Semantics
 
 - Queue timeout: safe cancellation; the model state was not touched.
 - Running timeout: Python cannot stop a running GPU call. Mark the session poisoned, close the connection, and never reuse that state.
 - Disconnect during a running call: discard the eventual result and abort/release the session after the running call completes.
 - A timed-out or disconnected job may consume capacity until the underlying model call returns, but it cannot mutate a live replacement session.
+- The absolute WebSocket session deadline is checked again after inference and
+  synchronous cleanup, before transcript state changes or events are emitted.
 
 ### Scheduling
 
@@ -155,6 +163,16 @@ Capacity is bounded by all of the following:
 - unprocessed audio seconds per connection;
 - binary frame bytes;
 - maximum session duration and cumulative audio duration.
+
+The transport buffer is part of the lag budget. Configuration validation enforces:
+
+```text
+ASR_WS_MAX_QUEUE * ASR_MAX_FRAME_BYTES / (2 bytes * 16000 samples/s)
+    <= ASR_MAX_CONNECTION_LAG_SECONDS
+```
+
+The conservative defaults are four queued 0.5-second frames, for at most two
+seconds of audio buffered inside Uvicorn before application-level admission.
 
 When a limit is reached:
 
@@ -180,6 +198,7 @@ The server enforces:
 - maximum connection duration;
 - maximum cumulative audio duration;
 - exactly one in-flight model operation per session;
+- an absolute session deadline that also covers inference result processing and event emission;
 - cleanup in a `finally` path for normal end, disconnect, protocol error, timeout, and inference error.
 
 The ASR session interface gains an explicit `abort()` or `close()` operation. Direct mutation of the qwen-asr state's internal `buffer` is removed. Segment reset uses an official reset API when available; otherwise it creates a fresh official streaming state while preserving only application-level confirmed transcript state.
@@ -204,6 +223,9 @@ Binary frames must be non-empty, even-length PCM and below the configured frame 
 - Warmup failure is retained as sanitized readiness detail and does not expose paths, secrets, or transcript content.
 - Production uses eager warmup in application lifespan.
 - Shutdown stops admission, drains or expires queued jobs, aborts sessions, and joins the worker within a bounded grace period.
+- A reserved queue slot admits the shutdown control job even when all business
+  slots are full. Unexpected worker exit clears readiness/admission, completes
+  queue accounting, cancels queued futures, and isolates abort failures.
 
 ## Configuration
 
@@ -217,7 +239,8 @@ ASR_MAX_ACTIVE_STREAMS=2
 ASR_INFERENCE_QUEUE_SIZE=16
 ASR_MAX_QUEUED_AUDIO_SECONDS=4.0
 ASR_MAX_CONNECTION_LAG_SECONDS=2.0
-ASR_MAX_FRAME_BYTES=32000
+ASR_MAX_FRAME_BYTES=16000
+ASR_WS_MAX_QUEUE=4
 ASR_START_TIMEOUT_SECONDS=10
 ASR_IDLE_TIMEOUT_SECONDS=30
 ASR_MAX_SESSION_SECONDS=1800
@@ -225,6 +248,7 @@ ASR_MAX_AUDIO_SECONDS=1800
 ASR_STREAM_QUEUE_TIMEOUT_SECONDS=2.0
 ASR_STREAM_INFERENCE_TIMEOUT_SECONDS=15.0
 ASR_FILE_INFERENCE_TIMEOUT_SECONDS=300.0
+ASR_SHUTDOWN_GRACE_SECONDS=10.0
 ```
 
 `ASR_MAX_ACTIVE_STREAMS=2` is an intentionally conservative rollout value, not a capacity claim. A10 benchmarks determine the final value.

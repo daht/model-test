@@ -33,6 +33,7 @@ from app.asr_inference import (
     ASRQueueFull,
     ASRQueueTimeout,
     ASRSessionLimit,
+    ASRSessionBusy,
     ASRSessionPoisoned,
 )
 from app.asr_streaming import (
@@ -223,6 +224,7 @@ class StreamingSessionController:
         self.finished = False
         self.accepted_samples = 0
         self.processing_debt_seconds = 0.0
+        self.session_deadline = time.monotonic() + current_settings.asr_max_session_seconds
         self.transcript = StreamingTranscriptState(
             sample_rate=16000,
             stable_commit_enabled=current_settings.asr_stable_commit_enabled,
@@ -250,11 +252,21 @@ class StreamingSessionController:
 
     async def _start_with(self, create_session, language: str | None) -> None:
         try:
-            self.session_id = await create_session(language)
+            self.session_id = await self._await_model_operation(
+                lambda: create_session(language)
+            )
+        except _StreamClosed:
+            raise
         except ValueError as exc:
             await self.fail("invalid_language", "Unsupported language", 1003)
             raise _StreamClosed from exc
-        except (ASRQueueFull, ASRQueueTimeout, ASRSessionLimit, ASRBatchConflict) as exc:
+        except (
+            ASRQueueFull,
+            ASRQueueTimeout,
+            ASRSessionLimit,
+            ASRSessionBusy,
+            ASRBatchConflict,
+        ) as exc:
             await self.fail("server_busy", "ASR is at capacity", 1013)
             raise _StreamClosed from exc
         except ASRNotReady as exc:
@@ -263,6 +275,7 @@ class StreamingSessionController:
         except Exception as exc:
             await self.fail("inference_error", "Unable to create ASR session", 1011)
             raise _StreamClosed from exc
+        await self._ensure_session_active()
         logger.info(
             "asr_stream_started session_id=%s active_streams=%d",
             self.session_id,
@@ -274,8 +287,18 @@ class StreamingSessionController:
         sample_count = await self.validate_audio_frame(pcm_bytes)
         assert self.session_id is not None
         try:
-            result = await self.coordinator.add_audio(self.session_id, pcm_bytes, 16000)
-        except (ASRQueueFull, ASRQueueTimeout, ASRSessionLimit, ASRBatchConflict) as exc:
+            result = await self._await_model_operation(
+                lambda: self.coordinator.add_audio(self.session_id, pcm_bytes, 16000)
+            )
+        except _StreamClosed:
+            raise
+        except (
+            ASRQueueFull,
+            ASRQueueTimeout,
+            ASRSessionLimit,
+            ASRSessionBusy,
+            ASRBatchConflict,
+        ) as exc:
             await self.fail("server_busy", "ASR is at capacity", 1013)
             raise _StreamClosed from exc
         except ASRInferenceTimeout as exc:
@@ -289,6 +312,7 @@ class StreamingSessionController:
             raise _StreamClosed from exc
 
         queue_wait, inference_time = self.coordinator.session_timing(self.session_id)
+        await self._ensure_session_active()
         if self._lag_exceeded(queue_wait + inference_time, sample_count / 16000):
             await self.fail("realtime_lag_exceeded", "ASR can no longer keep up in real time", 1013)
             raise _StreamClosed
@@ -329,13 +353,17 @@ class StreamingSessionController:
         started = time.monotonic()
         try:
             assert self.session_id is not None
-            result = await self.coordinator.transcribe_stream_chunk(
-                self.session_id,
-                temp_path,
-                language,
-                (len(pcm_bytes) // 2) / 16000,
+            result = await self._await_model_operation(
+                lambda: self.coordinator.transcribe_stream_chunk(
+                    self.session_id,
+                    temp_path,
+                    language,
+                    (len(pcm_bytes) // 2) / 16000,
+                )
             )
-        except (ASRQueueFull, ASRQueueTimeout, ASRBatchConflict) as exc:
+        except _StreamClosed:
+            raise
+        except (ASRQueueFull, ASRQueueTimeout, ASRSessionBusy, ASRBatchConflict) as exc:
             await self.fail("server_busy", "ASR is at capacity", 1013)
             raise _StreamClosed from exc
         except ASRInferenceTimeout as exc:
@@ -346,6 +374,7 @@ class StreamingSessionController:
             raise _StreamClosed from exc
         finally:
             remove_file(temp_path)
+        await self._ensure_session_active()
         elapsed = time.monotonic() - started
         if self._lag_exceeded(elapsed, (len(pcm_bytes) // 2) / 16000):
             await self.fail("realtime_lag_exceeded", "ASR can no longer keep up in real time", 1013)
@@ -362,8 +391,12 @@ class StreamingSessionController:
     async def reset_segment(self) -> None:
         assert self.session_id is not None
         try:
-            await self.coordinator.reset_segment(self.session_id)
-        except (ASRQueueFull, ASRQueueTimeout, ASRBatchConflict) as exc:
+            await self._await_model_operation(
+                lambda: self.coordinator.reset_segment(self.session_id)
+            )
+        except _StreamClosed:
+            raise
+        except (ASRQueueFull, ASRQueueTimeout, ASRSessionBusy, ASRBatchConflict) as exc:
             await self.fail("server_busy", "ASR is at capacity", 1013)
             raise _StreamClosed from exc
         except ASRInferenceTimeout as exc:
@@ -372,18 +405,24 @@ class StreamingSessionController:
         except Exception as exc:
             await self.fail("inference_error", "ASR segment reset failed", 1011)
             raise _StreamClosed from exc
+        await self._ensure_session_active()
         self.transcript.reset_segment()
         self.silence.reset()
 
     async def finish(self) -> None:
         assert self.session_id is not None
         try:
-            result = await self.coordinator.finish_stream(self.session_id)
+            result = await self._await_model_operation(
+                lambda: self.coordinator.finish_stream(self.session_id)
+            )
+            await self._ensure_session_active()
             await self._send_events(self.transcript.finish(result.text))
+        except _StreamClosed:
+            raise
         except ConfirmedPrefixConflict as exc:
             await self.fail("transcript_conflict", "Model output conflicts with confirmed text", 1011)
             raise _StreamClosed from exc
-        except (ASRQueueFull, ASRQueueTimeout) as exc:
+        except (ASRQueueFull, ASRQueueTimeout, ASRSessionBusy) as exc:
             await self.fail("server_busy", "ASR is at capacity", 1013)
             raise _StreamClosed from exc
         except ASRInferenceTimeout as exc:
@@ -396,6 +435,34 @@ class StreamingSessionController:
         logger.info("asr_stream_ended session_id=%s reason=finished", self.session_id)
         self.session_id = None
         await self.websocket.close(code=1000)
+
+    @property
+    def remaining_session_seconds(self) -> float:
+        return max(0.0, self.session_deadline - time.monotonic())
+
+    async def _await_model_operation(self, operation):
+        remaining = self.remaining_session_seconds
+        if remaining <= 0:
+            await self._expire_session()
+        try:
+            async with asyncio.timeout(remaining):
+                return await operation()
+        except TimeoutError:
+            await self._expire_session()
+
+    async def _ensure_session_active(self) -> None:
+        if self.remaining_session_seconds <= 0:
+            await self._expire_session()
+
+    async def _expire_session(self) -> None:
+        session_id, self.session_id = self.session_id, None
+        if session_id is not None:
+            try:
+                await self.coordinator.abort_stream(session_id)
+            except Exception:
+                pass
+        await self.fail("session_timeout", "Maximum session duration exceeded", 1008)
+        raise _StreamClosed
 
     async def abort(self) -> None:
         if self.session_id is None:
@@ -427,6 +494,7 @@ class StreamingSessionController:
 
     async def _send_events(self, events) -> None:
         for event in events:
+            await self._ensure_session_active()
             await self._send_event(event)
 
     async def _send_event(self, event) -> None:
@@ -476,11 +544,8 @@ async def transcribe_stream(
             return
 
         await controller.start(start.language)
-        session_started = time.monotonic()
         while True:
-            session_remaining = current_settings.asr_max_session_seconds - (
-                time.monotonic() - session_started
-            )
+            session_remaining = controller.remaining_session_seconds
             if session_remaining <= 0:
                 await controller.fail("session_timeout", "Maximum session duration exceeded", 1008)
                 return
@@ -572,11 +637,8 @@ async def _run_chunked_transcribe_stream(
     websocket = controller.websocket
     min_chunk_bytes = max(1, int(sample_rate * 2 * current_settings.asr_stream_chunk_seconds))
     buffer = bytearray()
-    session_started = time.monotonic()
     while True:
-        session_remaining = current_settings.asr_max_session_seconds - (
-            time.monotonic() - session_started
-        )
+        session_remaining = controller.remaining_session_seconds
         if session_remaining <= 0:
             await controller.fail("session_timeout", "Maximum session duration exceeded", 1008)
             raise _StreamClosed
@@ -621,6 +683,7 @@ async def _run_chunked_transcribe_stream(
                         await controller._send_events(
                             controller.transcript.append_independent_segment(segment_text)
                         )
+                await controller._ensure_session_active()
                 await controller._send_event(
                     controller.transcript.new_event("final", controller.transcript.partial_text)
                 )
@@ -630,5 +693,8 @@ async def _run_chunked_transcribe_stream(
             if payload.get("type") == "segment":
                 buffer.clear()
                 silence_detector.reset()
+                continue
+            await controller.fail("invalid_message", "Unsupported stream command", 1003)
+            raise _StreamClosed
         elif message.get("type") == "websocket.disconnect":
             return

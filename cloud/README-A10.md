@@ -98,7 +98,8 @@ ASR_MAX_ACTIVE_STREAMS=2
 ASR_INFERENCE_QUEUE_SIZE=16
 ASR_MAX_QUEUED_AUDIO_SECONDS=4.0
 ASR_MAX_CONNECTION_LAG_SECONDS=2.0
-ASR_MAX_FRAME_BYTES=32000
+ASR_MAX_FRAME_BYTES=16000
+ASR_WS_MAX_QUEUE=4
 ASR_START_TIMEOUT_SECONDS=10
 ASR_IDLE_TIMEOUT_SECONDS=30
 ASR_MAX_SESSION_SECONDS=1800
@@ -106,6 +107,7 @@ ASR_MAX_AUDIO_SECONDS=1800
 ASR_STREAM_QUEUE_TIMEOUT_SECONDS=2.0
 ASR_STREAM_INFERENCE_TIMEOUT_SECONDS=15.0
 ASR_FILE_INFERENCE_TIMEOUT_SECONDS=300.0
+ASR_SHUTDOWN_GRACE_SECONDS=10.0
 TTS_BACKEND=cosyvoice
 TTS_MODEL_ID=/models/CosyVoice
 TTS_COSYVOICE_REPO=/opt/CosyVoice
@@ -113,6 +115,11 @@ TTS_SAMPLE_RATE=24000
 ```
 
 Keep exactly one ASR process and one Uvicorn worker per GPU. `ASR_MAX_ACTIVE_STREAMS=2` is a conservative rollout setting, not a capacity claim. Calibrate it with 1, 2, 4, and 8 real-time streams while recording first-partial latency, queue wait p50/p95, inference p50/p95, RTF, GPU memory, and disconnect/error counts.
+
+At 16 kHz PCM16, the default frame is 0.5 seconds and four Uvicorn queue slots
+buffer at most two seconds of audio. Keep
+`ASR_WS_MAX_QUEUE * ASR_MAX_FRAME_BYTES / 32000 <= ASR_MAX_CONNECTION_LAG_SECONDS`;
+the application validates this relationship at startup.
 
 The live instance intentionally disables file upload. Use a separate batch instance with `ASR_FILE_TRANSCRIBE_ENABLED=true`; otherwise a running file job can stall every live stream. Use `ASR_BACKEND=qwen` and `ASR_STREAM_MODE=chunked` only as a fallback.
 

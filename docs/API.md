@@ -325,6 +325,13 @@ Every version 2 event, including `ready` and `error`, has a strictly increasing 
 
 The server limits active streams, queue jobs, queued audio seconds, per-connection lag, frame bytes, idle time, session time, and cumulative audio duration. It never accepts unbounded real-time backlog.
 
+The conservative transport defaults are `ASR_MAX_FRAME_BYTES=16000` and
+`ASR_WS_MAX_QUEUE=4`, which permit at most two seconds of 16 kHz PCM in the
+Uvicorn receive queue. Startup rejects configurations where this transport
+buffer exceeds `ASR_MAX_CONNECTION_LAG_SECONDS`. The absolute session deadline
+covers model inference, server-side result processing, and transcript event
+emission, so an expired session cannot publish a late `partial`.
+
 One GPU must be owned by one ASR process with one Uvicorn worker. Horizontal scaling requires one service instance per GPU.
 
 Test client:

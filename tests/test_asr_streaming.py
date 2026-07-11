@@ -87,6 +87,51 @@ def test_legacy_immediate_punctuation_commit_remains_available():
     ]
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            "第一句。第二句。",
+            [
+                ("sentence_final", "第一句。"),
+                ("sentence_final", "第二句。"),
+                ("partial", ""),
+            ],
+        ),
+        (
+            "第一句。第二句。未完成",
+            [
+                ("sentence_final", "第一句。"),
+                ("sentence_final", "第二句。"),
+                ("partial", "未完成"),
+            ],
+        ),
+        (
+            "First. Second. tail",
+            [
+                ("sentence_final", "First."),
+                ("sentence_final", " Second. "),
+                ("partial", "tail"),
+            ],
+        ),
+    ],
+)
+def test_legacy_immediate_commit_emits_all_complete_sentences(text, expected):
+    state = new_state(
+        stable_commit_enabled=False,
+        immediate_commit_on_punctuation=True,
+    )
+
+    events = state.apply_model_update(text, processed_samples=1600)
+
+    assert event_pairs(events) == expected
+    reconstructed = (
+        "".join(event.text for event in events if event.type == "sentence_final")
+        + state.partial_text
+    )
+    assert reconstructed == text
+
+
 def test_confirmed_prefix_conflict_never_reemits_full_model_text():
     state = new_state(stable_commit_enabled=False)
     state.apply_model_update("confirmed", processed_samples=1600)
@@ -209,6 +254,21 @@ def test_independent_segment_can_use_legacy_immediate_punctuation_commit():
 
     assert event_pairs(state.append_independent_segment("你好。")) == [
         ("sentence_final", "你好。"),
+        ("partial", ""),
+    ]
+
+
+def test_independent_segment_commits_all_complete_sentences():
+    state = new_state(
+        stable_commit_enabled=True,
+        immediate_commit_on_punctuation=True,
+    )
+
+    events = state.append_independent_segment("第一句。第二句。")
+
+    assert event_pairs(events) == [
+        ("sentence_final", "第一句。"),
+        ("sentence_final", "第二句。"),
         ("partial", ""),
     ]
 

@@ -1,6 +1,7 @@
 import os
 import logging
 import threading
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -62,6 +63,8 @@ class ProtocolCoordinator(FakeCoordinator):
         create_error=None,
         reset_error=None,
         timing=(0.0, 0.0),
+        timing_delay=0.0,
+        operation_delays=None,
     ):
         super().__init__()
         self.updates = iter(updates)
@@ -70,12 +73,17 @@ class ProtocolCoordinator(FakeCoordinator):
         self.create_error = create_error
         self.reset_error = reset_error
         self.timing = timing
+        self.timing_delay = timing_delay
+        self.operation_delays = operation_delays or {}
+        self.completed_operations = []
         self.abort_count = 0
         self.reset_count = 0
 
     async def create_stream(self, _language):
+        await self._delay("create")
         if self.create_error:
             raise self.create_error
+        self.completed_operations.append("create")
         return "protocol-session"
 
     async def create_chunked_stream(self, _language):
@@ -84,13 +92,17 @@ class ProtocolCoordinator(FakeCoordinator):
     async def add_audio(self, _session_id, _pcm_bytes, _sample_rate):
         from app.asr import StreamingTranscriptionResult
 
+        await self._delay("add")
         if self.add_error:
             raise self.add_error
+        self.completed_operations.append("add")
         return StreamingTranscriptionResult(next(self.updates), "zh")
 
     async def finish_stream(self, _session_id):
         from app.asr import StreamingTranscriptionResult
 
+        await self._delay("finish")
+        self.completed_operations.append("finish")
         return StreamingTranscriptionResult(self.final_text, "zh")
 
     async def transcribe_stream_chunk(
@@ -100,18 +112,31 @@ class ProtocolCoordinator(FakeCoordinator):
         _language,
         _audio_seconds,
     ):
+        await self._delay("chunk")
+        self.completed_operations.append("chunk")
         return TranscriptionResult(next(self.updates), "zh")
 
     async def reset_segment(self, _session_id):
+        await self._delay("reset")
         if self.reset_error:
             raise self.reset_error
+        self.completed_operations.append("reset")
         self.reset_count += 1
 
     async def abort_stream(self, _session_id):
         self.abort_count += 1
 
     def session_timing(self, _session_id):
+        if self.timing_delay:
+            import time
+
+            time.sleep(self.timing_delay)
         return self.timing
+
+    async def _delay(self, operation):
+        delay = self.operation_delays.get(operation, 0.0)
+        if delay:
+            await asyncio.sleep(delay)
 
 
 def _protocol_settings(**overrides):
@@ -120,7 +145,7 @@ def _protocol_settings(**overrides):
         "asr_backend": "mock",
         "asr_stream_mode": "stateful",
         "asr_stable_commit_enabled": False,
-        "asr_max_frame_bytes": 32000,
+        "asr_max_frame_bytes": 16000,
     }
     values.update(overrides)
     return Settings(_env_file=None, **values)
@@ -572,7 +597,11 @@ def test_stream_v2_maps_queue_overload_to_1013():
 
 def test_stream_v2_closes_when_realtime_lag_limit_is_exceeded():
     coordinator = ProtocolCoordinator(["late"], timing=(0.6, 0.5))
-    _override_protocol(coordinator, asr_max_connection_lag_seconds=1.0)
+    _override_protocol(
+        coordinator,
+        asr_max_connection_lag_seconds=1.0,
+        asr_ws_max_queue=2,
+    )
     try:
         with client.websocket_connect("/v1/transcribe/stream") as websocket:
             _start_stream(websocket, expect_sequence=True)
@@ -591,7 +620,11 @@ def test_stream_v2_accumulates_realtime_processing_debt():
         ["one", "two", "three", "four", "five"],
         timing=(0.0, 0.75),
     )
-    _override_protocol(coordinator, asr_max_connection_lag_seconds=1.0)
+    _override_protocol(
+        coordinator,
+        asr_max_connection_lag_seconds=1.0,
+        asr_ws_max_queue=2,
+    )
     frame = _pcm_s16le_samples(1000, 8000)
     try:
         with client.websocket_connect("/v1/transcribe/stream") as websocket:
@@ -713,6 +746,134 @@ def test_stream_v2_enforces_session_timeout():
         _clear_asr_dependency_overrides()
 
 
+@pytest.mark.parametrize("operation", ["add", "reset", "finish"])
+def test_stateful_session_deadline_cancels_model_operation_before_late_event(operation):
+    coordinator = ProtocolCoordinator(
+        ["late partial"],
+        final_text="late final",
+        operation_delays={operation: 0.08},
+    )
+    _override_protocol(
+        coordinator,
+        asr_max_session_seconds=0.03,
+        asr_idle_timeout_seconds=1.0,
+    )
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            _start_stream(websocket, expect_sequence=True)
+            if operation == "add":
+                websocket.send_bytes(b"\x00\x00" * 16)
+            elif operation == "reset":
+                websocket.send_json({"type": "segment"})
+            else:
+                websocket.send_json({"type": "end"})
+            event = websocket.receive_json()
+            assert event == {
+                "type": "error",
+                "code": "session_timeout",
+                "message": "Maximum session duration exceeded",
+                "sequence": 2,
+            }
+            _assert_closed(websocket, 1008)
+    finally:
+        _clear_asr_dependency_overrides()
+
+    assert operation not in coordinator.completed_operations
+    assert coordinator.abort_count >= 1
+
+
+def test_chunked_session_deadline_cancels_transcription_before_late_partial():
+    coordinator = ProtocolCoordinator(
+        ["late partial"],
+        operation_delays={"chunk": 0.08},
+    )
+    _override_protocol(
+        coordinator,
+        asr_stream_mode="chunked",
+        asr_stream_chunk_seconds=0.001,
+        asr_max_session_seconds=0.03,
+        asr_idle_timeout_seconds=1.0,
+    )
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            _start_stream(websocket, expect_sequence=True)
+            websocket.send_bytes(b"\x00\x00" * 16)
+            event = websocket.receive_json()
+            assert event["type"] == "error"
+            assert event["code"] == "session_timeout"
+            assert event["sequence"] == 2
+            _assert_closed(websocket, 1008)
+    finally:
+        _clear_asr_dependency_overrides()
+
+    assert "chunk" not in coordinator.completed_operations
+    assert coordinator.abort_count >= 1
+
+
+def test_stateful_post_inference_work_cannot_emit_partial_after_session_deadline():
+    coordinator = ProtocolCoordinator(
+        ["late partial"],
+        operation_delays={"add": 0.01},
+        timing_delay=0.08,
+    )
+    _override_protocol(
+        coordinator,
+        asr_max_session_seconds=0.05,
+        asr_idle_timeout_seconds=1.0,
+    )
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            _start_stream(websocket, expect_sequence=True)
+            websocket.send_bytes(b"\x00\x00" * 16)
+            event = websocket.receive_json()
+            assert event["type"] == "error"
+            assert event["code"] == "session_timeout"
+            assert event["sequence"] == 2
+            _assert_closed(websocket, 1008)
+    finally:
+        _clear_asr_dependency_overrides()
+
+    assert coordinator.abort_count >= 1
+
+
+def test_chunked_post_inference_cleanup_cannot_emit_partial_after_session_deadline(
+    monkeypatch,
+):
+    coordinator = ProtocolCoordinator(
+        ["late partial"],
+        operation_delays={"chunk": 0.01},
+    )
+    original_remove_file = asr_api.remove_file
+
+    def delayed_remove_file(path):
+        import time
+
+        original_remove_file(path)
+        time.sleep(0.08)
+
+    monkeypatch.setattr(asr_api, "remove_file", delayed_remove_file)
+    _override_protocol(
+        coordinator,
+        asr_stream_mode="chunked",
+        asr_stream_chunk_seconds=0.001,
+        asr_max_session_seconds=0.05,
+        asr_idle_timeout_seconds=1.0,
+    )
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            _start_stream(websocket, expect_sequence=True)
+            websocket.send_bytes(b"\x00\x00" * 16)
+            event = websocket.receive_json()
+            assert event["type"] == "error"
+            assert event["code"] == "session_timeout"
+            assert event["sequence"] == 2
+            _assert_closed(websocket, 1008)
+    finally:
+        _clear_asr_dependency_overrides()
+
+    assert coordinator.abort_count >= 1
+
+
 def test_stream_v2_maps_segment_reset_failure_to_stable_error():
     coordinator = ProtocolCoordinator(reset_error=RuntimeError("reset failed"))
     _override_protocol(coordinator)
@@ -743,6 +904,23 @@ def test_chunked_stream_enforces_session_timeout():
             assert event["code"] == "session_timeout"
             assert event["sequence"] == 2
             _assert_closed(websocket, 1008)
+    finally:
+        _clear_asr_dependency_overrides()
+
+
+@pytest.mark.parametrize("raw_command", ["not json", "[]", '{"type":"bogus"}'])
+def test_chunked_stream_rejects_every_invalid_json_command(raw_command):
+    coordinator = ProtocolCoordinator([])
+    _override_protocol(coordinator, asr_stream_mode="chunked")
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            _start_stream(websocket, expect_sequence=True)
+            websocket.send_text(raw_command)
+            event = websocket.receive_json()
+            assert event["type"] == "error"
+            assert event["code"] == "invalid_message"
+            assert event["sequence"] == 2
+            _assert_closed(websocket, 1003)
     finally:
         _clear_asr_dependency_overrides()
 
@@ -803,6 +981,45 @@ def test_chunked_stream_honors_legacy_immediate_punctuation_when_stable_enabled(
                 "type": "partial",
                 "text": "",
                 "sequence": 3,
+            }
+    finally:
+        _clear_asr_dependency_overrides()
+
+
+@pytest.mark.parametrize(
+    ("stream_mode", "stable_enabled"),
+    [("stateful", False), ("chunked", True)],
+)
+def test_legacy_protocol_commits_every_complete_sentence_in_one_update(
+    stream_mode,
+    stable_enabled,
+):
+    coordinator = ProtocolCoordinator(["第一句。第二句。"])
+    _override_protocol(
+        coordinator,
+        asr_stream_mode=stream_mode,
+        asr_stream_chunk_seconds=0.001,
+        asr_stable_commit_enabled=stable_enabled,
+        asr_commit_on_punctuation=True,
+    )
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            _start_stream(websocket, expect_sequence=True)
+            websocket.send_bytes(b"\x00\x00" * 16)
+            assert websocket.receive_json() == {
+                "type": "sentence_final",
+                "text": "第一句。",
+                "sequence": 2,
+            }
+            assert websocket.receive_json() == {
+                "type": "sentence_final",
+                "text": "第二句。",
+                "sequence": 3,
+            }
+            assert websocket.receive_json() == {
+                "type": "partial",
+                "text": "",
+                "sequence": 4,
             }
     finally:
         _clear_asr_dependency_overrides()
