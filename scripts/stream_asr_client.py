@@ -31,6 +31,25 @@ class DisplayState:
         return "".join(self.confirmed) + self.tail
 
 
+class SequenceTracker:
+    def __init__(self) -> None:
+        self.last_sequence: int | None = None
+
+    def observe(self, payload: dict[str, object]) -> str | None:
+        sequence = payload.get("sequence")
+        if not isinstance(sequence, int):
+            return None
+        previous = self.last_sequence
+        self.last_sequence = sequence
+        if previous is None:
+            return None
+        if sequence <= previous:
+            return f"server event sequence is not increasing: {sequence} after {previous}"
+        if sequence != previous + 1:
+            return f"server event sequence gap: expected {previous + 1}, got {sequence}"
+        return None
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Test Qwen ASR WebSocket streaming.")
     parser.add_argument("audio_file", help="Input audio file, such as wav/mp3/m4a/flac")
@@ -92,14 +111,22 @@ def start_ffmpeg(audio_file: str, sample_rate: int) -> subprocess.Popen[bytes]:
     return subprocess.Popen(command, stdout=subprocess.PIPE)
 
 
-async def receive_messages(websocket: websockets.ClientConnection, print_mode: str = "events") -> None:
+async def receive_messages(
+    websocket: websockets.ClientConnection,
+    print_mode: str = "events",
+    sequence_tracker: SequenceTracker | None = None,
+) -> None:
     display_state = DisplayState()
+    tracker = sequence_tracker or SequenceTracker()
     async for message in websocket:
         try:
             payload = json.loads(message)
         except json.JSONDecodeError:
             print(message)
             continue
+
+        if warning := tracker.observe(payload):
+            print(f"warning: {warning}", file=sys.stderr)
 
         message_type = payload.get("type")
         if print_mode == "display":
@@ -145,7 +172,13 @@ async def stream_audio(args: argparse.Namespace) -> None:
         if first.get("type") == "error":
             return
 
-        receiver = asyncio.create_task(receive_messages(websocket, args.print_mode))
+        sequence_tracker = SequenceTracker()
+        if warning := sequence_tracker.observe(first):
+            print(f"warning: {warning}", file=sys.stderr)
+
+        receiver = asyncio.create_task(
+            receive_messages(websocket, args.print_mode, sequence_tracker)
+        )
         process = start_ffmpeg(args.audio_file, args.sample_rate)
 
         assert process.stdout is not None

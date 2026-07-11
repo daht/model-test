@@ -91,13 +91,30 @@ ASR_STABLE_COMMIT_ENABLED=true
 ASR_STABLE_COMMIT_SECONDS=1.0
 ASR_STABLE_COMMIT_MIN_CHARS=8
 ASR_STABLE_COMMIT_MIN_UPDATES=2
+ASR_PROTOCOL_VERSION=2
+ASR_EAGER_LOAD=true
+ASR_FILE_TRANSCRIBE_ENABLED=false
+ASR_MAX_ACTIVE_STREAMS=2
+ASR_INFERENCE_QUEUE_SIZE=16
+ASR_MAX_QUEUED_AUDIO_SECONDS=4.0
+ASR_MAX_CONNECTION_LAG_SECONDS=2.0
+ASR_MAX_FRAME_BYTES=32000
+ASR_START_TIMEOUT_SECONDS=10
+ASR_IDLE_TIMEOUT_SECONDS=30
+ASR_MAX_SESSION_SECONDS=1800
+ASR_MAX_AUDIO_SECONDS=1800
+ASR_STREAM_QUEUE_TIMEOUT_SECONDS=2.0
+ASR_STREAM_INFERENCE_TIMEOUT_SECONDS=15.0
+ASR_FILE_INFERENCE_TIMEOUT_SECONDS=300.0
 TTS_BACKEND=cosyvoice
 TTS_MODEL_ID=/models/CosyVoice
 TTS_COSYVOICE_REPO=/opt/CosyVoice
 TTS_SAMPLE_RATE=24000
 ```
 
-Use `ASR_BACKEND=qwen` and `ASR_STREAM_MODE=chunked` if you need the original chunked fallback.
+Keep exactly one ASR process and one Uvicorn worker per GPU. `ASR_MAX_ACTIVE_STREAMS=2` is a conservative rollout setting, not a capacity claim. Calibrate it with 1, 2, 4, and 8 real-time streams while recording first-partial latency, queue wait p50/p95, inference p50/p95, RTF, GPU memory, and disconnect/error counts.
+
+The live instance intentionally disables file upload. Use a separate batch instance with `ASR_FILE_TRANSCRIBE_ENABLED=true`; otherwise a running file job can stall every live stream. Use `ASR_BACKEND=qwen` and `ASR_STREAM_MODE=chunked` only as a fallback.
 
 If the model is encoder-decoder rather than causal language model, set:
 
@@ -161,7 +178,7 @@ ASR WebSocket endpoint:
 ws://your-server-ip:8002/v1/transcribe/stream
 ```
 
-Stateful `partial` text is immediately replaceable. A punctuated prefix becomes `sentence_final` only after the exact prefix remains stable for 1.0 second and at least two updates, with a minimum of 8 non-whitespace characters. The A10 configuration uses 0.8 seconds of VAD silence as the fallback force-commit path.
+Stateful `partial` text is immediately replaceable. A punctuated prefix becomes `sentence_final` only after the exact prefix survives 1.0 second of additional processed audio and at least two updates, with a minimum of 8 non-whitespace characters. The A10 configuration uses 0.8 seconds of VAD silence as the fallback force-commit path.
 
 Test WebSocket streaming from the server:
 

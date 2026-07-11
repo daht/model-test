@@ -1,4 +1,5 @@
 import os
+import logging
 import threading
 from pathlib import Path
 
@@ -636,6 +637,29 @@ def test_stream_v2_confirmed_prefix_conflict_closes_session():
             _assert_closed(websocket, 1011)
     finally:
         _clear_asr_dependency_overrides()
+
+
+def test_stream_logs_conflict_code_without_transcript_or_api_key(caplog):
+    coordinator = ProtocolCoordinator(["distinctive-transcript", "distinctive-transcript", "unsafe"])
+    _override_protocol(coordinator, asr_vad_silence_seconds=0.001)
+    caplog.set_level(logging.WARNING, logger="app.asr_api")
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            _start_stream(websocket, expect_sequence=True)
+            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
+            websocket.receive_json()
+            websocket.send_bytes(_pcm_s16le_samples(0, 160))
+            websocket.receive_json()
+            websocket.receive_json()
+            websocket.send_bytes(_pcm_s16le_samples(1000, 160))
+            websocket.receive_json()
+    finally:
+        _clear_asr_dependency_overrides()
+
+    messages = " ".join(record.getMessage() for record in caplog.records)
+    assert "code=transcript_conflict" in messages
+    assert "distinctive-transcript" not in messages
+    assert "test-key" not in messages
 
 
 def test_stream_v2_enforces_session_timeout():

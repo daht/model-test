@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from contextlib import asynccontextmanager
 from typing import Literal
@@ -45,6 +46,8 @@ from app.schemas import (
     TranscribeResponse,
     TranscribeStreamInfoResponse,
 )
+
+logger = logging.getLogger(__name__)
 
 settings = get_settings()
 asr_transcriber = create_asr_transcriber(settings)
@@ -247,6 +250,11 @@ class StreamingSessionController:
         except Exception as exc:
             await self.fail("inference_error", "Unable to create ASR session", 1011)
             raise _StreamClosed from exc
+        logger.info(
+            "asr_stream_started session_id=%s active_streams=%d",
+            self.session_id,
+            self.coordinator.snapshot().active_streams,
+        )
         await self._send_event(self.transcript.new_event("ready"))
 
     async def add_audio(self, pcm_bytes: bytes) -> None:
@@ -327,6 +335,7 @@ class StreamingSessionController:
             await self.fail("inference_error", "ASR finalization failed", 1011)
             raise _StreamClosed from exc
         self.finished = True
+        logger.info("asr_stream_ended session_id=%s reason=finished", self.session_id)
         self.session_id = None
         await self.websocket.close(code=1000)
 
@@ -338,8 +347,15 @@ class StreamingSessionController:
             await self.coordinator.abort_stream(session_id)
         except Exception:
             return
+        logger.info("asr_stream_ended session_id=%s reason=aborted", session_id)
 
     async def fail(self, code: str, message: str, close_code: int) -> None:
+        logger.warning(
+            "asr_stream_error session_id=%s code=%s close_code=%d",
+            self.session_id or "unassigned",
+            code,
+            close_code,
+        )
         event = self.transcript.new_event("error")
         await self.websocket.send_json(
             {

@@ -15,3 +15,24 @@ def test_display_state_final_uses_remaining_tail():
     state.apply({"type": "sentence_final", "text": "hello"})
 
     assert state.apply({"type": "final", "text": " world"}) == "hello world"
+
+
+def test_empty_partial_after_commit_does_not_duplicate_display():
+    state = stream_asr_client.DisplayState()
+
+    assert state.apply({"type": "sentence_final", "text": "hello"}) == "hello"
+    assert state.apply({"type": "partial", "text": ""}) == "hello"
+
+
+def test_sequence_tracker_reports_gap_and_non_increasing_sequence():
+    tracker = stream_asr_client.SequenceTracker()
+
+    assert tracker.observe({"sequence": 1}) is None
+    assert tracker.observe({"sequence": 3}) == "server event sequence gap: expected 2, got 3"
+    assert tracker.observe({"sequence": 3}) == "server event sequence is not increasing: 3 after 3"
+
+
+def test_error_payload_is_not_treated_as_transcript():
+    state = stream_asr_client.DisplayState()
+
+    assert state.apply({"type": "error", "code": "server_busy", "text": "secret"}) is None

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import logging
 import queue
 import threading
 import time
@@ -12,6 +13,8 @@ from typing import Any, Callable
 
 from app.asr import ASRTranscriber, StreamingTranscriptionResult, TranscriptionResult
 from app.config import Settings
+
+logger = logging.getLogger(__name__)
 
 
 class ASRCoordinatorError(RuntimeError):
@@ -263,6 +266,11 @@ class ASRInferenceCoordinator:
         with self._lock:
             self._require_accepting_locked()
             if self._queued_audio_seconds + audio_seconds > self.settings.asr_max_queued_audio_seconds:
+                logger.warning(
+                    "asr_queue_rejected reason=audio_limit queue_depth=%d queued_audio_seconds=%.3f",
+                    self._jobs.qsize(),
+                    self._queued_audio_seconds,
+                )
                 raise ASRQueueFull("maximum queued audio duration reached")
             self._queued_audio_seconds += audio_seconds
         job = self._new_job(
@@ -277,6 +285,10 @@ class ASRInferenceCoordinator:
             self._jobs.put_nowait(job)
         except queue.Full as exc:
             self._release_audio_reservation(audio_seconds)
+            logger.warning(
+                "asr_queue_rejected reason=queue_full queue_depth=%d",
+                self._jobs.qsize(),
+            )
             raise ASRQueueFull("ASR inference queue is full") from exc
 
         started = asyncio.wrap_future(job.started)
@@ -287,6 +299,10 @@ class ASRInferenceCoordinator:
             except TimeoutError as exc:
                 if not job.started.done():
                     job.cancelled.set()
+                    logger.warning(
+                        "asr_timeout category=queue session_id=%s",
+                        session_id or "batch",
+                    )
                     raise ASRQueueTimeout("ASR job expired before execution") from exc
                 await started
             try:
@@ -295,6 +311,10 @@ class ASRInferenceCoordinator:
                 if session_id:
                     with self._lock:
                         self._poisoned_sessions.add(session_id)
+                logger.warning(
+                    "asr_timeout category=inference session_id=%s",
+                    session_id or "batch",
+                )
                 raise ASRInferenceTimeout("ASR inference exceeded its execution timeout") from exc
         except asyncio.CancelledError:
             if job.started.done() and session_id:
@@ -393,6 +413,14 @@ class ASRInferenceCoordinator:
                 if job.session_id:
                     with self._lock:
                         self._last_timings[job.session_id] = (max(queue_wait, 0.0), inference_elapsed)
+                logger.info(
+                    "asr_inference_completed job_type=%s session_id=%s queue_wait_ms=%.3f inference_ms=%.3f rtf=%.3f",
+                    job.action,
+                    job.session_id or "batch",
+                    max(queue_wait, 0.0) * 1000,
+                    inference_elapsed * 1000,
+                    inference_elapsed / job.audio_seconds if job.audio_seconds else 0.0,
+                )
                 if not job.result.done():
                     job.result.set_result(result)
             except Exception as exc:

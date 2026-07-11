@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import threading
 
 import pytest
@@ -288,3 +289,22 @@ def test_stream_is_rejected_while_file_job_is_running():
         await coordinator.stop()
 
     asyncio.run(scenario())
+
+
+def test_operational_logs_include_timings_without_transcript_or_api_key(caplog):
+    async def scenario():
+        coordinator, _records, _holder = make_coordinator(api_key="distinctive-api-key")
+        await coordinator.start()
+        session_id = await coordinator.create_stream(None)
+        await coordinator.add_audio(session_id, b"distinctive-transcript", 16000)
+        await coordinator.finish_stream(session_id)
+        await coordinator.stop()
+
+    caplog.set_level(logging.INFO, logger="app.asr_inference")
+    asyncio.run(scenario())
+    messages = " ".join(record.getMessage() for record in caplog.records)
+
+    assert "queue_wait_ms=" in messages
+    assert "inference_ms=" in messages
+    assert "distinctive-transcript" not in messages
+    assert "distinctive-api-key" not in messages

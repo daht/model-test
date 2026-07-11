@@ -1,8 +1,16 @@
 # HY-MT1.5-1.8B REST API Deployment Template
 
-This template deploys HY-MT1.5-1.8B behind a FastAPI REST service.
+This repository deploys translation, Qwen3-ASR, and CosyVoice as separate FastAPI services.
 
-The recommended target for your current server is NVIDIA A10 24GB. Use `float16`, one GPU, and no quantization for the first production deployment.
+The recommended target is NVIDIA A10 24GB. The live ASR service uses one process and one Uvicorn worker per GPU; do not increase `--workers` on a single GPU.
+
+## Stateful ASR Production Contract
+
+The production path is `ASR_BACKEND=qwen_vllm` with `ASR_STREAM_MODE=stateful`. All model loading and calls run on one owner thread behind a bounded coordinator, so synchronous GPU work does not block the FastAPI event loop. `/health` is liveness only; `/ready` returns 200 only after model warmup succeeds and admission is open.
+
+Live streaming defaults to `ASR_FILE_TRANSCRIBE_ENABLED=false` because an in-progress file transcription cannot be preempted. Run file transcription on a separate batch ASR instance. Stable punctuation is measured using processed audio samples, not wall-clock or network delay.
+
+Protocol version 2 guarantees monotonically increasing `sequence` values. Append `sentence_final` events permanently and replace the displayed tail with every `partial` or `final`. A commit is followed by `partial: ""` when no unconfirmed tail remains.
 
 ## Files
 
@@ -235,6 +243,7 @@ Check health:
 ```bash
 curl http://localhost:8000/health
 curl http://localhost:8002/health
+curl http://localhost:8002/ready
 curl http://localhost:8003/health
 ```
 
@@ -255,7 +264,7 @@ curl -X POST http://localhost:8000/v1/translate \
   }'
 ```
 
-Transcribe an audio file:
+Transcribe an audio file on a batch instance configured with `ASR_FILE_TRANSCRIBE_ENABLED=true`:
 
 ```bash
 curl -X POST http://localhost:8002/v1/transcribe \
@@ -295,9 +304,11 @@ Client sends a JSON start message:
 Then the client sends binary PCM chunks. The server returns:
 
 ```json
-{"type":"partial","text":"..."}
-{"type":"sentence_final","text":"..."}
-{"type":"final","text":"..."}
+{"type":"ready","sequence":1}
+{"type":"partial","text":"...","sequence":2}
+{"type":"sentence_final","text":"...","sequence":3}
+{"type":"partial","text":"","sequence":4}
+{"type":"final","text":"...","sequence":5}
 ```
 
 `partial` is the current unconfirmed streaming text and is replaceable immediately, including revisions that add or remove model-generated punctuation. In stateful mode, stable punctuation confirmation is enabled by default: the earliest punctuated prefix with at least 8 non-whitespace characters becomes `sentence_final` only after the exact prefix remains unchanged for 1.0 second and at least two updates. VAD remains the fallback and force-commits pending text after `ASR_VAD_SILENCE_SECONDS` of continuous silence. `sentence_final` will not be sent again or changed by later messages, and a following `partial` contains only the remaining uncommitted tail. Set `ASR_STABLE_COMMIT_ENABLED=false` to disable stable confirmation; stateful mode then honors the legacy `ASR_COMMIT_ON_PUNCTUATION` setting. On `end`, `final` contains only the remaining uncommitted text, so clients should render:

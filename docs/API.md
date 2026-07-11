@@ -76,6 +76,8 @@ Response:
 }
 ```
 
+`GET /health` is liveness only and does not prove that model loading succeeded. Use `GET /ready` for traffic admission. `/ready` returns 503 until the owner thread has warmed the model and the coordinator accepts work; a ready response includes active stream count, queue depth, and queued audio seconds.
+
 ### TTS Health
 
 ```bash
@@ -162,7 +164,7 @@ ar      Arabic
 
 ## ASR File Upload
 
-Use this endpoint for offline transcription from a complete audio file.
+Use this endpoint for offline transcription from a complete audio file. It is disabled by default on the live streaming instance and returns HTTP 503 with `detail.code=file_transcription_disabled`. Deploy a separate batch instance with `ASR_FILE_TRANSCRIBE_ENABLED=true`.
 
 ```http
 POST /v1/transcribe
@@ -258,7 +260,8 @@ Server ready response:
 
 ```json
 {
-  "type": "ready"
+  "type": "ready",
+  "sequence": 1
 }
 ```
 
@@ -269,7 +272,8 @@ Server partial response:
 ```json
 {
   "type": "partial",
-  "text": "今天我们来介绍"
+  "text": "今天我们来介绍",
+  "sequence": 2
 }
 ```
 
@@ -280,11 +284,12 @@ Server committed sentence response:
 ```json
 {
   "type": "sentence_final",
-  "text": "今天我们来介绍这个产品。"
+  "text": "今天我们来介绍这个产品。",
+  "sequence": 3
 }
 ```
 
-`sentence_final` text is confirmed and will not change. In stateful mode, the server confirms the earliest punctuated prefix with at least `ASR_STABLE_COMMIT_MIN_CHARS` non-whitespace characters after that exact prefix remains unchanged for `ASR_STABLE_COMMIT_SECONDS` and at least `ASR_STABLE_COMMIT_MIN_UPDATES` updates. The defaults are 8 characters, 1.0 second, and two updates. VAD remains a fallback and force-commits pending text after `ASR_VAD_SILENCE_SECONDS` of continuous silence. Set `ASR_STABLE_COMMIT_ENABLED=false` to disable stable confirmation; stateful mode then preserves the legacy `ASR_COMMIT_ON_PUNCTUATION` behavior. Clients should append every `sentence_final` in order, then display the latest replaceable `partial` tail after that confirmed prefix.
+`sentence_final` text is confirmed and will not change. Stability is measured from processed audio time (`processed samples / 16000`), so fast file replay and network pauses cannot change the commit decision. A commit always emits the remaining complete `partial`, including an empty string. VAD remains a force-commit fallback after `ASR_VAD_SILENCE_SECONDS` of continuous silence.
 
 End the stream:
 
@@ -309,11 +314,18 @@ Server final response:
 ```json
 {
   "type": "final",
-  "text": "剩余未确句文本"
+  "text": "剩余未确句文本",
+  "sequence": 8
 }
 ```
 
 `final` is sent only after `end` and contains the remaining uncommitted text. It does not repeat text already delivered by `sentence_final`. The completed transcript is all `sentence_final` messages in order plus the `final` text.
+
+Every version 2 event, including `ready` and `error`, has a strictly increasing `sequence`. Stable error codes include `invalid_start`, `invalid_language`, `invalid_audio_frame`, `frame_too_large`, `server_busy`, `realtime_lag_exceeded`, `session_timeout`, `inference_timeout`, and `transcript_conflict`. Protocol errors close with 1003, policy/time limits with 1008, oversized frames with 1009, model/state failures with 1011, and overload with 1013.
+
+The server limits active streams, queue jobs, queued audio seconds, per-connection lag, frame bytes, idle time, session time, and cumulative audio duration. It never accepts unbounded real-time backlog.
+
+One GPU must be owned by one ASR process with one Uvicorn worker. Horizontal scaling requires one service instance per GPU.
 
 Test client:
 

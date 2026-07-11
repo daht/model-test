@@ -10,6 +10,10 @@ echo "ASR health:"
 curl -fsS "${BASE_URL}/health"
 echo
 
+echo "ASR readiness:"
+curl -fsS "${BASE_URL}/ready"
+echo
+
 echo "ASR stream info:"
 stream_info="$(curl -fsS "${BASE_URL}/v1/transcribe/stream-info")"
 echo "${stream_info}"
@@ -19,19 +23,26 @@ EXPECT_ASR_STREAM_MODE="${EXPECT_ASR_STREAM_MODE:-}"
 EXPECT_ASR_BACKEND="${EXPECT_ASR_BACKEND:-}"
 EXPECT_ASR_COMMIT_ON_PUNCTUATION="${EXPECT_ASR_COMMIT_ON_PUNCTUATION:-}"
 EXPECT_ASR_STABLE_COMMIT_ENABLED="${EXPECT_ASR_STABLE_COMMIT_ENABLED:-}"
+EXPECT_ASR_PROTOCOL_VERSION="${EXPECT_ASR_PROTOCOL_VERSION:-2}"
 
-if [[ -n "${EXPECT_ASR_STREAM_MODE}${EXPECT_ASR_BACKEND}${EXPECT_ASR_COMMIT_ON_PUNCTUATION}${EXPECT_ASR_STABLE_COMMIT_ENABLED}" ]]; then
+if [[ -n "${EXPECT_ASR_STREAM_MODE}${EXPECT_ASR_BACKEND}${EXPECT_ASR_COMMIT_ON_PUNCTUATION}${EXPECT_ASR_STABLE_COMMIT_ENABLED}${EXPECT_ASR_PROTOCOL_VERSION}" ]]; then
   STREAM_INFO_JSON="${stream_info}" \
   EXPECT_ASR_STREAM_MODE="${EXPECT_ASR_STREAM_MODE}" \
   EXPECT_ASR_BACKEND="${EXPECT_ASR_BACKEND}" \
   EXPECT_ASR_COMMIT_ON_PUNCTUATION="${EXPECT_ASR_COMMIT_ON_PUNCTUATION}" \
   EXPECT_ASR_STABLE_COMMIT_ENABLED="${EXPECT_ASR_STABLE_COMMIT_ENABLED}" \
+  EXPECT_ASR_PROTOCOL_VERSION="${EXPECT_ASR_PROTOCOL_VERSION}" \
   python3 - <<'PY'
 import json
 import os
 
 info = json.loads(os.environ["STREAM_INFO_JSON"])
 audio = info["audio_format"]
+expected_protocol = os.environ.get("EXPECT_ASR_PROTOCOL_VERSION", "")
+if expected_protocol and str(info.get("protocol_version")) != expected_protocol:
+    raise SystemExit(
+        f"protocol_version expected {expected_protocol!r}, got {info.get('protocol_version')!r}"
+    )
 checks = {
     "EXPECT_ASR_STREAM_MODE": "stream_mode",
     "EXPECT_ASR_BACKEND": "backend",
@@ -70,6 +81,18 @@ fi
 
 if [[ ! -f "${AUDIO_FILE}" ]]; then
   echo "Audio file not found: ${AUDIO_FILE}"
+  exit 1
+fi
+
+file_transcribe_enabled="$({ STREAM_INFO_JSON="${stream_info}" python3 - <<'PY'
+import json
+import os
+
+print(str(json.loads(os.environ["STREAM_INFO_JSON"]).get("file_transcribe_enabled", False)).lower())
+PY
+} )"
+if [[ "${file_transcribe_enabled}" != "true" ]]; then
+  echo "File transcription is disabled on this live streaming instance. Use a dedicated batch ASR instance."
   exit 1
 fi
 
