@@ -100,10 +100,12 @@ Candidate removal, movement, or prefix revision resets stability. VAD force-comm
 If cumulative model text no longer starts with confirmed text:
 
 - retain confirmed text unchanged;
-- derive a tail only from a safe confirmed-suffix/model-prefix overlap;
-- never emit the full conflicting model text as a new tail;
+- reject the update as a confirmed-prefix conflict;
+- never infer continuation from an arbitrary suffix/prefix overlap or emit the conflicting model text as a new tail;
 - increment a conflict metric and emit a structured warning without transcript content by default;
-- close the session with a stable error if no safe continuation can be derived.
+- close the session with a stable error.
+
+The Qwen streaming wrapper preserves its application-level cumulative text prefix when the official model state is reset, so every later stateful update must include the complete confirmed prefix.
 
 Silently duplicating or contradicting confirmed text is not allowed.
 
@@ -230,6 +232,8 @@ ASR_FILE_INFERENCE_TIMEOUT_SECONDS=300.0
 ## Chunked Fallback
 
 Chunked mode transcribes independent, non-overlapping audio buffers. Its outputs are appended as independent segments and are never passed through cumulative-output deduplication. Repeated speech across adjacent chunks must remain repeated in the transcript.
+
+Stable punctuation tracking applies only to cumulative stateful output. Chunked mode continues to honor `ASR_COMMIT_ON_PUNCTUATION` immediately even when `ASR_STABLE_COMMIT_ENABLED=true` globally.
 
 No broader chunked-mode redesign is included.
 

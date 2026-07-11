@@ -781,6 +781,33 @@ def test_chunked_stream_preserves_repeated_independent_chunks():
         _clear_asr_dependency_overrides()
 
 
+def test_chunked_stream_honors_legacy_immediate_punctuation_when_stable_enabled():
+    coordinator = ProtocolCoordinator(["你好。"])
+    _override_protocol(
+        coordinator,
+        asr_stream_mode="chunked",
+        asr_stream_chunk_seconds=0.01,
+        asr_stable_commit_enabled=True,
+        asr_commit_on_punctuation=True,
+    )
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            _start_stream(websocket, expect_sequence=True)
+            websocket.send_bytes(b"\x00\x00" * 160)
+            assert websocket.receive_json() == {
+                "type": "sentence_final",
+                "text": "你好。",
+                "sequence": 2,
+            }
+            assert websocket.receive_json() == {
+                "type": "partial",
+                "text": "",
+                "sequence": 3,
+            }
+    finally:
+        _clear_asr_dependency_overrides()
+
+
 def test_qwen_vllm_backend_can_be_selected():
     from app.asr import QwenVLLMASRTranscriber, create_asr_transcriber
     from app.config import Settings

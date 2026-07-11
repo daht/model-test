@@ -231,7 +231,10 @@ class StreamingSessionController:
             stable_commit_min_updates=current_settings.asr_stable_commit_min_updates,
             immediate_commit_on_punctuation=(
                 current_settings.asr_commit_on_punctuation
-                and not current_settings.asr_stable_commit_enabled
+                and (
+                    current_settings.asr_stream_mode == "chunked"
+                    or not current_settings.asr_stable_commit_enabled
+                )
             ),
         )
         self.silence = SilenceEndpointDetector(

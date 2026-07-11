@@ -96,14 +96,17 @@ def test_confirmed_prefix_conflict_never_reemits_full_model_text():
         state.apply_model_update("unsafe revision", processed_samples=1600)
 
 
-def test_confirmed_suffix_overlap_derives_only_safe_continuation():
+@pytest.mark.parametrize(
+    ("confirmed", "revision"),
+    [("hello", "orange"), ("confirmed", "different revision")],
+)
+def test_confirmed_prefix_requires_full_cumulative_prefix(confirmed, revision):
     state = new_state(stable_commit_enabled=False)
-    state.apply_model_update("hello", processed_samples=1600)
+    state.apply_model_update(confirmed, processed_samples=1600)
     state.commit_pending()
 
-    assert event_pairs(state.apply_model_update("lo world", processed_samples=1600)) == [
-        ("partial", " world")
-    ]
+    with pytest.raises(ConfirmedPrefixConflict):
+        state.apply_model_update(revision, processed_samples=1600)
 
 
 def test_finish_emits_only_remaining_tail():
@@ -178,6 +181,14 @@ def test_empty_model_revision_clears_partial():
     assert event_pairs(state.apply_model_update("", processed_samples=1600)) == [
         ("partial", "")
     ]
+
+
+def test_whitespace_only_pending_text_clears_without_blank_sentence_final():
+    state = new_state(stable_commit_enabled=False)
+    state.apply_model_update("   ", processed_samples=1600)
+
+    assert event_pairs(state.commit_pending()) == [("partial", "")]
+    assert state.confirmed_text == ""
 
 
 def test_independent_segments_preserve_repeated_text():

@@ -221,7 +221,7 @@ format:      pcm_s16le
 chunk size:  100ms to 500ms recommended
 VAD commit:  1.5s continuous silence by default; the A10 stateful example uses 0.8s
 stable punctuation commit: enabled for stateful mode; 1.0s, 2 updates, 8 non-whitespace characters
-legacy punctuation commit: set ASR_STABLE_COMMIT_ENABLED=false, then use ASR_COMMIT_ON_PUNCTUATION
+legacy punctuation commit: stateful mode requires ASR_STABLE_COMMIT_ENABLED=false; chunked mode always honors ASR_COMMIT_ON_PUNCTUATION because stable confirmation only applies to cumulative stateful output
 ```
 
 Production stateful qwen vLLM mode:

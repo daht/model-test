@@ -119,9 +119,11 @@ class StreamingTranscriptState:
             self.stable.reset()
             return []
         sentence = self.partial_text.rstrip()
-        self.confirmed_text += sentence
         self.partial_text = ""
         self.stable.reset()
+        if not sentence:
+            return [self._event("partial", "")]
+        self.confirmed_text += sentence
         return [
             self._event("sentence_final", sentence),
             self._event("partial", ""),
@@ -153,11 +155,6 @@ class StreamingTranscriptState:
             return text
         if text.startswith(self.confirmed_text):
             return text[len(self.confirmed_text) :]
-        overlap = min(len(self.confirmed_text), len(text))
-        while overlap:
-            if self.confirmed_text.endswith(text[:overlap]):
-                return text[overlap:]
-            overlap -= 1
         raise ConfirmedPrefixConflict("model text conflicts with confirmed transcript prefix")
 
     def _commit_prefix(self, prefix: str) -> list[TranscriptEvent]:

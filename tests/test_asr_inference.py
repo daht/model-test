@@ -377,6 +377,63 @@ def test_coordinator_can_restart_cleanly_after_load_failure():
     assert snapshot.load_error is None
 
 
+def test_lazy_warmup_failure_stops_without_leaking_worker_thread():
+    async def scenario():
+        records = []
+
+        class FailingWarmupTranscriber(FakeTranscriber):
+            def warmup(self):
+                self.record("warmup")
+                raise RuntimeError("lazy warmup failed")
+
+        coordinator = ASRInferenceCoordinator(
+            settings(asr_eager_load=False),
+            lambda: FailingWarmupTranscriber(records),
+        )
+        await coordinator.start()
+        with pytest.raises(RuntimeError, match="lazy warmup failed"):
+            await coordinator.create_stream(None)
+        snapshot = coordinator.snapshot()
+        try:
+            await asyncio.wait_for(coordinator.stop(), timeout=0.5)
+        finally:
+            if coordinator.worker_alive:
+                shutdown = coordinator._new_job(
+                    "shutdown",
+                    (),
+                    None,
+                    priority=100,
+                    queue_timeout=1.0,
+                )
+                coordinator._jobs.put_nowait(shutdown)
+                await asyncio.to_thread(coordinator._thread.join, 1)
+        return coordinator, snapshot
+
+    coordinator, snapshot = asyncio.run(scenario())
+
+    assert snapshot.accepting is False
+    assert snapshot.load_error == "RuntimeError: model warmup failed"
+    assert coordinator.worker_alive is False
+
+
+def test_finished_and_aborted_sessions_do_not_leave_timing_entries():
+    async def scenario():
+        coordinator, _records, _holder = make_coordinator()
+        await coordinator.start()
+        finished_id = await coordinator.create_stream(None)
+        await coordinator.finish_stream(finished_id)
+        aborted_id = await coordinator.create_stream(None)
+        await coordinator.abort_stream(aborted_id)
+        timing_ids = set(coordinator._last_timings)
+        await coordinator.stop()
+        return timing_ids, finished_id, aborted_id
+
+    timing_ids, finished_id, aborted_id = asyncio.run(scenario())
+
+    assert finished_id not in timing_ids
+    assert aborted_id not in timing_ids
+
+
 def test_stream_chunk_transcription_runs_on_owner_thread_when_file_upload_is_disabled():
     async def scenario():
         coordinator, records, _holder = make_coordinator(asr_file_transcribe_enabled=False)

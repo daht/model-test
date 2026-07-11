@@ -393,11 +393,6 @@ class StreamingTranscriptState:
             return text
         if text.startswith(self.confirmed_text):
             return text[len(self.confirmed_text):]
-        overlap = min(len(self.confirmed_text), len(text))
-        while overlap:
-            if self.confirmed_text.endswith(text[:overlap]):
-                return text[overlap:]
-            overlap -= 1
         raise ConfirmedPrefixConflict("model text conflicts with confirmed transcript prefix")
 
     def _commit_prefix(self, prefix: str) -> list[TranscriptEvent]:
@@ -420,7 +415,7 @@ Move the existing punctuation constants and helpers from `app/asr_api.py` into t
 
 - [ ] **Step 4: Add edge-case tests before completing helpers**
 
-Add tests for transient punctuation, punctuation removal, abbreviation/decimal/domain parsing, closing quotes, mixed terminators, overlap continuation, VAD one-shot behavior, and empty model revisions. Use explicit processed sample counts; no test may patch `time.monotonic()` or sleep.
+Add tests for transient punctuation, punctuation removal, abbreviation/decimal/domain parsing, closing quotes, mixed terminators, strict confirmed-prefix conflicts, VAD one-shot behavior, and empty model revisions. Use explicit processed sample counts; no test may patch `time.monotonic()` or sleep.
 
 - [ ] **Step 5: Run focused state tests**
 

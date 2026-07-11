@@ -134,13 +134,7 @@ class ASRInferenceCoordinator:
         with self._lock:
             self._accepting = False
             thread = self._thread
-            load_failed = self._load_error is not None
         if not thread or not thread.is_alive():
-            return
-        if load_failed:
-            await asyncio.to_thread(thread.join, 10)
-            if thread.is_alive():
-                raise RuntimeError("ASR inference worker did not stop after load failure")
             return
         shutdown = self._new_job("shutdown", (), None, priority=100, queue_timeout=3600)
         await asyncio.to_thread(self._jobs.put, shutdown)
@@ -422,9 +416,6 @@ class ASRInferenceCoordinator:
             assert self._startup is not None
             self._startup.set_result(None)
 
-        if transcriber is None:
-            return
-
         while True:
             job = self._jobs.get()
             try:
@@ -449,6 +440,8 @@ class ASRInferenceCoordinator:
                     continue
 
                 if not warmed:
+                    if transcriber is None:
+                        raise ASRNotReady("ASR model failed to initialize")
                     try:
                         transcriber.warmup()
                         warmed = True
@@ -468,7 +461,13 @@ class ASRInferenceCoordinator:
                 inference_elapsed = time.monotonic() - inference_started
                 if job.session_id:
                     with self._lock:
-                        self._last_timings[job.session_id] = (max(queue_wait, 0.0), inference_elapsed)
+                        if job.session_id in self._active_sessions:
+                            self._last_timings[job.session_id] = (
+                                max(queue_wait, 0.0),
+                                inference_elapsed,
+                            )
+                        else:
+                            self._last_timings.pop(job.session_id, None)
                 logger.info(
                     "asr_inference_completed job_type=%s session_id=%s queue_wait_ms=%.3f inference_ms=%.3f rtf=%.3f",
                     job.action,
