@@ -181,3 +181,17 @@ def test_asr_smoke_rejects_non_positive_websocket_sequence():
 
     assert completed.returncode != 0
     assert "sequence" in completed.stdout + completed.stderr
+
+
+def test_asr_smoke_requires_ready_sequence_to_start_at_one():
+    completed = _run_sequence_smoke(ready_sequence=99, final_sequence=100)
+
+    assert completed.returncode != 0
+    assert "sequence" in completed.stdout + completed.stderr
+
+
+def test_asr_smoke_rejects_websocket_sequence_gaps():
+    completed = _run_sequence_smoke(ready_sequence=1, final_sequence=3)
+
+    assert completed.returncode != 0
+    assert "sequence" in completed.stdout + completed.stderr

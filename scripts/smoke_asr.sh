@@ -138,9 +138,11 @@ def require_sequence(event, previous_sequence):
     sequence = event.get("sequence")
     if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence <= 0:
         raise SystemExit(f"event sequence must be a positive integer, got {sequence!r}")
-    if sequence <= previous_sequence:
+    expected_sequence = previous_sequence + 1
+    if sequence != expected_sequence:
         raise SystemExit(
-            f"event sequence must strictly increase: previous={previous_sequence}, got={sequence}"
+            "event sequence must be continuous: "
+            f"expected={expected_sequence}, got={sequence}"
         )
     return sequence
 
