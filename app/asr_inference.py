@@ -429,6 +429,8 @@ class ASRInferenceCoordinator:
                     sessions.clear()
                     with self._lock:
                         self._active_sessions.clear()
+                        self._poisoned_sessions.clear()
+                        self._last_timings.clear()
                         self._ready = False
                     job.result.set_result(None)
                     return
@@ -556,13 +558,14 @@ class ASRInferenceCoordinator:
         if not poisoned:
             return
         session = sessions.pop(session_id, None)
-        if session is not None:
-            try:
+        try:
+            if session is not None:
                 session.abort()
-            finally:
-                with self._lock:
-                    self._active_sessions.discard(session_id)
-                    self._last_timings.pop(session_id, None)
+        finally:
+            with self._lock:
+                self._poisoned_sessions.discard(session_id)
+                self._active_sessions.discard(session_id)
+                self._last_timings.pop(session_id, None)
 
     def _require_session_admissible(self, session_id: str) -> None:
         with self._lock:

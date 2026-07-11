@@ -206,9 +206,17 @@ def test_running_timeout_poisons_and_removes_session():
         assert await asyncio.to_thread(holder["transcriber"].abort_called.wait, 1)
         with pytest.raises(ASRSessionPoisoned):
             await coordinator.add_audio(session_id, b"later", 16000)
+        barrier_id = await coordinator.create_stream(None)
+        await coordinator.abort_stream(barrier_id)
+        registries = (
+            set(coordinator._poisoned_sessions),
+            set(coordinator._active_sessions),
+            dict(coordinator._last_timings),
+        )
         await coordinator.stop()
 
         assert holder["transcriber"].sessions[0].abort_count == 1
+        assert registries == (set(), set(), {})
 
     asyncio.run(scenario())
 
@@ -432,6 +440,34 @@ def test_finished_and_aborted_sessions_do_not_leave_timing_entries():
 
     assert finished_id not in timing_ids
     assert aborted_id not in timing_ids
+
+
+def test_stop_and_restart_clear_all_session_registries():
+    async def scenario():
+        coordinator, _records, _holder = make_coordinator()
+        await coordinator.start()
+        session_id = await coordinator.create_stream(None)
+        await coordinator.add_audio(session_id, b"timed", 16000)
+        assert session_id in coordinator._last_timings
+        await coordinator.stop()
+        stopped_registries = (
+            set(coordinator._poisoned_sessions),
+            set(coordinator._active_sessions),
+            dict(coordinator._last_timings),
+        )
+        await coordinator.start()
+        restarted_registries = (
+            set(coordinator._poisoned_sessions),
+            set(coordinator._active_sessions),
+            dict(coordinator._last_timings),
+        )
+        await coordinator.stop()
+        return stopped_registries, restarted_registries
+
+    stopped, restarted = asyncio.run(scenario())
+
+    assert stopped == (set(), set(), {})
+    assert restarted == (set(), set(), {})
 
 
 def test_stream_chunk_transcription_runs_on_owner_thread_when_file_upload_is_disabled():
