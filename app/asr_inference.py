@@ -507,8 +507,15 @@ class ASRInferenceCoordinator:
             return sessions[session_id].add_pcm_s16le(pcm_bytes, sample_rate)
         if job.action == "finish_stream":
             (session_id,) = job.args
+            session = sessions[session_id]
             try:
-                return sessions[session_id].finish()
+                return session.finish()
+            except Exception:
+                try:
+                    session.abort()
+                except Exception:
+                    pass
+                raise
             finally:
                 sessions.pop(session_id, None)
                 with self._lock:

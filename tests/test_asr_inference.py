@@ -37,6 +37,8 @@ class FakeSession(ASRStreamingSession):
 
     def finish(self):
         self.owner.record("finish")
+        if getattr(self.owner, "finish_raises", False):
+            raise RuntimeError("fake finish failure")
         return StreamingTranscriptionResult(text=b"".join(self.chunks).decode(), language=self.language)
 
     def reset_segment(self):
@@ -224,6 +226,25 @@ def test_worker_continues_after_one_job_raises():
         assert result.text == "ok"
 
     asyncio.run(scenario())
+
+
+def test_finish_failure_aborts_and_removes_session():
+    async def scenario():
+        coordinator, _records, holder = make_coordinator()
+        await coordinator.start()
+        session_id = await coordinator.create_stream(None)
+        session = holder["transcriber"].sessions[0]
+        holder["transcriber"].finish_raises = True
+        with pytest.raises(RuntimeError, match="fake finish failure"):
+            await coordinator.finish_stream(session_id)
+        snapshot = coordinator.snapshot()
+        await coordinator.stop()
+        return session, snapshot
+
+    session, snapshot = asyncio.run(scenario())
+
+    assert session.abort_count == 1
+    assert snapshot.active_streams == 0
 
 
 def test_stop_rejects_new_jobs_and_joins_worker():
