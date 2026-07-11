@@ -42,6 +42,7 @@ target/
 /docker-codex.sh
 .DS_Store
 /.superpowers/
+/.worktrees/
 /sony-member-trade-starter/src/main/resources/application-local.yml
 /docs/superpowers/
 /.test/
