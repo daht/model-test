@@ -79,13 +79,13 @@ def test_onset_candidate_releases_full_candidate_and_exact_200ms_preroll():
     assert vad.state is VADEndpointState.IN_SPEECH
 
 
-def test_short_speech_burst_is_discarded_without_model_decode():
+def test_short_speech_burst_is_retained_without_model_decode():
     vad = detector([0.9, 0.8, 0.1, 0.01, 0.01])
 
     decisions = [vad.add_audio(pcm(2000)) for _ in range(5)]
 
     assert all(decision.audio_to_model == b"" for decision in decisions)
-    assert sum(decision.discarded_samples for decision in decisions) >= 2 * FRAME_SAMPLES
+    assert sum(decision.discarded_samples for decision in decisions) == 0
     assert vad.state is VADEndpointState.WAITING_FOR_SPEECH
 
 
@@ -106,6 +106,39 @@ def test_rejected_onset_transfers_preroll_without_duplicate_samples():
     ]
 
     assert released_values == [1, 2, 3, 4, 5, 6, 7]
+    assert len(released_values) + sum(
+        decision.discarded_samples for decision in decisions
+    ) == 7
+
+
+def test_endpoint_retains_only_silence_not_released_as_hangover():
+    vad = detector(
+        [0.9, 0.9, 0.1, 0.1, 0.1, 0.9, 0.9],
+        sample_rate=1000,
+        frame_samples=1,
+        min_speech_ms=2,
+        min_silence_ms=3,
+        hangover_ms=1,
+        pre_roll_ms=10,
+    )
+    decisions = []
+
+    for value in range(1, 8):
+        decision = vad.add_audio(pcm(value, samples=1))
+        decisions.append(decision)
+        if decision.endpoint:
+            decisions.append(vad.endpoint_finalized())
+
+    released = b"".join(decision.audio_to_model for decision in decisions)
+    released_values = [
+        int.from_bytes(released[index : index + 2], "little", signed=True)
+        for index in range(0, len(released), 2)
+    ]
+
+    assert released_values == [1, 2, 3, 4, 5, 6, 7]
+    assert len(released_values) + sum(
+        decision.discarded_samples for decision in decisions
+    ) == 7
 
 
 def test_trailing_silence_is_released_when_speech_resumes():

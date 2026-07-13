@@ -36,7 +36,7 @@ def verify_model_manifest(
     manifest_path: str | Path,
 ) -> ModelManifestMetadata:
     root = _require_model_directory(model_dir)
-    manifest = _require_regular_file(Path(manifest_path), "model manifest")
+    manifest = Path(manifest_path)
     source, revision, entries = _read_manifest(manifest)
     actual_files = _collect_model_files(root, excluded_file=manifest)
     expected_files = {entry.path for entry in entries}
@@ -132,8 +132,9 @@ def create_model_manifest(
 
 def _read_manifest(path: Path) -> tuple[str, str, list[_ManifestEntry]]:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        manifest_bytes = _read_manifest_bytes(path)
+        payload = json.loads(manifest_bytes.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
         raise ModelArtifactVerificationError("Model manifest is not valid JSON") from exc
     if not isinstance(payload, dict) or set(payload) != {
         "schema_version",
@@ -142,7 +143,10 @@ def _read_manifest(path: Path) -> tuple[str, str, list[_ManifestEntry]]:
         "files",
     }:
         raise ModelArtifactVerificationError("Model manifest schema is invalid")
-    if payload["schema_version"] != 1:
+    schema_version = payload["schema_version"]
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+        raise ModelArtifactVerificationError("Model manifest schema is invalid")
+    if schema_version != 1:
         raise ModelArtifactVerificationError("Unsupported model manifest schema")
     source = payload["source"]
     revision = payload["revision"]
@@ -188,6 +192,80 @@ def _read_manifest(path: Path) -> tuple[str, str, list[_ManifestEntry]]:
     return source.strip(), revision.strip(), entries
 
 
+def _read_manifest_bytes(path: Path) -> bytes:
+    try:
+        resolved_parent = path.parent.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ModelArtifactVerificationError("Model manifest does not exist") from exc
+    resolved = resolved_parent / path.name
+    if not path.name:
+        raise ModelArtifactVerificationError("Model manifest must be a regular file")
+
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None or os.stat not in os.supports_follow_symlinks:
+        raise ModelArtifactVerificationError(
+            "Safe model manifest verification is unsupported on this platform"
+        )
+    flags = (
+        os.O_RDONLY
+        | no_follow
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(resolved, flags)
+    except OSError as exc:
+        raise ModelArtifactVerificationError(
+            "Unable to open model manifest safely"
+        ) from exc
+
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ModelArtifactVerificationError(
+                "Model manifest must be a regular file"
+            )
+        chunks = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+    except OSError as exc:
+        raise ModelArtifactVerificationError(
+            "Unable to read model manifest safely"
+        ) from exc
+    finally:
+        os.close(descriptor)
+
+    manifest_bytes = b"".join(chunks)
+    try:
+        current = os.stat(resolved, follow_symlinks=False)
+    except OSError as exc:
+        raise ModelArtifactVerificationError(
+            "Model manifest changed during verification"
+        ) from exc
+    if (
+        _file_state(before) != _file_state(after)
+        or _file_state(after) != _file_state(current)
+        or len(manifest_bytes) != after.st_size
+    ):
+        raise ModelArtifactVerificationError(
+            "Model manifest changed during verification"
+        )
+    return manifest_bytes
+
+
+def _file_state(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
 def _require_model_directory(model_dir: str | Path) -> Path:
     requested_path = Path(model_dir)
     if requested_path.is_symlink():
@@ -199,20 +277,6 @@ def _require_model_directory(model_dir: str | Path) -> Path:
     if not root.is_dir() or root.is_symlink():
         raise ModelArtifactVerificationError("ASR model path must be a regular directory")
     return root
-
-
-def _require_regular_file(path: Path, description: str) -> Path:
-    if path.is_symlink():
-        raise ModelArtifactVerificationError(f"{description.capitalize()} must not be a symlink")
-    try:
-        resolved = path.resolve(strict=True)
-    except (OSError, RuntimeError) as exc:
-        raise ModelArtifactVerificationError(f"{description.capitalize()} does not exist") from exc
-    if not resolved.is_file():
-        raise ModelArtifactVerificationError(
-            f"{description.capitalize()} must be a regular file"
-        )
-    return resolved
 
 
 def _collect_model_files(

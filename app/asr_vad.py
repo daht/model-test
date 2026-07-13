@@ -283,8 +283,7 @@ class StreamingVADEndpointDetector:
                     self._candidate_speech_samples = 0
                     return audio, False, 0, tuple(transitions)
                 return b"", False, 0, tuple(transitions)
-            discarded = self._candidate_speech_samples
-            discarded += self._append_pre_roll(bytes(self._candidate) + frame)
+            discarded = self._append_pre_roll(bytes(self._candidate) + frame)
             self._candidate.clear()
             self._candidate_speech_samples = 0
             transitions.append(self._transition(VADEndpointState.WAITING_FOR_SPEECH))
@@ -311,9 +310,8 @@ class StreamingVADEndpointDetector:
         trailing = bytes(self._trailing)
         keep_bytes = min(len(trailing), self.hangover_samples * 2)
         audio = trailing[:keep_bytes]
-        discarded = (len(trailing) - keep_bytes) // 2
         self._pre_roll.clear()
-        self._append_pre_roll(trailing)
+        discarded = self._append_pre_roll(trailing[keep_bytes:])
         self._trailing.clear()
         transitions.append(self._transition(VADEndpointState.FINALIZING))
         logger.info(

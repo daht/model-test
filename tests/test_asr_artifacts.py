@@ -4,6 +4,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
+import app.asr_artifacts as asr_artifacts
 from app.asr import QwenASRTranscriber, QwenVLLMASRTranscriber
 from app.asr_artifacts import (
     ModelArtifactVerificationError,
@@ -21,11 +22,11 @@ def _entry(path, content):
     }
 
 
-def _write_manifest(path, entries):
+def _write_manifest(path, entries, *, schema_version=1):
     path.write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": schema_version,
                 "source": "unit-test-model-source",
                 "revision": "unit-test-immutable-revision",
                 "files": entries,
@@ -88,6 +89,110 @@ def test_model_manifest_rejects_symlinked_artifacts(tmp_path):
     )
 
     with pytest.raises(ModelArtifactVerificationError, match="symlink"):
+        verify_model_manifest(model_dir, manifest)
+
+
+def test_model_manifest_rejects_symlink_swap_before_manifest_read(
+    tmp_path,
+    monkeypatch,
+):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    content = b"approved-test-content"
+    (model_dir / "model.safetensors").write_bytes(content)
+    manifest = tmp_path / "manifest.json"
+    attacker_manifest = tmp_path / "attacker.json"
+    entries = [_entry("model.safetensors", content)]
+    _write_manifest(manifest, entries)
+    _write_manifest(attacker_manifest, entries)
+    original_read_manifest = asr_artifacts._read_manifest
+
+    def swap_then_read(path):
+        manifest.unlink()
+        manifest.symlink_to(attacker_manifest)
+        return original_read_manifest(path)
+
+    monkeypatch.setattr(asr_artifacts, "_read_manifest", swap_then_read)
+
+    with pytest.raises(ModelArtifactVerificationError, match="manifest"):
+        verify_model_manifest(model_dir, manifest)
+
+
+def test_model_manifest_rejects_content_mutation_during_descriptor_read(
+    tmp_path,
+    monkeypatch,
+):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    content = b"approved-test-content"
+    (model_dir / "model.safetensors").write_bytes(content)
+    manifest = tmp_path / "manifest.json"
+    _write_manifest(manifest, [_entry("model.safetensors", content)])
+    original_read = asr_artifacts.os.read
+    mutated = False
+
+    def read_then_mutate(descriptor, size):
+        nonlocal mutated
+        data = original_read(descriptor, size)
+        if data and not mutated:
+            mutated = True
+            with manifest.open("ab") as manifest_file:
+                manifest_file.write(b" ")
+        return data
+
+    monkeypatch.setattr(asr_artifacts.os, "read", read_then_mutate)
+
+    with pytest.raises(ModelArtifactVerificationError, match="changed"):
+        verify_model_manifest(model_dir, manifest)
+
+
+def test_model_manifest_rejects_path_replacement_during_descriptor_read(
+    tmp_path,
+    monkeypatch,
+):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    content = b"approved-test-content"
+    (model_dir / "model.safetensors").write_bytes(content)
+    manifest = tmp_path / "manifest.json"
+    replacement = tmp_path / "replacement.json"
+    entries = [_entry("model.safetensors", content)]
+    _write_manifest(manifest, entries)
+    _write_manifest(replacement, entries)
+    original_read = asr_artifacts.os.read
+    replaced = False
+
+    def read_then_replace(descriptor, size):
+        nonlocal replaced
+        data = original_read(descriptor, size)
+        if data and not replaced:
+            replaced = True
+            replacement.replace(manifest)
+        return data
+
+    monkeypatch.setattr(asr_artifacts.os, "read", read_then_replace)
+
+    with pytest.raises(ModelArtifactVerificationError, match="changed"):
+        verify_model_manifest(model_dir, manifest)
+
+
+@pytest.mark.parametrize("schema_version", [True, False, 1.0, "1", 2])
+def test_model_manifest_requires_exact_integer_schema_version(
+    tmp_path,
+    schema_version,
+):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    content = b"approved-test-content"
+    (model_dir / "model.safetensors").write_bytes(content)
+    manifest = tmp_path / "manifest.json"
+    _write_manifest(
+        manifest,
+        [_entry("model.safetensors", content)],
+        schema_version=schema_version,
+    )
+
+    with pytest.raises(ModelArtifactVerificationError, match="schema"):
         verify_model_manifest(model_dir, manifest)
 
 
