@@ -257,6 +257,7 @@ class StreamingVADEndpointDetector:
         if self.state is VADEndpointState.WAITING_FOR_SPEECH:
             if probability >= self.onset_threshold:
                 self._candidate = bytearray(self._pre_roll)
+                self._pre_roll.clear()
                 self._candidate.extend(frame)
                 self._candidate_speech_samples = self.frame_samples
                 transitions.append(self._transition(VADEndpointState.SPEECH_CANDIDATE))

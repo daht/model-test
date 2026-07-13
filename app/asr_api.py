@@ -264,6 +264,7 @@ class StreamingSessionController:
         self.accepted_samples = 0
         self.processing_debt_seconds = 0.0
         self.oldest_undecoded_age_seconds = 0.0
+        self.sustained_decoded_lag_seconds = 0.0
         self._model_work_seconds = 0.0
         self._undecoded_batches: deque[list[float]] = deque()
         self._lag_error_sent = False
@@ -343,7 +344,7 @@ class StreamingSessionController:
                 decision = self.vad.endpoint_finalized()
         result = await self._add_model_audio(pcm_bytes)
         silence_endpoint = self.silence.add_audio(pcm_bytes, 16000)
-        if result.segment_finished:
+        if result.last_snapshot.segment_finished:
             await self._commit_finished_segment(reset_endpoint_detector=False)
         elif silence_endpoint:
             await self.reset_segment()
@@ -359,7 +360,9 @@ class StreamingSessionController:
         result = None
         if decision.audio_to_model:
             result = await self._add_vad_audio(decision.audio_to_model)
-        if decision.endpoint and not (result and result.segment_finished):
+        if decision.endpoint and not (
+            result and result.last_snapshot.segment_finished
+        ):
             await self.reset_segment(reset_endpoint_detector=False)
 
     async def explicit_segment(self) -> None:
@@ -368,7 +371,7 @@ class StreamingSessionController:
             pending = self.vad.finish_input()
             if pending.audio_to_model:
                 result = await self._add_vad_audio(pending.audio_to_model)
-                if result and result.segment_finished:
+                if result and result.last_snapshot.segment_finished:
                     already_finalized = True
         if not already_finalized:
             await self.reset_segment(reset_endpoint_detector=False)
@@ -409,8 +412,14 @@ class StreamingSessionController:
             await self.fail("realtime_lag_exceeded", "ASR can no longer keep up in real time", 1013)
             raise _StreamClosed
         try:
-            if result.model_updated:
-                await self._apply_stream_result(result)
+            snapshots = tuple(result.snapshots())
+            for index, snapshot in enumerate(snapshots):
+                if snapshot.model_updated or snapshot.segment_finished:
+                    await self._apply_stream_result(snapshot)
+                if snapshot.segment_finished and index < len(snapshots) - 1:
+                    await self._commit_finished_segment(
+                        reset_endpoint_detector=False
+                    )
         except ConfirmedPrefixConflict as exc:
             await self.fail("transcript_conflict", "Model output conflicts with confirmed text", 1011)
             raise _StreamClosed from exc
@@ -424,7 +433,7 @@ class StreamingSessionController:
             result = await self._add_model_audio(
                 pcm_bytes[offset : offset + frame_bytes]
             )
-            if result.segment_finished:
+            if result.last_snapshot.segment_finished:
                 await self._commit_finished_segment(
                     reset_endpoint_detector=False
                 )
@@ -495,7 +504,7 @@ class StreamingSessionController:
             0.0, result.inference_seconds
         )
         self._model_work_seconds += processing_seconds
-        decoded_samples = result.decoded_samples_delta
+        decoded_samples = result.total_decoded_samples_delta
         decoded_seconds = (
             max(0, decoded_samples) / 16000
             if decoded_samples is not None
@@ -505,6 +514,22 @@ class StreamingSessionController:
             0.0,
             self.processing_debt_seconds + processing_seconds - decoded_seconds,
         )
+        if decoded_samples is not None and decoded_samples > 0:
+            self.sustained_decoded_lag_seconds = max(
+                0.0,
+                self.sustained_decoded_lag_seconds
+                + processing_seconds
+                - decoded_seconds,
+            )
+
+        oldest_age_during_call = 0.0
+        if self._undecoded_batches:
+            oldest = self._undecoded_batches[0]
+            oldest_age_during_call = max(
+                0.0,
+                now - oldest[1],
+                self._model_work_seconds - oldest[2],
+            )
 
         remaining_decoded = max(0, decoded_samples or 0)
         while remaining_decoded and self._undecoded_batches:
@@ -526,19 +551,27 @@ class StreamingSessionController:
             self.oldest_undecoded_age_seconds = 0.0
 
         logger.info(
-            "asr_stream_progress session_id=%s decoded_audio_seconds=%.3f queue_wait_ms=%.3f inference_ms=%.3f lag_debt_seconds=%.3f oldest_undecoded_age_seconds=%.3f",
+            "asr_stream_progress session_id=%s decoded_audio_seconds=%.3f queue_wait_ms=%.3f inference_ms=%.3f lag_debt_seconds=%.3f oldest_undecoded_age_seconds=%.3f sustained_decoded_lag_seconds=%.3f",
             self.session_id or "unassigned",
             decoded_seconds,
             max(0.0, result.queue_wait_seconds) * 1000,
             max(0.0, result.inference_seconds) * 1000,
             self.processing_debt_seconds,
             self.oldest_undecoded_age_seconds,
+            self.sustained_decoded_lag_seconds,
+        )
+        pending_audio_too_old = max(
+            oldest_age_during_call,
+            self.oldest_undecoded_age_seconds,
+        ) > self.settings.asr_max_undecoded_age_seconds
+        decoded_work_is_sustained_slow = (
+            self.sustained_decoded_lag_seconds
+            > self.settings.asr_max_connection_lag_seconds
         )
         exceeded = (
             self.processing_debt_seconds
             > self.settings.asr_max_connection_lag_seconds
-            and self.oldest_undecoded_age_seconds
-            > self.settings.asr_max_undecoded_age_seconds
+            and (pending_audio_too_old or decoded_work_is_sustained_slow)
         )
         if not exceeded or self._lag_error_sent:
             return False

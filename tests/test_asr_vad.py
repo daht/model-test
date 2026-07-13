@@ -89,6 +89,25 @@ def test_short_speech_burst_is_discarded_without_model_decode():
     assert vad.state is VADEndpointState.WAITING_FOR_SPEECH
 
 
+def test_rejected_onset_transfers_preroll_without_duplicate_samples():
+    vad = detector(
+        [0.01, 0.9, 0.01, 0.9, 0.9, 0.9, 0.9],
+        sample_rate=1000,
+        frame_samples=1,
+        min_speech_ms=4,
+        pre_roll_ms=10,
+    )
+
+    decisions = [vad.add_audio(pcm(value, samples=1)) for value in range(1, 8)]
+    released = b"".join(decision.audio_to_model for decision in decisions)
+    released_values = [
+        int.from_bytes(released[index : index + 2], "little", signed=True)
+        for index in range(0, len(released), 2)
+    ]
+
+    assert released_values == [1, 2, 3, 4, 5, 6, 7]
+
+
 def test_trailing_silence_is_released_when_speech_resumes():
     vad = detector([0.9, 0.9, 0.9, 0.1, 0.1, 0.8])
     speech = [pcm(1000 + index) for index in range(3)]

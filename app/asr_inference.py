@@ -533,8 +533,10 @@ class ASRInferenceCoordinator:
                         queue_wait_seconds=max(queue_wait, 0.0),
                         inference_seconds=inference_elapsed,
                     )
-                    if result.decoded_samples_delta is not None:
-                        decoded_audio_seconds = result.decoded_samples_delta / 16000
+                    if result.total_decoded_samples_delta is not None:
+                        decoded_audio_seconds = (
+                            result.total_decoded_samples_delta / 16000
+                        )
                 logger.info(
                     "asr_inference_completed job_type=%s session_id=%s queue_wait_ms=%.3f inference_ms=%.3f decoded_audio_seconds=%.3f decoded_rtf=%.3f",
                     job.action,

@@ -82,6 +82,7 @@ class StreamingTranscriptionResult:
     segment_finished: bool
     queue_wait_seconds: float
     inference_seconds: float
+    continuation: "StreamingTranscriptionResult | None"
 
     def __init__(
         self,
@@ -96,6 +97,7 @@ class StreamingTranscriptionResult:
         decoded_samples_delta: int | None = None,
         queue_wait_seconds: float = 0.0,
         inference_seconds: float = 0.0,
+        continuation: "StreamingTranscriptionResult | None" = None,
     ) -> None:
         self.segment_id = segment_id
         self.segment_text = text if segment_text is None else segment_text
@@ -109,6 +111,7 @@ class StreamingTranscriptionResult:
         self.segment_finished = segment_finished
         self.queue_wait_seconds = queue_wait_seconds
         self.inference_seconds = inference_seconds
+        self.continuation = continuation
 
     @property
     def text(self) -> str:
@@ -117,6 +120,23 @@ class StreamingTranscriptionResult:
     @property
     def processed_samples(self) -> int | None:
         return self.decoded_samples_delta
+
+    def snapshots(self):
+        current: StreamingTranscriptionResult | None = self
+        while current is not None:
+            yield current
+            current = current.continuation
+
+    @property
+    def last_snapshot(self) -> "StreamingTranscriptionResult":
+        return tuple(self.snapshots())[-1]
+
+    @property
+    def total_decoded_samples_delta(self) -> int | None:
+        snapshots = tuple(self.snapshots())
+        if any(snapshot.decoded_samples_delta is None for snapshot in snapshots):
+            return None
+        return sum(snapshot.decoded_samples_delta or 0 for snapshot in snapshots)
 
 
 class ASRStreamingSession:
@@ -352,37 +372,58 @@ class QwenVLLMStreamingSession(ASRStreamingSession):
                 pcm.byteswap()
         if self._segment_received_samples + sample_count > self._watchdog_samples:
             raise RuntimeError("ASR utterance state exceeded invariant watchdog")
+
+        results: list[StreamingTranscriptionResult] = []
+        offset = 0
+        while offset < sample_count:
+            segment_capacity = (
+                self._max_utterance_samples - self._segment_received_samples
+            )
+            piece_samples = min(sample_count - offset, segment_capacity)
+            piece = pcm[offset : offset + piece_samples]
+            offset += piece_samples
+
+            decoded_samples, model_updated = self._stream_piece(piece)
+            if self._segment_received_samples == self._max_utterance_samples:
+                flush_samples, flush_updated = self._finish_active_state()
+                decoded_samples += flush_samples
+                model_updated = model_updated or flush_updated
+                result = StreamingTranscriptionResult(
+                    segment_id=self._segment_id,
+                    segment_text=self._segment_text(),
+                    language=getattr(self.state, "language", self.language),
+                    decoded_samples_delta=decoded_samples,
+                    model_updated=model_updated,
+                    segment_finished=True,
+                )
+                results.append(result)
+                self._start_fresh_segment()
+                continue
+
+            results.append(
+                StreamingTranscriptionResult(
+                    segment_id=self._segment_id,
+                    segment_text=self._segment_text(),
+                    language=getattr(self.state, "language", self.language),
+                    decoded_samples_delta=decoded_samples,
+                    model_updated=model_updated,
+                )
+            )
+
+        for current, continuation in zip(results, results[1:]):
+            current.continuation = continuation
+        return results[0]
+
+    def _stream_piece(self, pcm) -> tuple[int, bool]:
         previous_chunk_id = self._chunk_id()
         previous_text = self._segment_text()
-        self._segment_received_samples += sample_count
-        self._undecoded_samples += sample_count
+        piece_samples = len(pcm)
+        self._segment_received_samples += piece_samples
+        self._undecoded_samples += piece_samples
         state = self.transcriber._streaming_transcribe(pcm, self.state)
         self.state = state
-        decoded_samples, model_updated = self._decode_progress(
+        return self._decode_progress(
             previous_chunk_id, previous_text
-        )
-        if self._segment_received_samples >= self._max_utterance_samples:
-            flush_samples, flush_updated = self._finish_active_state()
-            decoded_samples += flush_samples
-            model_updated = model_updated or flush_updated
-            text = self._segment_text()
-            language = getattr(self.state, "language", self.language)
-            result = StreamingTranscriptionResult(
-                segment_id=self._segment_id,
-                segment_text=text,
-                language=language,
-                decoded_samples_delta=decoded_samples,
-                model_updated=model_updated,
-                segment_finished=True,
-            )
-            self._start_fresh_segment()
-            return result
-        return StreamingTranscriptionResult(
-            segment_id=self._segment_id,
-            segment_text=self._segment_text(),
-            language=getattr(state, "language", self.language),
-            decoded_samples_delta=decoded_samples,
-            model_updated=model_updated,
         )
 
     def finish(self) -> StreamingTranscriptionResult:
@@ -515,8 +556,10 @@ class QwenVLLMASRTranscriber(ASRTranscriber):
                 update = session.add_pcm_s16le(
                     pcm[offset : offset + frame_bytes], 16000
                 )
-                decoded_samples += update.decoded_samples_delta or 0
-                model_updated = model_updated or update.model_updated
+                decoded_samples += update.total_decoded_samples_delta or 0
+                model_updated = model_updated or any(
+                    snapshot.model_updated for snapshot in update.snapshots()
+                )
             final = session.finish()
             decoded_samples += final.decoded_samples_delta or 0
             model_updated = model_updated or final.model_updated

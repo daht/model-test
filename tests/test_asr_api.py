@@ -404,6 +404,13 @@ def test_automatic_rollover_emits_ordered_segment_and_exact_final_text():
                         processed_samples=1600,
                         model_updated=True,
                         segment_finished=True,
+                        continuation=StreamingTranscriptionResult(
+                            segment_id=1,
+                            segment_text="丙",
+                            language="zh",
+                            decoded_samples_delta=800,
+                            model_updated=True,
+                        ),
                     ),
                     StreamingTranscriptionResult(
                         segment_id=1,
@@ -457,6 +464,7 @@ def test_automatic_rollover_emits_ordered_segment_and_exact_final_text():
         ("partial", "甲乙"),
         ("sentence_final", "甲乙"),
         ("partial", ""),
+        ("partial", "丙"),
         ("partial", "丙丁"),
         ("final", "丙丁"),
     ]
@@ -1306,6 +1314,117 @@ def test_sustained_real_lag_requires_debt_and_oldest_audio_age_and_fires_once():
     assert controller.oldest_undecoded_age_seconds >= 4.5
 
 
+def test_repeated_slow_fully_decoded_calls_trigger_sustained_lag_once():
+    from app.asr import StreamingTranscriptionResult
+
+    controller = asr_api.StreamingSessionController(
+        RecordingWebSocket(),
+        _protocol_settings(),
+        FakeCoordinator(),
+    )
+    result = StreamingTranscriptionResult(
+        segment_id=0,
+        segment_text="snapshot",
+        decoded_samples_delta=3200,
+        model_updated=True,
+        inference_seconds=1.0,
+    )
+
+    decisions = [
+        controller._observe_stream_progress(result, submitted_samples=3200)
+        for _ in range(6)
+    ]
+
+    assert decisions == [False, False, True, False, False, False]
+    assert controller.processing_debt_seconds == pytest.approx(4.8)
+    assert controller.oldest_undecoded_age_seconds == 0.0
+    assert controller.sustained_decoded_lag_seconds == pytest.approx(4.8)
+
+
+def test_slow_endpoint_flush_counts_toward_sustained_decoded_lag():
+    from app.asr import StreamingTranscriptionResult
+
+    controller = asr_api.StreamingSessionController(
+        RecordingWebSocket(),
+        _protocol_settings(),
+        FakeCoordinator(),
+    )
+    buffered = StreamingTranscriptionResult(
+        segment_id=0,
+        segment_text="",
+        decoded_samples_delta=0,
+        model_updated=False,
+        inference_seconds=0.1,
+    )
+    endpoint_flush = StreamingTranscriptionResult(
+        segment_id=0,
+        segment_text="final snapshot",
+        decoded_samples_delta=3200,
+        model_updated=True,
+        segment_finished=True,
+        inference_seconds=3.0,
+    )
+
+    assert (
+        controller._observe_stream_progress(buffered, submitted_samples=3200)
+        is False
+    )
+    assert (
+        controller._observe_stream_progress(endpoint_flush, submitted_samples=0)
+        is True
+    )
+
+
+def test_slow_endpoint_flush_emits_one_realtime_lag_error():
+    from app.asr import StreamingTranscriptionResult
+
+    class Coordinator(FakeCoordinator):
+        async def create_stream(self, _language):
+            return "session"
+
+        async def add_audio(self, _session_id, _pcm_bytes, _sample_rate):
+            return StreamingTranscriptionResult(
+                segment_id=0,
+                segment_text="",
+                decoded_samples_delta=0,
+                model_updated=False,
+                inference_seconds=0.1,
+            )
+
+        async def finish_segment(self, _session_id):
+            return StreamingTranscriptionResult(
+                segment_id=0,
+                segment_text="final snapshot",
+                decoded_samples_delta=3200,
+                model_updated=True,
+                segment_finished=True,
+                inference_seconds=3.0,
+            )
+
+        async def abort_stream(self, _session_id):
+            return None
+
+    async def scenario():
+        websocket = RecordingWebSocket()
+        controller = asr_api.StreamingSessionController(
+            websocket,
+            _protocol_settings(),
+            Coordinator(),
+        )
+        await controller.start("zh")
+        await controller.add_audio(_pcm_s16le_samples(1000, 3200))
+        with pytest.raises(asr_api._StreamClosed):
+            await controller.reset_segment()
+        return websocket
+
+    websocket = asyncio.run(scenario())
+
+    errors = [event for event in websocket.events if event["type"] == "error"]
+    assert len(errors) == 1
+    assert errors[0]["code"] == "realtime_lag_exceeded"
+    assert websocket.close_codes == [1013]
+
+
 def test_stream_v2_new_segment_snapshot_does_not_conflict_with_frozen_text():
     coordinator = ProtocolCoordinator(["confirmed", "confirmed", "unsafe"])
     _override_protocol(
@@ -2100,8 +2219,10 @@ def test_stateful_rollover_bounds_official_state_and_preserves_exact_text(monkey
     assert [result.segment_id for result in results if result.segment_finished] == [0, 1]
     assert len(finish_calls) == 2
     assert len(states) == 3
-    assert [state.total_samples for state in states[:2]] == [4800, 4800]
-    assert max(state.total_samples for state in states[:2]) <= 4000 + 1600
+    assert [state.total_samples for state in states] == [4000, 4000, 1600]
+    assert sum(state.total_samples for state in states) == 6 * 1600
+    assert results[2].continuation is not None
+    assert results[2].continuation.segment_id == 1
     assert session.add_pcm_s16le(b"\x00\x00" * 1600, 16000).segment_text == "戊"
     assert session.finish().segment_text == "戊"
 
