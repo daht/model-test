@@ -6,9 +6,9 @@ The recommended target is NVIDIA A10 24GB. The live ASR service uses one process
 
 ## Stateful ASR Production Contract
 
-The production path is `ASR_BACKEND=qwen_vllm` with `ASR_STREAM_MODE=stateful`. All model loading and calls run on one owner thread behind a bounded coordinator, so synchronous GPU work does not block the FastAPI event loop. `/health` is liveness only; `/ready` returns 200 only after model warmup succeeds and admission is open.
+The production path is `ASR_BACKEND=qwen_vllm` with `ASR_STREAM_MODE=stateful`. All model loading and calls run on one owner thread behind a bounded coordinator, so synchronous GPU work does not block the FastAPI event loop. `/health` is liveness only; `/ready` returns 200 only after the pinned Silero VAD asset loads and Qwen completes a real non-silent streaming decode warmup.
 
-Live streaming defaults to `ASR_FILE_TRANSCRIBE_ENABLED=false` because an in-progress file transcription cannot be preempted. Run file transcription on a separate batch ASR instance. Stable punctuation is measured using processed audio samples, not wall-clock or network delay.
+Live streaming defaults to `ASR_FILE_TRANSCRIBE_ENABLED=false` because an in-progress file transcription cannot be preempted. Run file transcription on a separate batch ASR instance. Stateful punctuation and repeated text are always replaceable; only a VAD endpoint, explicit `segment`, the 30-second utterance boundary, or `end` can freeze text.
 
 Protocol version 2 guarantees monotonically increasing `sequence` values. Append `sentence_final` events permanently and replace the displayed tail with every `partial` or `final`. A commit is followed by `partial: ""` when no unconfirmed tail remains.
 
@@ -18,6 +18,11 @@ validation requires their worst-case buffered audio to fit within
 `ASR_MAX_CONNECTION_LAG_SECONDS`; change all three values together. Shutdown
 stops admission immediately and waits at most `ASR_SHUTDOWN_GRACE_SECONDS` for
 an already-running model call.
+
+The ASR image pins `qwen-asr[vllm]==0.0.6`, `vllm==0.14.0`, and
+`onnxruntime==1.23.2`. It downloads Silero VAD v6.2.1 only during image build,
+verifies SHA256 `1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3`,
+and includes the upstream MIT license. Runtime startup never downloads VAD assets.
 
 ## Files
 
@@ -104,16 +109,20 @@ ASR_MODEL_ID=/models/Qwen3-ASR-1.7B-hf
 ASR_BACKEND=qwen_vllm
 ASR_STREAM_MODE=stateful
 ASR_STREAM_CHUNK_SECONDS=1.0
-ASR_STREAM_ROLLOVER_SECONDS=120.0
+ASR_MAX_UTTERANCE_SECONDS=30.0
+ASR_STATE_WATCHDOG_SECONDS=120.0
 ASR_VLLM_GPU_MEMORY_UTILIZATION=0.8
 ASR_VLLM_MAX_NEW_TOKENS=32
 ASR_STREAM_UNFIXED_CHUNK_NUM=2
 ASR_STREAM_UNFIXED_TOKEN_NUM=5
-ASR_VAD_SILENCE_SECONDS=0.8
-ASR_STABLE_COMMIT_ENABLED=true
-ASR_STABLE_COMMIT_SECONDS=1.0
-ASR_STABLE_COMMIT_MIN_CHARS=8
-ASR_STABLE_COMMIT_MIN_UPDATES=2
+ASR_VAD_MODEL_VERSION=6.2.1
+ASR_VAD_MODEL_SHA256=1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3
+ASR_VAD_ONSET_THRESHOLD=0.65
+ASR_VAD_OFFSET_THRESHOLD=0.35
+ASR_VAD_MIN_SPEECH_MS=250
+ASR_VAD_MIN_SILENCE_MS=800
+ASR_VAD_HANGOVER_MS=160
+ASR_VAD_PRE_ROLL_MS=200
 TTS_MODEL_ID=/models/CosyVoice
 TTS_BACKEND=cosyvoice
 TTS_COSYVOICE_REPO=/opt/CosyVoice
@@ -319,7 +328,7 @@ Then the client sends binary PCM chunks. The server returns:
 {"type":"final","text":"...","sequence":5}
 ```
 
-`partial` is the current unconfirmed streaming text and is replaceable immediately, including revisions that add or remove model-generated punctuation. In stateful mode, stable punctuation confirmation is enabled by default: the earliest punctuated prefix with at least 8 non-whitespace characters becomes `sentence_final` only after the exact prefix remains unchanged for 1.0 second and at least two updates. VAD remains the fallback and force-commits pending text after `ASR_VAD_SILENCE_SECONDS` of continuous silence. `sentence_final` will not be sent again or changed by later messages, and a following `partial` contains only the remaining uncommitted tail. Set `ASR_STABLE_COMMIT_ENABLED=false` to disable stable confirmation; stateful mode then honors the legacy `ASR_COMMIT_ON_PUNCTUATION` setting. Chunked mode always honors `ASR_COMMIT_ON_PUNCTUATION` because stable confirmation applies only to cumulative stateful output. On `end`, `final` contains only the remaining uncommitted text, so clients should render:
+`partial` is the current segment snapshot and is replaceable immediately, including revisions that add or remove model-generated punctuation. Silero VAD uses onset/offset hysteresis, a 250ms minimum speech duration, 800ms trailing silence, 160ms hangover, and a 200ms rolling pre-roll. Silence/noise and short bursts never reach Qwen. `ASR_COMMIT_ON_PUNCTUATION` and `ASR_STABLE_COMMIT_*` remain accepted for compatibility but are reported and applied as false in stateful mode. On `end`, `final` contains only the remaining unconfirmed segment, so clients should render:
 
 ```text
 display_text = all sentence_final text in order + latest partial or final tail
@@ -363,15 +372,16 @@ Stateful qwen vLLM streaming uses these production settings:
 ASR_BACKEND=qwen_vllm
 ASR_STREAM_MODE=stateful
 ASR_STREAM_CHUNK_SECONDS=1.0
+ASR_MAX_UTTERANCE_SECONDS=30.0
+ASR_STATE_WATCHDOG_SECONDS=120.0
 ASR_VLLM_GPU_MEMORY_UTILIZATION=0.8
 ASR_VLLM_MAX_NEW_TOKENS=32
 ASR_STREAM_UNFIXED_CHUNK_NUM=2
 ASR_STREAM_UNFIXED_TOKEN_NUM=5
-ASR_VAD_SILENCE_SECONDS=0.8
-ASR_STABLE_COMMIT_ENABLED=true
-ASR_STABLE_COMMIT_SECONDS=1.0
-ASR_STABLE_COMMIT_MIN_CHARS=8
-ASR_STABLE_COMMIT_MIN_UPDATES=2
+ASR_VAD_MIN_SPEECH_MS=250
+ASR_VAD_MIN_SILENCE_MS=800
+ASR_VAD_HANGOVER_MS=160
+ASR_VAD_PRE_ROLL_MS=200
 SERVICE=qwen-asr-api BASE_URL=http://127.0.0.1:8002 scripts/update_service.sh build
 ```
 
@@ -381,7 +391,7 @@ Smoke-test the expected ASR mode:
 API_KEY=your-production-api-key \
 EXPECT_ASR_STREAM_MODE=stateful \
 EXPECT_ASR_BACKEND=qwen_vllm \
-EXPECT_ASR_STABLE_COMMIT_ENABLED=true \
+EXPECT_ASR_STABLE_COMMIT_ENABLED=false \
 BASE_URL=http://127.0.0.1:8002 \
 scripts/smoke_asr.sh
 ```

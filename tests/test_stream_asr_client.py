@@ -1,3 +1,8 @@
+import argparse
+import asyncio
+
+import pytest
+
 from scripts import stream_asr_client
 
 
@@ -36,3 +41,80 @@ def test_error_payload_is_not_treated_as_transcript():
     state = stream_asr_client.DisplayState()
 
     assert state.apply({"type": "error", "code": "server_busy", "text": "secret"}) is None
+
+
+def test_server_close_cancels_sender_and_reaps_ffmpeg_without_task_leak():
+    class BlockingStdout:
+        async def read(self, _size):
+            await asyncio.Event().wait()
+
+    class Process:
+        def __init__(self):
+            self.stdout = BlockingStdout()
+            self.returncode = None
+            self.terminated = False
+            self.killed = False
+            self._killed = asyncio.Event()
+
+        def terminate(self):
+            self.terminated = True
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+            self._killed.set()
+
+        async def wait(self):
+            await self._killed.wait()
+            return self.returncode
+
+    class ClosedWebSocket:
+        async def send(self, _payload):
+            return None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+    async def scenario():
+        process = Process()
+        args = argparse.Namespace(
+            chunk_ms=200,
+            realtime=False,
+            print_mode="events",
+        )
+        with pytest.raises(stream_asr_client.StreamClientError, match="before final"):
+            await asyncio.wait_for(
+                stream_asr_client.run_stream_tasks(
+                    ClosedWebSocket(),
+                    process,
+                    args,
+                    chunk_size=6400,
+                    sequence_tracker=stream_asr_client.SequenceTracker(),
+                ),
+                timeout=2.0,
+            )
+        return process
+
+    process = asyncio.run(scenario())
+
+    assert process.terminated is True
+    assert process.killed is True
+
+
+def test_business_error_exits_cleanly_without_traceback(monkeypatch, capsys):
+    async def fail(_args):
+        raise stream_asr_client.StreamClientError("server closed before final")
+
+    monkeypatch.setattr(stream_asr_client, "parse_args", lambda: object())
+    monkeypatch.setattr(stream_asr_client, "stream_audio", fail)
+
+    with pytest.raises(SystemExit) as exc_info:
+        stream_asr_client.main()
+
+    captured = capsys.readouterr()
+    assert exc_info.value.code == 2
+    assert "ASR stream failed: server closed before final" in captured.err
+    assert "Traceback" not in captured.err

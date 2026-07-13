@@ -219,26 +219,33 @@ sample_rate: 16000
 channels:    1
 format:      pcm_s16le
 chunk size:  100ms to 500ms recommended
-VAD commit:  1.5s continuous silence by default; the A10 stateful example uses 0.8s
-stable punctuation commit: enabled for stateful mode; 1.0s, 2 updates, 8 non-whitespace characters
-legacy punctuation commit: stateful mode requires ASR_STABLE_COMMIT_ENABLED=false; chunked mode always honors ASR_COMMIT_ON_PUNCTUATION because stable confirmation only applies to cumulative stateful output
+endpointing: pinned Silero VAD v6.2.1 on CPU with onset/offset hysteresis
+speech/silence: 250ms minimum speech, 800ms minimum trailing silence, 160ms hangover
+pre-roll: 200ms rolling audio plus every onset-candidate frame
+immutable commits: VAD endpoint, explicit segment, 30s utterance boundary, or end only
 ```
 
 Production stateful qwen vLLM mode:
+
+The image contract is `qwen-asr 0.0.6`, `vLLM 0.14.0`, ONNX Runtime 1.23.2,
+and Silero VAD v6.2.1 with SHA256
+`1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3`.
+VAD runs only on `CPUExecutionProvider` with bounded intra/inter-op threads.
 
 ```bash
 ASR_BACKEND=qwen_vllm
 ASR_STREAM_MODE=stateful
 ASR_STREAM_CHUNK_SECONDS=1.0
+ASR_MAX_UTTERANCE_SECONDS=30.0
+ASR_STATE_WATCHDOG_SECONDS=120.0
 ASR_VLLM_GPU_MEMORY_UTILIZATION=0.8
 ASR_VLLM_MAX_NEW_TOKENS=32
 ASR_STREAM_UNFIXED_CHUNK_NUM=2
 ASR_STREAM_UNFIXED_TOKEN_NUM=5
-ASR_VAD_SILENCE_SECONDS=0.8
-ASR_STABLE_COMMIT_ENABLED=true
-ASR_STABLE_COMMIT_SECONDS=1.0
-ASR_STABLE_COMMIT_MIN_CHARS=8
-ASR_STABLE_COMMIT_MIN_UPDATES=2
+ASR_VAD_MIN_SPEECH_MS=250
+ASR_VAD_MIN_SILENCE_MS=800
+ASR_VAD_HANGOVER_MS=160
+ASR_VAD_PRE_ROLL_MS=200
 SERVICE=qwen-asr-api BASE_URL=http://127.0.0.1:8002 scripts/update_service.sh build
 ```
 
@@ -289,7 +296,7 @@ Server committed sentence response:
 }
 ```
 
-`sentence_final` text is confirmed and will not change. Stability is measured from processed audio time (`processed samples / 16000`), so fast file replay and network pauses cannot change the commit decision. A commit always emits the remaining complete `partial`, including an empty string. VAD remains a force-commit fallback after `ASR_VAD_SILENCE_SECONDS` of continuous silence.
+`sentence_final` text is confirmed and will not change. Stateful punctuation or repeated snapshots never make text immutable. A VAD endpoint, explicit `segment`, or the 30-second normal utterance boundary first flushes the official Qwen state, applies its final segment snapshot, emits at most one non-empty `sentence_final`, then clears `partial`.
 
 End the stream:
 
@@ -307,7 +314,7 @@ Clear the pending server audio buffer without closing the connection:
 }
 ```
 
-Use `segment` during long-running listening when the client wants to discard pending server audio without closing the socket. `segment` is not a commit command; it resets the stateful punctuation tracker and silence detector.
+Use `segment` when the client needs an explicit utterance boundary without closing the socket. It flushes and finalizes the current non-empty segment exactly once, then initializes a fresh official Qwen streaming state.
 
 Server final response:
 
@@ -321,7 +328,7 @@ Server final response:
 
 `final` is sent only after `end` and contains the remaining uncommitted text. It does not repeat text already delivered by `sentence_final`. The completed transcript is all `sentence_final` messages in order plus the `final` text.
 
-Every version 2 event, including `ready` and `error`, has a strictly increasing `sequence`. Stable error codes include `invalid_start`, `invalid_language`, `invalid_audio_frame`, `frame_too_large`, `server_busy`, `realtime_lag_exceeded`, `session_timeout`, `inference_timeout`, and `transcript_conflict`. Protocol errors close with 1003, policy/time limits with 1008, oversized frames with 1009, model/state failures with 1011, and overload with 1013.
+Every version 2 event, including `ready` and `error`, has a strictly increasing `sequence`. Stable error codes include `invalid_start`, `invalid_language`, `invalid_audio_frame`, `frame_too_large`, `server_busy`, `realtime_lag_exceeded`, `session_timeout`, and `inference_timeout`. Protocol errors close with 1003, policy/time limits with 1008, oversized frames with 1009, model/state failures with 1011, and overload with 1013.
 
 The server limits active streams, queue jobs, queued audio seconds, per-connection lag, frame bytes, idle time, session time, and cumulative audio duration. It never accepts unbounded real-time backlog.
 
@@ -346,7 +353,7 @@ python3 scripts/stream_asr_client.py /path/to/audio.wav \
   --realtime
 ```
 
-`--print-mode display` renders the client-visible transcript as all confirmed `sentence_final` text plus the latest replaceable `partial` or `final` tail. For deployment smoke checks, set `EXPECT_ASR_STREAM_MODE=stateful`, `EXPECT_ASR_BACKEND=qwen_vllm`, and `EXPECT_ASR_STABLE_COMMIT_ENABLED=true` when running `scripts/smoke_asr.sh`.
+`--print-mode display` renders the client-visible transcript as all confirmed `sentence_final` text plus the latest replaceable `partial` or `final` tail. For deployment smoke checks, set `EXPECT_ASR_STREAM_MODE=stateful`, `EXPECT_ASR_BACKEND=qwen_vllm`, and `EXPECT_ASR_STABLE_COMMIT_ENABLED=false` when running `scripts/smoke_asr.sh`. The smoke sends real non-silent PCM and requires continuous sequences, exactly one `final`, and a normal close.
 
 ## TTS Synthesis
 

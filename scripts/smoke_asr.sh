@@ -73,11 +73,12 @@ if expected_stable_commit:
 PY
 fi
 
-echo "WebSocket smoke: start -> ready -> end -> final"
+echo "WebSocket smoke: start -> ready -> audio -> end -> final -> close"
 BASE_URL="${BASE_URL}" API_KEY="${API_KEY}" LANGUAGE="${LANGUAGE}" python3 - <<'PY'
 import base64
 import hashlib
 import json
+import math
 import os
 import socket
 import ssl
@@ -197,11 +198,18 @@ if opcode != 1 or ready.get("type") != "ready":
     raise SystemExit(f"expected ready, got {ready!r}")
 last_sequence = require_sequence(ready, 0)
 
+pcm = b"".join(
+    struct.pack("<h", int(8000 * math.sin(2 * math.pi * 440 * index / 16000)))
+    for index in range(16000)
+)
+send_frame(connection, 2, pcm[:16000])
+send_frame(connection, 2, pcm[16000:])
 send_frame(connection, 1, json.dumps({"type": "end"}))
+final_count = 0
 while True:
     opcode, payload = receive_frame(connection)
     if opcode == 8:
-        raise SystemExit("WebSocket closed before final")
+        break
     if opcode == 9:
         send_frame(connection, 10, payload)
         continue
@@ -212,10 +220,12 @@ while True:
     if event.get("type") == "error":
         raise SystemExit(f"ASR WebSocket error: {event!r}")
     if event.get("type") == "final":
-        break
-if "text" not in event:
-    raise SystemExit(f"expected final with text, got {event!r}")
-print(json.dumps(event, ensure_ascii=False))
+        final_count += 1
+        if "text" not in event:
+            raise SystemExit(f"expected final with text, got {event!r}")
+        print(json.dumps(event, ensure_ascii=False))
+if final_count != 1:
+    raise SystemExit(f"expected exactly one final, got {final_count}")
 connection.close()
 PY
 

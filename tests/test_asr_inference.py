@@ -159,6 +159,22 @@ def test_same_session_sequential_calls_complete_in_submission_order():
     asyncio.run(scenario())
 
 
+def test_stream_result_carries_atomic_queue_and_inference_timings():
+    async def scenario():
+        coordinator, _records, _holder = make_coordinator()
+        await coordinator.start()
+        session_id = await coordinator.create_stream("en")
+        result = await coordinator.add_audio(session_id, b"first", 16000)
+        await coordinator.stop()
+        return coordinator, result
+
+    coordinator, result = asyncio.run(scenario())
+
+    assert result.queue_wait_seconds > 0
+    assert result.inference_seconds > 0
+    assert not hasattr(coordinator, "session_timing")
+
+
 def test_queue_full_raises_asr_queue_full():
     async def scenario():
         coordinator, _records, holder = make_coordinator(
@@ -228,12 +244,11 @@ def test_running_timeout_poisons_and_removes_session():
         registries = (
             set(coordinator._poisoned_sessions),
             set(coordinator._active_sessions),
-            dict(coordinator._last_timings),
         )
         await coordinator.stop()
 
         assert holder["transcriber"].sessions[0].abort_count == 1
-        assert registries == (set(), set(), {})
+        assert registries == (set(), set())
 
     asyncio.run(scenario())
 
@@ -709,7 +724,6 @@ def test_poison_abort_failure_isolated_and_worker_remains_ready():
         registries = (
             set(coordinator._poisoned_sessions),
             set(coordinator._active_sessions),
-            dict(coordinator._last_timings),
         )
         worker_alive = coordinator.worker_alive
         if worker_alive:
@@ -724,7 +738,7 @@ def test_poison_abort_failure_isolated_and_worker_remains_ready():
     assert worker_alive is True
     assert snapshot.ready is True
     assert snapshot.accepting is True
-    assert registries == (set(), set(), {})
+    assert registries == (set(), set())
 
 
 def test_unexpected_worker_exit_clears_cached_readiness():
@@ -1143,7 +1157,7 @@ def test_stop_is_bounded_when_running_call_blocks_and_business_queue_is_full():
     assert worker_alive is False
 
 
-def test_finished_and_aborted_sessions_do_not_leave_timing_entries():
+def test_finished_and_aborted_sessions_need_no_timing_registry():
     async def scenario():
         coordinator, _records, _holder = make_coordinator()
         await coordinator.start()
@@ -1151,14 +1165,14 @@ def test_finished_and_aborted_sessions_do_not_leave_timing_entries():
         await coordinator.finish_stream(finished_id)
         aborted_id = await coordinator.create_stream(None)
         await coordinator.abort_stream(aborted_id)
-        timing_ids = set(coordinator._last_timings)
+        has_timing_registry = hasattr(coordinator, "_last_timings")
         await coordinator.stop()
-        return timing_ids, finished_id, aborted_id
+        return has_timing_registry, finished_id, aborted_id
 
-    timing_ids, finished_id, aborted_id = asyncio.run(scenario())
+    has_timing_registry, finished_id, aborted_id = asyncio.run(scenario())
 
-    assert finished_id not in timing_ids
-    assert aborted_id not in timing_ids
+    assert has_timing_registry is False
+    assert finished_id != aborted_id
 
 
 def test_stop_and_restart_clear_all_session_registries():
@@ -1166,27 +1180,25 @@ def test_stop_and_restart_clear_all_session_registries():
         coordinator, _records, _holder = make_coordinator()
         await coordinator.start()
         session_id = await coordinator.create_stream(None)
-        await coordinator.add_audio(session_id, b"timed", 16000)
-        assert session_id in coordinator._last_timings
+        result = await coordinator.add_audio(session_id, b"timed", 16000)
+        assert result.inference_seconds > 0
         await coordinator.stop()
         stopped_registries = (
             set(coordinator._poisoned_sessions),
             set(coordinator._active_sessions),
-            dict(coordinator._last_timings),
         )
         await coordinator.start()
         restarted_registries = (
             set(coordinator._poisoned_sessions),
             set(coordinator._active_sessions),
-            dict(coordinator._last_timings),
         )
         await coordinator.stop()
         return stopped_registries, restarted_registries
 
     stopped, restarted = asyncio.run(scenario())
 
-    assert stopped == (set(), set(), {})
-    assert restarted == (set(), set(), {})
+    assert stopped == (set(), set())
+    assert restarted == (set(), set())
 
 
 def test_stream_chunk_transcription_runs_on_owner_thread_when_file_upload_is_disabled():

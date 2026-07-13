@@ -2,6 +2,7 @@ import os
 import logging
 import threading
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -112,16 +113,18 @@ class ProtocolCoordinator(FakeCoordinator):
         update = next(self.updates)
         if isinstance(update, StreamingTranscriptionResult):
             self.latest_text = update.text
-            return update
+            return self._with_timing(update)
         self.latest_text = update
-        return StreamingTranscriptionResult(update, "zh")
+        return self._with_timing(StreamingTranscriptionResult(update, "zh"))
 
     async def finish_stream(self, _session_id):
         from app.asr import StreamingTranscriptionResult
 
         await self._delay("finish")
         self.completed_operations.append("finish")
-        return StreamingTranscriptionResult(self.final_text or self.latest_text, "zh")
+        return self._with_timing(
+            StreamingTranscriptionResult(self.final_text or self.latest_text, "zh")
+        )
 
     async def transcribe_stream_chunk(
         self,
@@ -142,7 +145,9 @@ class ProtocolCoordinator(FakeCoordinator):
         self.reset_count += 1
         from app.asr import StreamingTranscriptionResult
 
-        return StreamingTranscriptionResult(self.final_text or self.latest_text, "zh")
+        return self._with_timing(
+            StreamingTranscriptionResult(self.final_text or self.latest_text, "zh")
+        )
 
     async def finish_segment(self, session_id):
         return await self.reset_segment(session_id)
@@ -156,6 +161,17 @@ class ProtocolCoordinator(FakeCoordinator):
 
             time.sleep(self.timing_delay)
         return self.timing
+
+    def _with_timing(self, result):
+        if self.timing_delay:
+            import time
+
+            time.sleep(self.timing_delay)
+        return replace(
+            result,
+            queue_wait_seconds=self.timing[0],
+            inference_seconds=self.timing[1],
+        )
 
     async def _delay(self, operation):
         delay = self.operation_delays.get(operation, 0.0)
@@ -244,7 +260,11 @@ def test_vad_segment_finish_flushes_buffered_audio_and_keeps_session_usable():
                         "", "zh", processed_samples=0, model_updated=False
                     ),
                     StreamingTranscriptionResult(
-                        "尾音继续", "zh", processed_samples=1600, model_updated=True
+                        segment_id=1,
+                        segment_text="继续",
+                        language="zh",
+                        decoded_samples_delta=1600,
+                        model_updated=True,
                     ),
                 ]
             )
@@ -259,11 +279,12 @@ def test_vad_segment_finish_flushes_buffered_audio_and_keeps_session_usable():
         async def finish_segment(self, _session_id):
             self.segment_finishes += 1
             return StreamingTranscriptionResult(
-                "尾音",
-                "zh",
-                processed_samples=14400,
-                model_updated=True,
-                segment_finished=True,
+                    "尾音",
+                    "zh",
+                    processed_samples=14400,
+                    model_updated=True,
+                    segment_finished=True,
+                    segment_id=0,
             )
 
         async def abort_stream(self, _session_id):
@@ -385,7 +406,11 @@ def test_automatic_rollover_emits_ordered_segment_and_exact_final_text():
                         segment_finished=True,
                     ),
                     StreamingTranscriptionResult(
-                        "甲乙丙丁", "zh", processed_samples=1600, model_updated=True
+                        segment_id=1,
+                        segment_text="丙丁",
+                        language="zh",
+                        decoded_samples_delta=1600,
+                        model_updated=True,
                     ),
                 ]
             )
@@ -398,7 +423,11 @@ def test_automatic_rollover_emits_ordered_segment_and_exact_final_text():
 
         async def finish_stream(self, _session_id):
             return StreamingTranscriptionResult(
-                "甲乙丙丁", "zh", processed_samples=0, model_updated=False
+                segment_id=1,
+                segment_text="丙丁",
+                language="zh",
+                decoded_samples_delta=0,
+                model_updated=False,
             )
 
         async def abort_stream(self, _session_id):
@@ -793,6 +822,7 @@ def test_stream_info_reports_streaming_mode_and_stateful_settings(monkeypatch):
     monkeypatch.setenv("ASR_STABLE_COMMIT_SECONDS", "1.0")
     monkeypatch.setenv("ASR_STABLE_COMMIT_MIN_CHARS", "8")
     monkeypatch.setenv("ASR_STABLE_COMMIT_MIN_UPDATES", "2")
+    monkeypatch.setenv("ASR_COMMIT_ON_PUNCTUATION", "true")
 
     try:
         response = client.get("/v1/transcribe/stream-info")
@@ -810,10 +840,20 @@ def test_stream_info_reports_streaming_mode_and_stateful_settings(monkeypatch):
     assert body["audio_format"]["stateful"]["unfixed_token_num"] == 5
     assert body["audio_format"]["stateful"]["vllm_gpu_memory_utilization"] == 0.8
     assert body["audio_format"]["stateful"]["vllm_max_new_tokens"] == 32
-    assert body["audio_format"]["stateful"]["stable_commit_enabled"] is True
+    assert body["audio_format"]["stateful"]["stable_commit_enabled"] is False
     assert body["audio_format"]["stateful"]["stable_commit_seconds"] == 1.0
     assert body["audio_format"]["stateful"]["stable_commit_min_chars"] == 8
     assert body["audio_format"]["stateful"]["stable_commit_min_updates"] == 2
+    assert body["audio_format"]["commit_on_punctuation"] is False
+    endpointing = body["audio_format"]["endpointing"]
+    assert endpointing["backend"] == "silero_onnx_cpu"
+    assert endpointing["immutable_commit_source"] == (
+        "vad_endpoint_explicit_segment_or_forced_boundary"
+    )
+    assert endpointing["pre_roll_ms"] == 200
+    assert endpointing["model_version"] == "6.2.1"
+    assert endpointing["normal_utterance_seconds"] == 30.0
+    assert endpointing["invariant_watchdog_seconds"] == 120.0
 
 
 @pytest.mark.parametrize(
@@ -939,6 +979,7 @@ def test_stream_v2_closes_when_realtime_lag_limit_is_exceeded():
     _override_protocol(
         coordinator,
         asr_max_connection_lag_seconds=1.0,
+        asr_max_undecoded_age_seconds=1.0,
         asr_ws_max_queue=2,
     )
     try:
@@ -962,6 +1003,7 @@ def test_stream_v2_accumulates_realtime_processing_debt():
     _override_protocol(
         coordinator,
         asr_max_connection_lag_seconds=1.0,
+        asr_max_undecoded_age_seconds=3.0,
         asr_ws_max_queue=2,
     )
     frame = _pcm_s16le_samples(1000, 8000)
@@ -1009,23 +1051,262 @@ def test_stream_v2_sequences_reconstruct_without_duplication():
             _start_stream(websocket, expect_sequence=True)
             websocket.send_bytes(_pcm_s16le_samples(1000, 8000))
             first = websocket.receive_json()
-            websocket.send_bytes(_pcm_s16le_samples(1000, 8000))
-            websocket.send_bytes(_pcm_s16le_samples(1000, 8000))
-            committed = websocket.receive_json()
-            empty_partial = websocket.receive_json()
             websocket.send_json({"type": "end"})
             final = websocket.receive_json()
 
             assert first == {"type": "partial", "text": text, "sequence": 2}
-            assert committed == {"type": "sentence_final", "text": text, "sequence": 3}
-            assert empty_partial == {"type": "partial", "text": "", "sequence": 4}
-            assert final == {"type": "final", "text": "", "sequence": 5}
+            assert final == {"type": "final", "text": text, "sequence": 3}
             _assert_closed(websocket, 1000)
     finally:
         _clear_asr_dependency_overrides()
 
 
-def test_stream_v2_confirmed_prefix_conflict_closes_session():
+def test_stateful_punctuation_snapshot_remains_replaceable_until_end():
+    coordinator = ProtocolCoordinator(
+        ["其中最。", "其中最重要的是保留模型修订。"],
+        final_text="其中最重要的是保留模型修订。",
+    )
+    _override_protocol(
+        coordinator,
+        asr_commit_on_punctuation=True,
+        asr_stable_commit_enabled=False,
+    )
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            _start_stream(websocket, expect_sequence=True)
+            websocket.send_bytes(_pcm_s16le_samples(1000, 1600))
+            assert websocket.receive_json() == {
+                "type": "partial",
+                "text": "其中最。",
+                "sequence": 2,
+            }
+            websocket.send_bytes(_pcm_s16le_samples(1000, 1600))
+            assert websocket.receive_json() == {
+                "type": "partial",
+                "text": "其中最重要的是保留模型修订。",
+                "sequence": 3,
+            }
+            websocket.send_json({"type": "end"})
+            assert websocket.receive_json() == {
+                "type": "final",
+                "text": "其中最重要的是保留模型修订。",
+                "sequence": 4,
+            }
+            _assert_closed(websocket, 1000)
+    finally:
+        _clear_asr_dependency_overrides()
+
+
+def test_vad_endpoint_flushes_once_and_requires_new_confirmed_speech_to_rearm():
+    from collections import deque
+
+    from app.asr import StreamingTranscriptionResult
+    from app.asr_vad import StreamingVADEndpointDetector
+
+    class Backend:
+        def __init__(self):
+            self.probabilities = deque(
+                [0.9] * 3
+                + [0.01] * 13
+                + [0.9] * 3
+                + [0.01] * 3
+            )
+
+        def speech_probability(self, _frame):
+            return self.probabilities.popleft()
+
+        def reset(self):
+            return None
+
+    vad = StreamingVADEndpointDetector(
+        backend=Backend(),
+        sample_rate=16000,
+        frame_samples=512,
+        onset_threshold=0.65,
+        offset_threshold=0.35,
+        min_speech_ms=96,
+        min_silence_ms=96,
+        hangover_ms=32,
+        pre_roll_ms=200,
+    )
+
+    class Coordinator(FakeCoordinator):
+        def __init__(self):
+            super().__init__()
+            self.add_results = iter(
+                [
+                    StreamingTranscriptionResult(
+                        segment_id=0,
+                        segment_text="其中最。",
+                        language="zh",
+                        decoded_samples_delta=1536,
+                    ),
+                    StreamingTranscriptionResult(
+                        segment_id=0,
+                        segment_text="其中最重要",
+                        language="zh",
+                        decoded_samples_delta=512,
+                    ),
+                    StreamingTranscriptionResult(
+                        segment_id=1,
+                        segment_text="第二句",
+                        language="zh",
+                        decoded_samples_delta=1536,
+                    ),
+                    StreamingTranscriptionResult(
+                        segment_id=1,
+                        segment_text="第二句",
+                        language="zh",
+                        decoded_samples_delta=512,
+                    ),
+                ]
+            )
+            self.segment_results = iter(
+                [
+                    StreamingTranscriptionResult(
+                        segment_id=0,
+                        segment_text="其中最重要的。",
+                        language="zh",
+                        decoded_samples_delta=0,
+                        segment_finished=True,
+                    ),
+                    StreamingTranscriptionResult(
+                        segment_id=1,
+                        segment_text="第二句。",
+                        language="zh",
+                        decoded_samples_delta=0,
+                        segment_finished=True,
+                    ),
+                ]
+            )
+            self.add_calls = 0
+            self.segment_calls = 0
+
+        async def create_stream(self, _language):
+            return "session"
+
+        async def add_audio(self, _session_id, _pcm_bytes, _sample_rate):
+            self.add_calls += 1
+            return next(self.add_results)
+
+        async def finish_segment(self, _session_id):
+            self.segment_calls += 1
+            return next(self.segment_results)
+
+        async def finish_stream(self, _session_id):
+            return StreamingTranscriptionResult(
+                segment_id=2,
+                segment_text="",
+                language="zh",
+                decoded_samples_delta=0,
+                model_updated=False,
+            )
+
+        async def abort_stream(self, _session_id):
+            return None
+
+    async def scenario():
+        websocket = RecordingWebSocket()
+        coordinator = Coordinator()
+        controller = asr_api.StreamingSessionController(
+            websocket,
+            _protocol_settings(),
+            coordinator,
+            vad_detector=vad,
+        )
+        await controller.start("zh")
+        for probability_index in range(22):
+            is_speech = probability_index < 3 or 16 <= probability_index < 19
+            await controller.add_audio(
+                _pcm_s16le_samples(1000 if is_speech else 0, 512)
+            )
+        await controller.finish()
+        return websocket.events, coordinator.add_calls, coordinator.segment_calls
+
+    events, add_calls, segment_calls = asyncio.run(scenario())
+
+    assert [
+        event["text"] for event in events if event["type"] == "sentence_final"
+    ] == ["其中最重要的。", "第二句。"]
+    assert [event for event in events if event["type"] == "final"] == [
+        {"type": "final", "text": "", "sequence": events[-1]["sequence"]}
+    ]
+    assert add_calls == 4
+    assert segment_calls == 2
+    assert [event["sequence"] for event in events] == list(
+        range(1, len(events) + 1)
+    )
+
+
+@pytest.mark.parametrize(
+    ("frame_samples", "frame_count", "inference_seconds"),
+    [(3200, 10, 0.10), (8000, 4, 0.25)],
+)
+def test_chunk_buffering_lag_uses_decoded_progress_not_transport_frames(
+    frame_samples, frame_count, inference_seconds
+):
+    from app.asr import StreamingTranscriptionResult
+
+    controller = asr_api.StreamingSessionController(
+        RecordingWebSocket(),
+        _protocol_settings(),
+        FakeCoordinator(),
+    )
+
+    decisions = []
+    for index in range(frame_count):
+        decisions.append(
+            controller._observe_stream_progress(
+                StreamingTranscriptionResult(
+                    segment_id=0,
+                    segment_text="",
+                    decoded_samples_delta=(
+                        32000 if index == frame_count - 1 else 0
+                    ),
+                    model_updated=index == frame_count - 1,
+                    inference_seconds=inference_seconds,
+                ),
+                submitted_samples=frame_samples,
+            )
+        )
+
+    assert decisions == [False] * frame_count
+    assert controller.processing_debt_seconds == pytest.approx(0.0)
+    assert controller.oldest_undecoded_age_seconds == 0.0
+
+
+def test_sustained_real_lag_requires_debt_and_oldest_audio_age_and_fires_once():
+    from app.asr import StreamingTranscriptionResult
+
+    controller = asr_api.StreamingSessionController(
+        RecordingWebSocket(),
+        _protocol_settings(
+            asr_max_connection_lag_seconds=1.0,
+            asr_max_undecoded_age_seconds=2.0,
+            asr_ws_max_queue=1,
+        ),
+        FakeCoordinator(),
+    )
+    result = StreamingTranscriptionResult(
+        segment_id=0,
+        segment_text="",
+        decoded_samples_delta=0,
+        model_updated=False,
+        queue_wait_seconds=0.25,
+        inference_seconds=0.5,
+    )
+
+    decisions = [
+        controller._observe_stream_progress(result, submitted_samples=3200)
+        for _ in range(6)
+    ]
+
+    assert decisions == [False, False, True, False, False, False]
+    assert controller.processing_debt_seconds == pytest.approx(4.5)
+    assert controller.oldest_undecoded_age_seconds >= 4.5
+
+
+def test_stream_v2_new_segment_snapshot_does_not_conflict_with_frozen_text():
     coordinator = ProtocolCoordinator(["confirmed", "confirmed", "unsafe"])
     _override_protocol(
         coordinator,
@@ -1041,14 +1322,19 @@ def test_stream_v2_confirmed_prefix_conflict_closes_session():
             assert websocket.receive_json() == {"type": "partial", "text": "", "sequence": 4}
             websocket.send_bytes(_pcm_s16le_samples(1000, 160))
             event = websocket.receive_json()
-            assert event["code"] == "transcript_conflict"
-            assert event["sequence"] == 5
-            _assert_closed(websocket, 1011)
+            assert event == {"type": "partial", "text": "unsafe", "sequence": 5}
+            websocket.send_json({"type": "end"})
+            assert websocket.receive_json() == {
+                "type": "final",
+                "text": "unsafe",
+                "sequence": 6,
+            }
+            _assert_closed(websocket, 1000)
     finally:
         _clear_asr_dependency_overrides()
 
 
-def test_stream_logs_conflict_code_without_transcript_or_api_key(caplog):
+def test_stream_revision_logs_neither_transcript_nor_api_key(caplog):
     coordinator = ProtocolCoordinator(["distinctive-transcript", "distinctive-transcript", "unsafe"])
     _override_protocol(coordinator, asr_vad_silence_seconds=0.001)
     caplog.set_level(logging.WARNING, logger="app.asr_api")
@@ -1066,7 +1352,6 @@ def test_stream_logs_conflict_code_without_transcript_or_api_key(caplog):
         _clear_asr_dependency_overrides()
 
     messages = " ".join(record.getMessage() for record in caplog.records)
-    assert "code=transcript_conflict" in messages
     assert "distinctive-transcript" not in messages
     assert "test-key" not in messages
 
@@ -1152,8 +1437,7 @@ def test_chunked_session_deadline_cancels_transcription_before_late_partial():
 def test_stateful_post_inference_work_cannot_emit_partial_after_session_deadline():
     coordinator = ProtocolCoordinator(
         ["late partial"],
-        operation_delays={"add": 0.01},
-        timing_delay=0.08,
+        operation_delays={"add": 0.08},
     )
     _override_protocol(
         coordinator,
@@ -1388,21 +1672,28 @@ def test_legacy_protocol_commits_every_complete_sentence_in_one_update(
         with client.websocket_connect("/v1/transcribe/stream") as websocket:
             _start_stream(websocket, expect_sequence=True)
             websocket.send_bytes(b"\x00\x00" * 16)
-            assert websocket.receive_json() == {
-                "type": "sentence_final",
-                "text": "第一句。",
-                "sequence": 2,
-            }
-            assert websocket.receive_json() == {
-                "type": "sentence_final",
-                "text": "第二句。",
-                "sequence": 3,
-            }
-            assert websocket.receive_json() == {
-                "type": "partial",
-                "text": "",
-                "sequence": 4,
-            }
+            if stream_mode == "stateful":
+                assert websocket.receive_json() == {
+                    "type": "partial",
+                    "text": "第一句。第二句。",
+                    "sequence": 2,
+                }
+            else:
+                assert websocket.receive_json() == {
+                    "type": "sentence_final",
+                    "text": "第一句。",
+                    "sequence": 2,
+                }
+                assert websocket.receive_json() == {
+                    "type": "sentence_final",
+                    "text": "第二句。",
+                    "sequence": 3,
+                }
+                assert websocket.receive_json() == {
+                    "type": "partial",
+                    "text": "",
+                    "sequence": 4,
+                }
     finally:
         _clear_asr_dependency_overrides()
 
@@ -1474,7 +1765,13 @@ def test_qwen_vllm_streaming_session_feeds_pcm_and_finishes(monkeypatch):
     monkeypatch.setitem(sys.modules, "qwen_asr", types.SimpleNamespace(Qwen3ASRModel=FakeQwen3ASRModel))
     monkeypatch.delenv("ASR_STREAM_CHUNK_SECONDS", raising=False)
 
-    transcriber = QwenVLLMASRTranscriber(Settings(asr_backend="qwen_vllm"))
+    transcriber = QwenVLLMASRTranscriber(
+        Settings(
+            asr_backend="qwen_vllm",
+            asr_max_frame_bytes=32000,
+            asr_ws_max_queue=1,
+        )
+    )
     session = transcriber.create_streaming_session(language="zh")
     update = session.add_pcm_s16le((1000).to_bytes(2, "little", signed=True) * 16000, sample_rate=16000)
     final = session.finish()
@@ -1521,6 +1818,103 @@ def test_qwen_vllm_warmup_loads_model_once(monkeypatch):
     assert constructor_count == 1
 
 
+def test_qwen_vllm_stateful_warmup_fails_fast_without_vad_asset(
+    monkeypatch, tmp_path
+):
+    from app.asr import QwenVLLMASRTranscriber
+    from app.asr_vad import VADRuntimeError
+    from app.config import Settings
+
+    transcriber = QwenVLLMASRTranscriber(
+        Settings(
+            _env_file=None,
+            asr_backend="qwen_vllm",
+            asr_stream_mode="stateful",
+            asr_vad_model_path=str(tmp_path / "missing.onnx"),
+        )
+    )
+    monkeypatch.setattr(transcriber, "_load", lambda: None)
+    monkeypatch.setattr(transcriber, "_validate_qwen_runtime_contract", lambda: None)
+
+    with pytest.raises(VADRuntimeError, match="asset is missing"):
+        transcriber.warmup()
+
+
+def test_qwen_vllm_stateful_warmup_performs_non_silent_streaming_decode(
+    monkeypatch,
+):
+    import sys
+    import types
+
+    from app.asr import QwenVLLMASRTranscriber
+    from app.config import Settings
+
+    calls = []
+
+    class FakeState:
+        def __init__(self, chunk_size_samples):
+            self.text = ""
+            self.language = "zh"
+            self.chunk_id = 0
+            self.chunk_size_samples = chunk_size_samples
+            self.buffered = 0
+
+    class FakeModel:
+        def init_streaming_state(self, **kwargs):
+            calls.append(("init", kwargs))
+            return FakeState(round(kwargs["chunk_size_sec"] * 16000))
+
+        def streaming_transcribe(self, pcm, state):
+            calls.append(("stream", len(pcm), int(max(pcm)), int(min(pcm))))
+            state.buffered += len(pcm)
+            while state.buffered >= state.chunk_size_samples:
+                state.buffered -= state.chunk_size_samples
+                state.chunk_id += 1
+                state.text = "warm"
+            return state
+
+        def finish_streaming_transcribe(self, state):
+            calls.append(("finish", state.buffered))
+            if state.buffered:
+                state.buffered = 0
+                state.chunk_id += 1
+                state.text = "warm"
+            return state
+
+    class FakeQwen3ASRModel:
+        @classmethod
+        def LLM(cls, **_kwargs):
+            return FakeModel()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "qwen_asr",
+        types.SimpleNamespace(Qwen3ASRModel=FakeQwen3ASRModel),
+    )
+    monkeypatch.setattr(
+        "app.asr.create_vad_endpoint_detector", lambda _settings: object()
+    )
+    transcriber = QwenVLLMASRTranscriber(
+        Settings(
+            _env_file=None,
+            asr_backend="qwen_vllm",
+            asr_stream_mode="stateful",
+            asr_stream_chunk_seconds=0.5,
+        )
+    )
+    monkeypatch.setattr(transcriber, "_validate_qwen_runtime_contract", lambda: None)
+
+    transcriber.warmup()
+
+    stream_calls = [call for call in calls if call[0] == "stream"]
+    assert sum(call[1] for call in stream_calls) >= 16000
+    assert all(call[1] <= 8000 for call in stream_calls)
+    assert all(call[2] > 0 for call in stream_calls)
+    assert all(call[3] < 0 for call in stream_calls)
+    assert any(call[0] == "finish" for call in calls)
+    assert transcriber.streaming_warmup_complete is True
+
+
 def test_stateful_segment_reset_reinitializes_official_state(monkeypatch):
     import sys
     import types
@@ -1557,11 +1951,14 @@ def test_stateful_segment_reset_reinitializes_official_state(monkeypatch):
 
     transcriber = QwenVLLMASRTranscriber(Settings(asr_backend="qwen_vllm"))
     session = transcriber.create_streaming_session(language="zh")
-    session.add_pcm_s16le(b"\x00\x00", 16000)
-    session.reset_segment()
+    first = session.add_pcm_s16le(b"\x00\x00", 16000)
+    segment = session.reset_segment()
     result = session.add_pcm_s16le(b"\x00\x00", 16000)
 
-    assert result.text == "hello world"
+    assert first.segment_id == 0
+    assert segment.segment_id == 0
+    assert result.segment_id == 1
+    assert result.segment_text == " world"
     assert len(states) == 2
 
 
@@ -1612,6 +2009,8 @@ def test_stateful_segment_finish_flushes_buffer_before_reinitializing(monkeypatc
             asr_backend="qwen_vllm",
             asr_stream_mode="stateful",
             asr_stream_chunk_seconds=1.0,
+            asr_max_frame_bytes=28800,
+            asr_ws_max_queue=1,
         )
     ).create_streaming_session("zh")
 
@@ -1621,11 +2020,13 @@ def test_stateful_segment_finish_flushes_buffer_before_reinitializing(monkeypatc
 
     assert buffered.model_updated is False
     assert buffered.processed_samples == 0
-    assert segment.text == "尾音"
+    assert segment.segment_text == "尾音"
+    assert segment.segment_id == 0
     assert segment.model_updated is True
     assert segment.processed_samples == 14400
     assert segment.segment_finished is True
-    assert continued.text == "尾音"
+    assert continued.segment_text == ""
+    assert continued.segment_id == 1
     assert len(states) == 2
     assert finish_calls == [states[0]]
 
@@ -1684,19 +2085,71 @@ def test_stateful_rollover_bounds_official_state_and_preserves_exact_text(monkey
             asr_backend="qwen_vllm",
             asr_stream_mode="stateful",
             asr_stream_chunk_seconds=0.1,
-            asr_stream_rollover_seconds=0.25,
+            asr_stream_rollover_seconds=120.0,
+            asr_max_utterance_seconds=0.25,
             asr_max_frame_bytes=3200,
         )
     ).create_streaming_session("zh")
 
     results = [session.add_pcm_s16le(b"\x00\x00" * 1600, 16000) for _ in range(6)]
 
-    assert [result.text for result in results if result.segment_finished] == ["甲乙", "甲乙丙丁"]
+    assert [result.segment_text for result in results if result.segment_finished] == [
+        "甲乙",
+        "丙丁",
+    ]
+    assert [result.segment_id for result in results if result.segment_finished] == [0, 1]
     assert len(finish_calls) == 2
     assert len(states) == 3
     assert [state.total_samples for state in states[:2]] == [4800, 4800]
-    assert session.add_pcm_s16le(b"\x00\x00" * 1600, 16000).text == "甲乙丙丁戊"
-    assert session.finish().text == "甲乙丙丁戊"
+    assert max(state.total_samples for state in states[:2]) <= 4000 + 1600
+    assert session.add_pcm_s16le(b"\x00\x00" * 1600, 16000).segment_text == "戊"
+    assert session.finish().segment_text == "戊"
+
+
+def test_stateful_invariant_watchdog_aborts_instead_of_normal_rollover(monkeypatch):
+    import sys
+    import types
+
+    from app.asr import QwenVLLMASRTranscriber
+    from app.config import Settings
+
+    stream_calls = 0
+
+    class FakeState:
+        text = ""
+        language = "zh"
+        chunk_id = 0
+        chunk_size_samples = 1600
+
+    class FakeModel:
+        def init_streaming_state(self, **_kwargs):
+            return FakeState()
+
+        def streaming_transcribe(self, _pcm, state):
+            nonlocal stream_calls
+            stream_calls += 1
+            return state
+
+    class FakeQwen3ASRModel:
+        @classmethod
+        def LLM(cls, **_kwargs):
+            return FakeModel()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "qwen_asr",
+        types.SimpleNamespace(Qwen3ASRModel=FakeQwen3ASRModel),
+    )
+    session = QwenVLLMASRTranscriber(
+        Settings(_env_file=None, asr_backend="qwen_vllm")
+    ).create_streaming_session("zh")
+    session._max_utterance_samples = 100000
+    session._watchdog_samples = 1000
+
+    with pytest.raises(RuntimeError, match="invariant watchdog"):
+        session.add_pcm_s16le(b"\x00\x00" * 1001, 16000)
+
+    assert stream_calls == 0
 
 
 def test_stateful_abort_releases_state(monkeypatch):

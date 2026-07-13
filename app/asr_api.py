@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from typing import Literal
 
@@ -41,6 +42,7 @@ from app.asr_streaming import (
     SilenceEndpointDetector,
     StreamingTranscriptState,
 )
+from app.asr_vad import VADDecision, create_vad_endpoint_detector
 from app.schemas import (
     ASRHealthResponse,
     ASRReadyResponse,
@@ -145,6 +147,7 @@ async def transcribe(
 
 @app.get("/v1/transcribe/stream-info", response_model=TranscribeStreamInfoResponse)
 def transcribe_stream_info(current_settings: Settings = Depends(get_settings)) -> TranscribeStreamInfoResponse:
+    stateful = current_settings.asr_stream_mode == "stateful"
     return TranscribeStreamInfoResponse(
         protocol_version=current_settings.asr_protocol_version,
         file_transcribe_enabled=current_settings.asr_file_transcribe_enabled,
@@ -157,18 +160,52 @@ def transcribe_stream_info(current_settings: Settings = Depends(get_settings)) -
             "backend": current_settings.asr_backend,
             "stream_mode": current_settings.asr_stream_mode,
             "vad_silence_seconds": current_settings.asr_vad_silence_seconds,
-            "commit_on_punctuation": current_settings.asr_commit_on_punctuation,
+            "commit_on_punctuation": (
+                current_settings.asr_commit_on_punctuation and not stateful
+            ),
+            "endpointing": {
+                "backend": (
+                    "silero_onnx_cpu"
+                    if stateful and current_settings.asr_backend == "qwen_vllm"
+                    else "legacy_chunked_or_mock"
+                ),
+                "immutable_commit_source": (
+                    "vad_endpoint_explicit_segment_or_forced_boundary"
+                    if stateful
+                    else "chunked_legacy_policy"
+                ),
+                "onset_threshold": current_settings.asr_vad_onset_threshold,
+                "offset_threshold": current_settings.asr_vad_offset_threshold,
+                "min_speech_ms": current_settings.asr_vad_min_speech_ms,
+                "min_silence_ms": current_settings.asr_vad_min_silence_ms,
+                "hangover_ms": current_settings.asr_vad_hangover_ms,
+                "pre_roll_ms": current_settings.asr_vad_pre_roll_ms,
+                "model_version": current_settings.asr_vad_model_version,
+                "model_sha256": current_settings.asr_vad_model_sha256,
+                "normal_utterance_seconds": current_settings.asr_max_utterance_seconds,
+                "invariant_watchdog_seconds": current_settings.asr_state_watchdog_seconds,
+            },
             "stateful": {
                 "chunk_seconds": current_settings.asr_stream_chunk_seconds,
                 "unfixed_chunk_num": current_settings.asr_stream_unfixed_chunk_num,
                 "unfixed_token_num": current_settings.asr_stream_unfixed_token_num,
-                "rollover_seconds": current_settings.asr_stream_rollover_seconds,
+                "rollover_seconds": (
+                    current_settings.asr_max_utterance_seconds
+                    if stateful
+                    else current_settings.asr_stream_rollover_seconds
+                ),
                 "vllm_gpu_memory_utilization": current_settings.asr_vllm_gpu_memory_utilization,
                 "vllm_max_new_tokens": current_settings.asr_vllm_max_new_tokens,
-                "stable_commit_enabled": current_settings.asr_stable_commit_enabled,
+                "stable_commit_enabled": (
+                    current_settings.asr_stable_commit_enabled and not stateful
+                ),
                 "stable_commit_seconds": current_settings.asr_stable_commit_seconds,
                 "stable_commit_min_chars": current_settings.asr_stable_commit_min_chars,
                 "stable_commit_min_updates": current_settings.asr_stable_commit_min_updates,
+                "legacy_commit_options_requested": {
+                    "commit_on_punctuation": current_settings.asr_commit_on_punctuation,
+                    "stable_commit_enabled": current_settings.asr_stable_commit_enabled,
+                },
             },
         },
         start_message={
@@ -217,6 +254,7 @@ class StreamingSessionController:
         websocket: WebSocket,
         current_settings: Settings,
         coordinator: ASRInferenceCoordinator,
+        vad_detector=None,
     ) -> None:
         self.websocket = websocket
         self.settings = current_settings
@@ -225,6 +263,11 @@ class StreamingSessionController:
         self.finished = False
         self.accepted_samples = 0
         self.processing_debt_seconds = 0.0
+        self.oldest_undecoded_age_seconds = 0.0
+        self._model_work_seconds = 0.0
+        self._undecoded_batches: deque[list[float]] = deque()
+        self._lag_error_sent = False
+        self.stateful = current_settings.asr_stream_mode == "stateful"
         self.session_deadline = time.monotonic() + current_settings.asr_max_session_seconds
         self.transcript = StreamingTranscriptState(
             sample_rate=16000,
@@ -234,16 +277,21 @@ class StreamingSessionController:
             stable_commit_min_updates=current_settings.asr_stable_commit_min_updates,
             immediate_commit_on_punctuation=(
                 current_settings.asr_commit_on_punctuation
-                and (
-                    current_settings.asr_stream_mode == "chunked"
-                    or not current_settings.asr_stable_commit_enabled
-                )
+                and current_settings.asr_stream_mode == "chunked"
             ),
+            segment_local_snapshots=self.stateful,
         )
         self.silence = SilenceEndpointDetector(
             silence_seconds=current_settings.asr_vad_silence_seconds,
             rms_threshold=current_settings.asr_vad_rms_threshold,
         )
+        self.vad = vad_detector
+        if (
+            self.vad is None
+            and self.stateful
+            and current_settings.asr_backend == "qwen_vllm"
+        ):
+            self.vad = create_vad_endpoint_detector(current_settings)
 
     async def start(self, language: str | None) -> None:
         await self._start_with(self.coordinator.create_stream, language)
@@ -285,7 +333,49 @@ class StreamingSessionController:
         await self._send_event(self.transcript.new_event("ready"))
 
     async def add_audio(self, pcm_bytes: bytes) -> None:
-        sample_count = await self.validate_audio_frame(pcm_bytes)
+        await self.validate_audio_frame(pcm_bytes)
+        if self.vad is not None:
+            decision = self.vad.add_audio(pcm_bytes)
+            while True:
+                await self._handle_vad_decision(decision)
+                if not decision.endpoint:
+                    return
+                decision = self.vad.endpoint_finalized()
+        result = await self._add_model_audio(pcm_bytes)
+        silence_endpoint = self.silence.add_audio(pcm_bytes, 16000)
+        if result.segment_finished:
+            await self._commit_finished_segment(reset_endpoint_detector=False)
+        elif silence_endpoint:
+            await self.reset_segment()
+
+    async def _handle_vad_decision(self, decision: VADDecision) -> None:
+        if decision.discarded_samples:
+            logger.info(
+                "asr_vad_discarded session_id=%s samples=%d duration_seconds=%.3f",
+                self.session_id or "unassigned",
+                decision.discarded_samples,
+                decision.discarded_samples / 16000,
+            )
+        result = None
+        if decision.audio_to_model:
+            result = await self._add_vad_audio(decision.audio_to_model)
+        if decision.endpoint and not (result and result.segment_finished):
+            await self.reset_segment(reset_endpoint_detector=False)
+
+    async def explicit_segment(self) -> None:
+        already_finalized = False
+        if self.vad is not None:
+            pending = self.vad.finish_input()
+            if pending.audio_to_model:
+                result = await self._add_vad_audio(pending.audio_to_model)
+                if result and result.segment_finished:
+                    already_finalized = True
+        if not already_finalized:
+            await self.reset_segment(reset_endpoint_detector=False)
+        if self.vad is not None:
+            self.vad.reset()
+
+    async def _add_model_audio(self, pcm_bytes: bytes):
         assert self.session_id is not None
         try:
             result = await self._await_model_operation(
@@ -312,33 +402,33 @@ class StreamingSessionController:
             await self.fail("inference_error", "ASR inference failed", 1011)
             raise _StreamClosed from exc
 
-        queue_wait, inference_time = self.coordinator.session_timing(self.session_id)
         await self._ensure_session_active()
-        if self._lag_exceeded(queue_wait + inference_time, sample_count / 16000):
+        if self._observe_stream_progress(
+            result, submitted_samples=len(pcm_bytes) // 2
+        ):
             await self.fail("realtime_lag_exceeded", "ASR can no longer keep up in real time", 1013)
             raise _StreamClosed
         try:
             if result.model_updated:
-                processed_samples = (
-                    sample_count
-                    if result.processed_samples is None
-                    else result.processed_samples
-                )
-                await self._send_events(
-                    self.transcript.apply_model_update(
-                        result.text,
-                        processed_samples=processed_samples,
-                    )
-                )
+                await self._apply_stream_result(result)
         except ConfirmedPrefixConflict as exc:
             await self.fail("transcript_conflict", "Model output conflicts with confirmed text", 1011)
             raise _StreamClosed from exc
 
-        silence_endpoint = self.silence.add_audio(pcm_bytes, 16000)
-        if result.segment_finished:
-            await self._commit_finished_segment()
-        elif silence_endpoint:
-            await self.reset_segment()
+        return result
+
+    async def _add_vad_audio(self, pcm_bytes: bytes):
+        result = None
+        frame_bytes = self.settings.asr_max_frame_bytes
+        for offset in range(0, len(pcm_bytes), frame_bytes):
+            result = await self._add_model_audio(
+                pcm_bytes[offset : offset + frame_bytes]
+            )
+            if result.segment_finished:
+                await self._commit_finished_segment(
+                    reset_endpoint_detector=False
+                )
+        return result
 
     async def validate_audio_frame(self, pcm_bytes: bytes) -> int:
         if not pcm_bytes or len(pcm_bytes) % 2:
@@ -395,7 +485,81 @@ class StreamingSessionController:
         )
         return self.processing_debt_seconds > self.settings.asr_max_connection_lag_seconds
 
-    async def reset_segment(self) -> None:
+    def _observe_stream_progress(self, result, *, submitted_samples: int) -> bool:
+        now = time.monotonic()
+        if submitted_samples:
+            self._undecoded_batches.append(
+                [float(submitted_samples), now, self._model_work_seconds]
+            )
+        processing_seconds = max(0.0, result.queue_wait_seconds) + max(
+            0.0, result.inference_seconds
+        )
+        self._model_work_seconds += processing_seconds
+        decoded_samples = result.decoded_samples_delta
+        decoded_seconds = (
+            max(0, decoded_samples) / 16000
+            if decoded_samples is not None
+            else 0.0
+        )
+        self.processing_debt_seconds = max(
+            0.0,
+            self.processing_debt_seconds + processing_seconds - decoded_seconds,
+        )
+
+        remaining_decoded = max(0, decoded_samples or 0)
+        while remaining_decoded and self._undecoded_batches:
+            batch = self._undecoded_batches[0]
+            consumed = min(remaining_decoded, int(batch[0]))
+            batch[0] -= consumed
+            remaining_decoded -= consumed
+            if batch[0] <= 0:
+                self._undecoded_batches.popleft()
+
+        if self._undecoded_batches:
+            oldest = self._undecoded_batches[0]
+            self.oldest_undecoded_age_seconds = max(
+                0.0,
+                now - oldest[1],
+                self._model_work_seconds - oldest[2],
+            )
+        else:
+            self.oldest_undecoded_age_seconds = 0.0
+
+        logger.info(
+            "asr_stream_progress session_id=%s decoded_audio_seconds=%.3f queue_wait_ms=%.3f inference_ms=%.3f lag_debt_seconds=%.3f oldest_undecoded_age_seconds=%.3f",
+            self.session_id or "unassigned",
+            decoded_seconds,
+            max(0.0, result.queue_wait_seconds) * 1000,
+            max(0.0, result.inference_seconds) * 1000,
+            self.processing_debt_seconds,
+            self.oldest_undecoded_age_seconds,
+        )
+        exceeded = (
+            self.processing_debt_seconds
+            > self.settings.asr_max_connection_lag_seconds
+            and self.oldest_undecoded_age_seconds
+            > self.settings.asr_max_undecoded_age_seconds
+        )
+        if not exceeded or self._lag_error_sent:
+            return False
+        self._lag_error_sent = True
+        return True
+
+    async def _enforce_stream_progress(
+        self, result, *, submitted_samples: int = 0
+    ) -> None:
+        if not self._observe_stream_progress(
+            result, submitted_samples=submitted_samples
+        ):
+            return
+        await self.fail(
+            "realtime_lag_exceeded",
+            "ASR can no longer keep up in real time",
+            1013,
+        )
+        raise _StreamClosed
+
+    async def reset_segment(self, *, reset_endpoint_detector: bool = True) -> None:
         assert self.session_id is not None
         try:
             result = await self._await_model_operation(
@@ -413,38 +577,38 @@ class StreamingSessionController:
             await self.fail("inference_error", "ASR segment reset failed", 1011)
             raise _StreamClosed from exc
         await self._ensure_session_active()
+        await self._enforce_stream_progress(result)
         try:
-            if result.model_updated:
-                await self._send_events(
-                    self.transcript.apply_model_update(
-                        result.text,
-                        processed_samples=result.processed_samples or 0,
-                    )
-                )
+            await self._apply_stream_result(result)
         except ConfirmedPrefixConflict as exc:
             await self.fail("transcript_conflict", "Model output conflicts with confirmed text", 1011)
             raise _StreamClosed from exc
-        await self._commit_finished_segment()
+        await self._commit_finished_segment(
+            reset_endpoint_detector=reset_endpoint_detector
+        )
 
-    async def _commit_finished_segment(self) -> None:
+    async def _commit_finished_segment(
+        self, *, reset_endpoint_detector: bool = True
+    ) -> None:
         await self._send_events(self.transcript.commit_pending())
         self.transcript.reset_segment()
         self.silence.reset()
+        if reset_endpoint_detector and self.vad is not None:
+            self.vad.reset()
 
     async def finish(self) -> None:
         assert self.session_id is not None
         try:
+            if self.vad is not None:
+                pending = self.vad.finish_input()
+                if pending.audio_to_model:
+                    await self._add_vad_audio(pending.audio_to_model)
             result = await self._await_model_operation(
                 lambda: self.coordinator.finish_stream(self.session_id)
             )
             await self._ensure_session_active()
-            if result.model_updated:
-                await self._send_events(
-                    self.transcript.apply_model_update(
-                        result.text,
-                        processed_samples=result.processed_samples or 0,
-                    )
-                )
+            await self._enforce_stream_progress(result)
+            await self._apply_stream_result(result)
             await self._send_event(self.transcript.final_event())
         except _StreamClosed:
             raise
@@ -464,6 +628,20 @@ class StreamingSessionController:
         logger.info("asr_stream_ended session_id=%s reason=finished", self.session_id)
         self.session_id = None
         await self.websocket.close(code=1000)
+
+    async def _apply_stream_result(self, result) -> None:
+        if self.stateful:
+            events = self.transcript.apply_segment_snapshot(
+                result.segment_id,
+                result.segment_text,
+                decoded_samples_delta=result.decoded_samples_delta or 0,
+            )
+        else:
+            events = self.transcript.apply_model_update(
+                result.text,
+                processed_samples=result.decoded_samples_delta or 0,
+            )
+        await self._send_events(events)
 
     @property
     def remaining_session_seconds(self) -> float:
@@ -619,7 +797,7 @@ async def transcribe_stream(
                 await controller.finish()
                 return
             if payload.get("type") == "segment":
-                await controller.reset_segment()
+                await controller.explicit_segment()
                 continue
             await controller.fail("invalid_message", "Unsupported stream command", 1003)
             return

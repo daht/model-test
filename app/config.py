@@ -1,8 +1,13 @@
+import re
 from functools import lru_cache
 from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+SILERO_VAD_SHA256 = (
+    "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"
+)
 
 
 class Settings(BaseSettings):
@@ -31,8 +36,24 @@ class Settings(BaseSettings):
     asr_stream_unfixed_chunk_num: int = Field(default=2, ge=0)
     asr_stream_unfixed_token_num: int = Field(default=5, ge=0)
     asr_stream_rollover_seconds: float = Field(default=120.0, gt=0, le=3600)
+    asr_max_utterance_seconds: float = Field(default=30.0, gt=0, le=60)
+    asr_state_watchdog_seconds: float = Field(default=120.0, ge=120, le=120)
     asr_vad_silence_seconds: float = Field(default=1.5, gt=0, le=30)
     asr_vad_rms_threshold: int = Field(default=200, ge=0, le=32767)
+    asr_vad_model_path: str = Field(
+        default="/opt/asr-assets/silero_vad.onnx", min_length=1
+    )
+    asr_vad_model_version: Literal["6.2.1"] = "6.2.1"
+    asr_vad_model_sha256: str = SILERO_VAD_SHA256
+    asr_vad_frame_samples: int = Field(default=512, ge=512, le=512)
+    asr_vad_onset_threshold: float = Field(default=0.65, gt=0, lt=1)
+    asr_vad_offset_threshold: float = Field(default=0.35, gt=0, lt=1)
+    asr_vad_min_speech_ms: int = Field(default=250, gt=0, le=5000)
+    asr_vad_min_silence_ms: int = Field(default=800, gt=0, le=30000)
+    asr_vad_hangover_ms: int = Field(default=160, ge=0, le=5000)
+    asr_vad_pre_roll_ms: int = Field(default=200, ge=200, le=200)
+    asr_vad_onnx_intra_threads: int = Field(default=1, ge=1, le=4)
+    asr_vad_onnx_inter_threads: int = Field(default=1, ge=1, le=4)
     asr_commit_on_punctuation: bool = False
     asr_stable_commit_enabled: bool = True
     asr_stable_commit_seconds: float = Field(default=1.0, gt=0, le=30)
@@ -45,6 +66,7 @@ class Settings(BaseSettings):
     asr_inference_queue_size: int = Field(default=16, gt=0, le=1024)
     asr_max_queued_audio_seconds: float = Field(default=4.0, gt=0, le=120)
     asr_max_connection_lag_seconds: float = Field(default=2.0, gt=0, le=30)
+    asr_max_undecoded_age_seconds: float = Field(default=4.0, gt=0, le=60)
     asr_max_frame_bytes: int = Field(default=16000, gt=0, le=1_048_576)
     asr_ws_max_queue: int = Field(default=4, gt=0, le=1024)
     asr_start_timeout_seconds: float = Field(default=10.0, gt=0, le=120)
@@ -72,6 +94,16 @@ class Settings(BaseSettings):
             raise ValueError("asr_max_frame_bytes must be even for pcm_s16le")
         return value
 
+    @field_validator("asr_vad_model_sha256")
+    @classmethod
+    def require_sha256_hex(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", normalized):
+            raise ValueError("asr_vad_model_sha256 must be a 64-character SHA256")
+        if normalized != SILERO_VAD_SHA256:
+            raise ValueError("asr_vad_model_sha256 must match the pinned model")
+        return normalized
+
     @model_validator(mode="after")
     def bound_websocket_buffered_audio(self) -> "Settings":
         frame_audio_seconds = self.asr_max_frame_bytes / (2 * 16000)
@@ -82,6 +114,14 @@ class Settings(BaseSettings):
             )
         if self.asr_backend == "qwen" and self.asr_stream_mode == "stateful":
             raise ValueError("asr_backend=qwen does not support stateful streaming")
+        if self.asr_vad_onset_threshold <= self.asr_vad_offset_threshold:
+            raise ValueError(
+                "asr_vad_onset_threshold must exceed asr_vad_offset_threshold"
+            )
+        if self.asr_vad_hangover_ms > self.asr_vad_min_silence_ms:
+            raise ValueError(
+                "asr_vad_hangover_ms must not exceed asr_vad_min_silence_ms"
+            )
         if self.asr_stream_mode == "stateful":
             if self.asr_stream_rollover_seconds <= self.asr_stream_chunk_seconds:
                 raise ValueError(
@@ -90,6 +130,28 @@ class Settings(BaseSettings):
             if self.asr_stream_rollover_seconds <= frame_audio_seconds:
                 raise ValueError(
                     "asr_stream_rollover_seconds must exceed one transport frame"
+                )
+            if self.asr_max_utterance_seconds <= self.asr_stream_chunk_seconds:
+                raise ValueError(
+                    "normal utterance limit must exceed the model chunk duration"
+                )
+            if self.asr_max_utterance_seconds <= frame_audio_seconds:
+                raise ValueError(
+                    "normal utterance limit must exceed one transport frame"
+                )
+            if (
+                self.asr_backend == "qwen_vllm"
+                and self.asr_max_frame_bytes < self.asr_vad_frame_samples * 2
+            ):
+                raise ValueError(
+                    "asr_max_frame_bytes must hold at least one VAD frame"
+                )
+            if (
+                self.asr_state_watchdog_seconds
+                <= self.asr_max_utterance_seconds + frame_audio_seconds
+            ):
+                raise ValueError(
+                    "asr_state_watchdog_seconds must exceed the normal utterance limit plus one frame"
                 )
         return self
 

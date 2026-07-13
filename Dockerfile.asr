@@ -8,10 +8,18 @@ WORKDIR /app
 
 ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 ARG PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
+ARG SILERO_VAD_VERSION=6.2.1
+ARG SILERO_VAD_SHA256=1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential ffmpeg libsndfile1 \
+    && apt-get install -y --no-install-recommends build-essential ca-certificates curl ffmpeg libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /opt/asr-assets \
+    && curl --fail --location --retry 5 \
+      "https://raw.githubusercontent.com/snakers4/silero-vad/v${SILERO_VAD_VERSION}/src/silero_vad/data/silero_vad.onnx" \
+      --output /opt/asr-assets/silero_vad.onnx \
+    && echo "${SILERO_VAD_SHA256}  /opt/asr-assets/silero_vad.onnx" | sha256sum -c -
 
 COPY requirements.txt requirements-asr-vllm.txt ./
 RUN python -m pip install --upgrade pip \
@@ -20,7 +28,18 @@ RUN python -m pip install --upgrade pip \
       --trusted-host "${PIP_TRUSTED_HOST}" \
       -r requirements-asr-vllm.txt
 
+COPY scripts/check_qwen_streaming_contract.py /tmp/check_qwen_streaming_contract.py
+RUN python /tmp/check_qwen_streaming_contract.py \
+    && rm /tmp/check_qwen_streaming_contract.py
+
 COPY app ./app
+COPY licenses/SILERO-VAD-LICENSE /opt/asr-assets/SILERO-VAD-LICENSE
+
+LABEL org.opencontainers.image.asr.vad.name="Silero VAD" \
+      org.opencontainers.image.asr.vad.version="6.2.1" \
+      org.opencontainers.image.asr.vad.source="https://github.com/snakers4/silero-vad/tree/v6.2.1" \
+      org.opencontainers.image.asr.vad.license="MIT" \
+      org.opencontainers.image.asr.vad.sha256="1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"
 
 EXPOSE 8000
 

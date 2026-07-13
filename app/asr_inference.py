@@ -8,7 +8,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import Future
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
 from app.asr import ASRTranscriber, StreamingTranscriptionResult, TranscriptionResult
@@ -117,7 +117,6 @@ class ASRInferenceCoordinator:
         self._busy_sessions: set[str] = set()
         self._batch_pending = False
         self._batch_running = False
-        self._last_timings: dict[str, tuple[float, float]] = {}
 
     @property
     def worker_alive(self) -> bool:
@@ -344,10 +343,6 @@ class ASRInferenceCoordinator:
                 load_error=self._load_error,
             )
 
-    def session_timing(self, session_id: str) -> tuple[float, float]:
-        with self._lock:
-            return self._last_timings.get(session_id, (0.0, 0.0))
-
     async def _submit(
         self,
         action: str,
@@ -531,22 +526,25 @@ class ASRInferenceCoordinator:
                 inference_started = time.monotonic()
                 result = self._execute_job(transcriber, sessions, job)
                 inference_elapsed = time.monotonic() - inference_started
-                if job.session_id:
-                    with self._lock:
-                        if job.session_id in self._active_sessions:
-                            self._last_timings[job.session_id] = (
-                                max(queue_wait, 0.0),
-                                inference_elapsed,
-                            )
-                        else:
-                            self._last_timings.pop(job.session_id, None)
+                decoded_audio_seconds = 0.0
+                if isinstance(result, StreamingTranscriptionResult):
+                    result = replace(
+                        result,
+                        queue_wait_seconds=max(queue_wait, 0.0),
+                        inference_seconds=inference_elapsed,
+                    )
+                    if result.decoded_samples_delta is not None:
+                        decoded_audio_seconds = result.decoded_samples_delta / 16000
                 logger.info(
-                    "asr_inference_completed job_type=%s session_id=%s queue_wait_ms=%.3f inference_ms=%.3f rtf=%.3f",
+                    "asr_inference_completed job_type=%s session_id=%s queue_wait_ms=%.3f inference_ms=%.3f decoded_audio_seconds=%.3f decoded_rtf=%.3f",
                     job.action,
                     job.session_id or "batch",
                     max(queue_wait, 0.0) * 1000,
                     inference_elapsed * 1000,
-                    inference_elapsed / job.audio_seconds if job.audio_seconds else 0.0,
+                    decoded_audio_seconds,
+                    inference_elapsed / decoded_audio_seconds
+                    if decoded_audio_seconds
+                    else 0.0,
                 )
                 if not job.result.done():
                     self._release_session_reservation(job)
@@ -623,7 +621,6 @@ class ASRInferenceCoordinator:
             self._active_sessions.clear()
             self._poisoned_sessions.clear()
             self._busy_sessions.clear()
-            self._last_timings.clear()
             self._batch_pending = False
             self._batch_running = False
             self._queued_audio_seconds = 0.0
@@ -688,7 +685,6 @@ class ASRInferenceCoordinator:
                 sessions.pop(session_id, None)
                 with self._lock:
                     self._active_sessions.discard(session_id)
-                    self._last_timings.pop(session_id, None)
         if job.action == "finish_segment":
             (session_id,) = job.args
             return sessions[session_id].finish_segment()
@@ -702,7 +698,6 @@ class ASRInferenceCoordinator:
             finally:
                 with self._lock:
                     self._active_sessions.discard(session_id)
-                    self._last_timings.pop(session_id, None)
         if job.action == "transcribe_file":
             audio_path, language = job.args
             with self._lock:
@@ -740,7 +735,6 @@ class ASRInferenceCoordinator:
                 self._poisoned_sessions.discard(session_id)
                 self._busy_sessions.discard(session_id)
                 self._active_sessions.discard(session_id)
-                self._last_timings.pop(session_id, None)
 
     def _require_session_admissible(self, session_id: str) -> None:
         with self._lock:

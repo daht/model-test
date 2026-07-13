@@ -43,12 +43,16 @@ def test_remote_deploy_targets_asr_and_runs_websocket_smoke():
 def test_asr_smoke_always_exercises_websocket_lifecycle():
     content = script("smoke_asr.sh")
 
-    assert 'WebSocket smoke: start -> ready -> end -> final' in content
+    assert 'WebSocket smoke: start -> ready -> audio -> end -> final -> close' in content
     assert '"type": "start"' in content
     assert '"type": "end"' in content
+    assert "math.sin" in content
+    assert "send_frame(connection, 2" in content
     assert 'expected ready' in content
     assert 'expected final' in content
-    websocket_position = content.index("WebSocket smoke: start -> ready -> end -> final")
+    websocket_position = content.index(
+        "WebSocket smoke: start -> ready -> audio -> end -> final -> close"
+    )
     audio_guard_position = content.index('if [[ -z "${AUDIO_FILE}" ]]')
     assert websocket_position < audio_guard_position
 
@@ -116,10 +120,14 @@ def _run_sequence_smoke(ready_sequence, final_sequence):
                     self.wfile, {"type": "ready", "sequence": ready_sequence}
                 )
                 _read_websocket_frame(self.rfile)
+                _read_websocket_frame(self.rfile)
+                _read_websocket_frame(self.rfile)
                 _send_websocket_json(
                     self.wfile,
                     {"type": "final", "sequence": final_sequence, "text": ""},
                 )
+                self.wfile.write(b"\x88\x02\x03\xe8")
+                self.wfile.flush()
                 return
             if path == "/v1/transcribe/stream-info":
                 body = {
@@ -195,3 +203,37 @@ def test_asr_smoke_rejects_websocket_sequence_gaps():
 
     assert completed.returncode != 0
     assert "sequence" in completed.stdout + completed.stderr
+
+
+def test_asr_runtime_and_silero_asset_supply_chain_are_fully_pinned():
+    requirements = Path("requirements-asr-vllm.txt").read_text()
+    dockerfile = Path("Dockerfile.asr").read_text()
+    license_text = Path("licenses/SILERO-VAD-LICENSE").read_text()
+
+    assert "qwen-asr[vllm]==0.0.6" in requirements
+    assert "vllm==0.14.0" in requirements
+    assert "onnxruntime==1.23.2" in requirements
+    assert "SILERO_VAD_VERSION=6.2.1" in dockerfile
+    assert "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3" in dockerfile
+    assert "sha256sum -c -" in dockerfile
+    assert "SILERO-VAD-LICENSE" in dockerfile
+    assert "MIT License" in license_text
+
+
+def test_asr_image_executes_official_qwen_streaming_contract_check():
+    dockerfile = Path("Dockerfile.asr").read_text()
+    contract = Path("scripts/check_qwen_streaming_contract.py").read_text()
+
+    assert "check_qwen_streaming_contract.py" in dockerfile
+    assert "ASRStreamingState" in contract
+    for field in (
+        "chunk_size_samples",
+        "chunk_id",
+        "buffer",
+        "audio_accum",
+        "language",
+        "text",
+    ):
+        assert f'"{field}"' in contract
+    assert 'require_version("qwen-asr", "0.0.6")' in contract
+    assert 'require_version("vllm", "0.14.0")' in contract

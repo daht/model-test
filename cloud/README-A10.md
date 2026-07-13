@@ -82,16 +82,18 @@ ASR_DEVICE=auto
 ASR_BACKEND=qwen_vllm
 ASR_STREAM_MODE=stateful
 ASR_STREAM_CHUNK_SECONDS=1.0
-ASR_STREAM_ROLLOVER_SECONDS=120.0
+ASR_MAX_UTTERANCE_SECONDS=30.0
+ASR_STATE_WATCHDOG_SECONDS=120.0
 ASR_VLLM_GPU_MEMORY_UTILIZATION=0.8
 ASR_VLLM_MAX_NEW_TOKENS=32
 ASR_STREAM_UNFIXED_CHUNK_NUM=2
 ASR_STREAM_UNFIXED_TOKEN_NUM=5
-ASR_VAD_SILENCE_SECONDS=0.8
-ASR_STABLE_COMMIT_ENABLED=true
-ASR_STABLE_COMMIT_SECONDS=1.0
-ASR_STABLE_COMMIT_MIN_CHARS=8
-ASR_STABLE_COMMIT_MIN_UPDATES=2
+ASR_VAD_MODEL_VERSION=6.2.1
+ASR_VAD_MODEL_SHA256=1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3
+ASR_VAD_MIN_SPEECH_MS=250
+ASR_VAD_MIN_SILENCE_MS=800
+ASR_VAD_HANGOVER_MS=160
+ASR_VAD_PRE_ROLL_MS=200
 ASR_PROTOCOL_VERSION=2
 ASR_EAGER_LOAD=true
 ASR_FILE_TRANSCRIBE_ENABLED=false
@@ -193,7 +195,7 @@ ASR WebSocket endpoint:
 ws://your-server-ip:8002/v1/transcribe/stream
 ```
 
-Stateful `partial` text is immediately replaceable. A punctuated prefix becomes `sentence_final` only after the exact prefix survives 1.0 second of additional processed audio and at least two updates, with a minimum of 8 non-whitespace characters. The A10 configuration uses 0.8 seconds of VAD silence as the fallback force-commit path.
+Stateful `partial` text is always replaceable, including punctuation revisions. The pinned Silero VAD v6.2.1 CPU model is the normal endpoint source; it confirms speech before any audio reaches Qwen and finalizes after the configured trailing silence while retaining 200ms pre-roll and 160ms hangover. Continuous speech is normally split at 30 seconds. The independent 120-second watchdog is an invariant failure, not a second rollover policy.
 
 Test WebSocket streaming from the server:
 
@@ -225,7 +227,7 @@ Check the deployed ASR mode during smoke tests:
 API_KEY=your-api-key \
 EXPECT_ASR_STREAM_MODE=stateful \
 EXPECT_ASR_BACKEND=qwen_vllm \
-EXPECT_ASR_STABLE_COMMIT_ENABLED=true \
+EXPECT_ASR_STABLE_COMMIT_ENABLED=false \
 BASE_URL=http://127.0.0.1:8002 \
 scripts/smoke_asr.sh
 ```

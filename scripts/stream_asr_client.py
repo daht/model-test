@@ -5,12 +5,15 @@ import argparse
 import asyncio
 import json
 import os
-import subprocess
 import sys
 import time
 import urllib.request
 
 import websockets
+
+
+class StreamClientError(RuntimeError):
+    pass
 
 
 class DisplayState:
@@ -92,7 +95,9 @@ def fetch_stream_info(url: str) -> dict[str, object]:
         return json.loads(response.read().decode("utf-8"))
 
 
-def start_ffmpeg(audio_file: str, sample_rate: int) -> subprocess.Popen[bytes]:
+async def start_ffmpeg(
+    audio_file: str, sample_rate: int
+) -> asyncio.subprocess.Process:
     command = [
         "ffmpeg",
         "-hide_banner",
@@ -108,7 +113,11 @@ def start_ffmpeg(audio_file: str, sample_rate: int) -> subprocess.Popen[bytes]:
         "s16le",
         "-",
     ]
-    return subprocess.Popen(command, stdout=subprocess.PIPE)
+    return await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
 
 
 async def receive_messages(
@@ -118,27 +127,138 @@ async def receive_messages(
 ) -> None:
     display_state = DisplayState()
     tracker = sequence_tracker or SequenceTracker()
-    async for message in websocket:
-        try:
-            payload = json.loads(message)
-        except json.JSONDecodeError:
-            print(message)
-            continue
+    final_count = 0
+    try:
+        async for message in websocket:
+            try:
+                payload = json.loads(message)
+            except json.JSONDecodeError:
+                print(message)
+                continue
+            if not isinstance(payload, dict):
+                raise StreamClientError("server returned a non-object event")
 
-        if warning := tracker.observe(payload):
-            print(f"warning: {warning}", file=sys.stderr)
+            if warning := tracker.observe(payload):
+                print(f"warning: {warning}", file=sys.stderr)
 
-        message_type = payload.get("type")
-        if print_mode == "display":
-            display_text = display_state.apply(payload)
-            if display_text is not None:
-                print(f"[display] {display_text}")
+            message_type = payload.get("type")
+            if message_type == "error":
+                raise StreamClientError(
+                    f"server error {payload.get('code', 'unknown')}: "
+                    f"{payload.get('message', 'ASR stream failed')}"
+                )
+            if message_type == "final":
+                final_count += 1
+            if print_mode == "display":
+                display_text = display_state.apply(payload)
+                if display_text is not None:
+                    print(f"[display] {display_text}")
+                else:
+                    print(json.dumps(payload, ensure_ascii=False))
+            elif message_type in {"partial", "sentence_final", "final"}:
+                print(f"[{message_type}] {payload.get('text', '')}")
             else:
                 print(json.dumps(payload, ensure_ascii=False))
-        elif message_type in {"partial", "sentence_final", "final"}:
-            print(f"[{message_type}] {payload.get('text', '')}")
+    except websockets.ConnectionClosed as exc:
+        if final_count != 1:
+            raise StreamClientError("server closed before final") from exc
+    if final_count != 1:
+        if final_count == 0:
+            raise StreamClientError("server closed before final")
+        raise StreamClientError(f"server sent {final_count} final events")
+
+
+async def send_audio(
+    websocket,
+    process: asyncio.subprocess.Process,
+    args: argparse.Namespace,
+    chunk_size: int,
+) -> None:
+    assert process.stdout is not None
+    start = time.monotonic()
+    sent_chunks = 0
+    while True:
+        chunk = await process.stdout.read(chunk_size)
+        if not chunk:
+            break
+        try:
+            await websocket.send(chunk)
+        except websockets.ConnectionClosed as exc:
+            raise StreamClientError("server closed while audio was being sent") from exc
+        sent_chunks += 1
+        if args.realtime:
+            expected_elapsed = sent_chunks * args.chunk_ms / 1000
+            sleep_for = expected_elapsed - (time.monotonic() - start)
+            if sleep_for > 0:
+                await asyncio.sleep(sleep_for)
+
+    return_code = await process.wait()
+    if return_code:
+        raise StreamClientError(f"ffmpeg exited with status {return_code}")
+    try:
+        await websocket.send(json.dumps({"type": "end"}))
+    except websockets.ConnectionClosed as exc:
+        raise StreamClientError("server closed before end could be sent") from exc
+
+
+async def cleanup_ffmpeg(
+    process: asyncio.subprocess.Process, *, timeout: float = 0.75
+) -> None:
+    if process.returncode is not None:
+        return
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        await process.wait()
+        return
+    try:
+        await asyncio.wait_for(process.wait(), timeout=timeout)
+        return
+    except TimeoutError:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            await process.wait()
+            return
+    try:
+        await asyncio.wait_for(process.wait(), timeout=timeout)
+    except TimeoutError as exc:
+        raise StreamClientError("ffmpeg could not be reaped") from exc
+
+
+async def run_stream_tasks(
+    websocket,
+    process: asyncio.subprocess.Process,
+    args: argparse.Namespace,
+    *,
+    chunk_size: int,
+    sequence_tracker: SequenceTracker,
+) -> None:
+    sender = asyncio.create_task(send_audio(websocket, process, args, chunk_size))
+    receiver = asyncio.create_task(
+        receive_messages(websocket, args.print_mode, sequence_tracker)
+    )
+    tasks = {sender, receiver}
+    try:
+        done, _pending = await asyncio.wait(
+            tasks, return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in done:
+            exception = task.exception()
+            if exception is not None:
+                raise exception
+        if receiver in done and not sender.done():
+            raise StreamClientError("server closed before final audio was sent")
+        if sender in done:
+            await receiver
         else:
-            print(json.dumps(payload, ensure_ascii=False))
+            await sender
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await cleanup_ffmpeg(process)
 
 
 async def stream_audio(args: argparse.Namespace) -> None:
@@ -167,39 +287,31 @@ async def stream_audio(args: argparse.Namespace) -> None:
             )
         )
 
-        first = json.loads(await websocket.recv())
+        try:
+            first = json.loads(await websocket.recv())
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise StreamClientError("server returned an invalid ready response") from exc
+        if not isinstance(first, dict):
+            raise StreamClientError("server returned a non-object ready response")
         print(json.dumps(first, ensure_ascii=False))
         if first.get("type") == "error":
-            return
+            raise StreamClientError(
+                f"server error {first.get('code', 'unknown')}: "
+                f"{first.get('message', 'ASR stream failed')}"
+            )
 
         sequence_tracker = SequenceTracker()
         if warning := sequence_tracker.observe(first):
             print(f"warning: {warning}", file=sys.stderr)
 
-        receiver = asyncio.create_task(
-            receive_messages(websocket, args.print_mode, sequence_tracker)
+        process = await start_ffmpeg(args.audio_file, args.sample_rate)
+        await run_stream_tasks(
+            websocket,
+            process,
+            args,
+            chunk_size=chunk_size,
+            sequence_tracker=sequence_tracker,
         )
-        process = start_ffmpeg(args.audio_file, args.sample_rate)
-
-        assert process.stdout is not None
-        start = time.monotonic()
-        sent_chunks = 0
-
-        while True:
-            chunk = process.stdout.read(chunk_size)
-            if not chunk:
-                break
-            await websocket.send(chunk)
-            sent_chunks += 1
-            if args.realtime:
-                expected_elapsed = sent_chunks * args.chunk_ms / 1000
-                sleep_for = expected_elapsed - (time.monotonic() - start)
-                if sleep_for > 0:
-                    await asyncio.sleep(sleep_for)
-
-        process.wait()
-        await websocket.send(json.dumps({"type": "end"}))
-        await receiver
 
 
 def main() -> None:
@@ -210,6 +322,12 @@ def main() -> None:
         if exc.filename == "ffmpeg":
             raise SystemExit("ffmpeg is required. Install it with: sudo apt install -y ffmpeg")
         raise
+    except StreamClientError as exc:
+        print(f"ASR stream failed: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
+    except (OSError, websockets.WebSocketException) as exc:
+        print(f"ASR connection failed: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
 
 
 if __name__ == "__main__":

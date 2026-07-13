@@ -27,6 +27,38 @@ def new_state(**overrides):
     return StreamingTranscriptState(**values)
 
 
+def test_stateful_segment_snapshot_never_commits_stable_punctuation():
+    state = new_state(
+        segment_local_snapshots=True,
+        stable_commit_enabled=True,
+        immediate_commit_on_punctuation=True,
+    )
+
+    first = state.apply_segment_snapshot(
+        0, "其中最。", decoded_samples_delta=16000
+    )
+    unchanged = state.apply_segment_snapshot(
+        0, "其中最。", decoded_samples_delta=16000
+    )
+    revised = state.apply_segment_snapshot(
+        0, "其中最重要的是保留修订。", decoded_samples_delta=16000
+    )
+
+    assert event_pairs(first) == [("partial", "其中最。")]
+    assert unchanged == []
+    assert event_pairs(revised) == [("partial", "其中最重要的是保留修订。")]
+    assert state.confirmed_text == ""
+
+
+@pytest.mark.parametrize("text", ["N", "嗯", "N嗯"])
+def test_stateful_segment_snapshot_preserves_literal_text(text):
+    state = new_state(segment_local_snapshots=True)
+
+    events = state.apply_segment_snapshot(0, text, decoded_samples_delta=1600)
+
+    assert event_pairs(events) == [("partial", text)]
+
+
 def pcm(value: int, samples: int) -> bytes:
     return array("h", [value] * samples).tobytes()
 
@@ -71,6 +103,21 @@ def test_vad_commit_emits_sentence_and_empty_partial():
 
     assert event_pairs(state.commit_pending()) == [
         ("sentence_final", "hello world"),
+        ("partial", ""),
+    ]
+
+
+def test_segment_commit_preserves_exact_nonblank_snapshot_text():
+    state = new_state(
+        stable_commit_enabled=False,
+        segment_local_snapshots=True,
+    )
+    state.apply_segment_snapshot(
+        7, " hello \n", decoded_samples_delta=1600
+    )
+
+    assert event_pairs(state.commit_pending()) == [
+        ("sentence_final", " hello \n"),
         ("partial", ""),
     ]
 

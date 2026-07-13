@@ -77,19 +77,48 @@ class StreamingTranscriptState:
         stable_commit_min_chars: int,
         stable_commit_min_updates: int,
         immediate_commit_on_punctuation: bool = False,
+        segment_local_snapshots: bool = False,
     ) -> None:
         self.sample_rate = sample_rate
         self.confirmed_text = ""
         self.partial_text = ""
         self.processed_samples = 0
         self._sequence = 0
-        self.immediate_commit_on_punctuation = immediate_commit_on_punctuation
+        self.segment_local_snapshots = segment_local_snapshots
+        self.active_segment_id: int | None = None
+        self.immediate_commit_on_punctuation = (
+            immediate_commit_on_punctuation and not segment_local_snapshots
+        )
         self.stable = StablePunctuationTracker(
-            stable_commit_enabled,
+            stable_commit_enabled and not segment_local_snapshots,
             stable_commit_seconds,
             stable_commit_min_chars,
             stable_commit_min_updates,
         )
+
+    def apply_segment_snapshot(
+        self,
+        segment_id: int,
+        segment_text: str,
+        *,
+        decoded_samples_delta: int,
+    ) -> list[TranscriptEvent]:
+        if not self.segment_local_snapshots:
+            raise RuntimeError("segment snapshots require segment_local_snapshots mode")
+        if self.active_segment_id is None:
+            self.active_segment_id = segment_id
+        elif segment_id != self.active_segment_id:
+            if self.partial_text:
+                raise ConfirmedPrefixConflict(
+                    "new model segment arrived before the active segment was finalized"
+                )
+            self.active_segment_id = segment_id
+        self.processed_samples += decoded_samples_delta
+        previous = self.partial_text
+        self.partial_text = segment_text
+        if self.partial_text != previous:
+            return [self._event("partial", self.partial_text)]
+        return []
 
     @property
     def audio_time(self) -> float:
@@ -117,11 +146,13 @@ class StreamingTranscriptState:
     def commit_pending(self) -> list[TranscriptEvent]:
         if not self.partial_text:
             self.stable.reset()
+            self.active_segment_id = None
             return []
-        sentence = self.partial_text.rstrip()
+        sentence = self.partial_text
         self.partial_text = ""
         self.stable.reset()
-        if not sentence:
+        self.active_segment_id = None
+        if not sentence.strip():
             return [self._event("partial", "")]
         self.confirmed_text += sentence
         return [
@@ -149,6 +180,7 @@ class StreamingTranscriptState:
 
     def reset_segment(self) -> None:
         self.stable.reset()
+        self.active_segment_id = None
 
     def new_event(self, event_type: str, text: str = "") -> TranscriptEvent:
         return self._event(event_type, text)
