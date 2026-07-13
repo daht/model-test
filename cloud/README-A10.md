@@ -46,12 +46,25 @@ MODEL_ID=your-org-or-user/HY-MT1.5-1.8B
 
 Put that value in `.env`.
 
-Qwen3-ASR model:
+Qwen3-ASR model and approval manifest, created on a trusted staging host:
 
 ```bash
 cd /opt/model-test
-hf download Qwen/Qwen3-ASR-1.7B-hf --local-dir models/Qwen3-ASR-1.7B-hf
+hf download Qwen/Qwen3-ASR-1.7B-hf \
+  --revision "$APPROVED_QWEN_REVISION" \
+  --local-dir models/Qwen3-ASR-1.7B-hf
+python3 -m app.asr_artifacts create \
+  --model-dir models/Qwen3-ASR-1.7B-hf \
+  --output models/Qwen3-ASR-1.7B-hf.manifest.json \
+  --source Qwen/Qwen3-ASR-1.7B-hf \
+  --revision "$APPROVED_QWEN_REVISION"
 ```
+
+`APPROVED_QWEN_REVISION` must come from the release approval process. Transfer
+the manifest through the authenticated release channel and do not generate it
+from an unverified target-host download. Runtime verification proves that the
+target files match that manifest; approval of the revision and manifest is an
+external deployment gate.
 
 CosyVoice TTS runtime and model:
 
@@ -69,7 +82,9 @@ cp cloud/A10.env.example .env
 openssl rand -hex 32
 ```
 
-Use the generated value as `API_KEY`.
+Use the generated value as `API_KEY`. Production Qwen backends reject missing
+keys, values shorter than 32 characters, and known placeholders.
+Set `DEPLOYED_API_KEY` to the same value when running the client commands below.
 
 For A10, keep:
 
@@ -79,6 +94,8 @@ DEVICE=auto
 MAX_NEW_TOKENS=1024
 ASR_TORCH_DTYPE=bfloat16
 ASR_DEVICE=auto
+ASR_REQUIRE_MODEL_MANIFEST=true
+ASR_MODEL_MANIFEST_PATH=/models/Qwen3-ASR-1.7B-hf.manifest.json
 ASR_BACKEND=qwen_vllm
 ASR_STREAM_MODE=stateful
 ASR_STREAM_CHUNK_SECONDS=1.0
@@ -154,8 +171,8 @@ From your local machine:
 
 ```bash
 REMOTE_HOST=root@your-server-ip ENV_FILE=.env scripts/deploy_remote.sh
-API_KEY=your-api-key BASE_URL=http://your-server-ip:8000 scripts/smoke_test.sh
-API_KEY=your-api-key BASE_URL=http://your-server-ip:8002 scripts/smoke_asr.sh
+API_KEY="$DEPLOYED_API_KEY" BASE_URL=http://your-server-ip:8000 scripts/smoke_test.sh
+API_KEY="$DEPLOYED_API_KEY" BASE_URL=http://your-server-ip:8002 scripts/smoke_asr.sh
 curl -H "X-API-Key: your-api-key" \
   -H "Content-Type: application/json" \
   -d '{"text":"你好，欢迎使用。"}' \
@@ -200,7 +217,7 @@ Stateful `partial` text is always replaceable, including punctuation revisions. 
 Test WebSocket streaming from the server:
 
 ```bash
-API_KEY=your-api-key \
+API_KEY="$DEPLOYED_API_KEY" \
 python3 scripts/stream_asr_client.py /path/to/audio.wav \
   --url ws://127.0.0.1:8002/v1/transcribe/stream \
   --language zh \
@@ -212,7 +229,7 @@ python3 scripts/stream_asr_client.py /path/to/audio.wav \
 Test from your own machine by changing the URL:
 
 ```bash
-API_KEY=your-api-key \
+API_KEY="$DEPLOYED_API_KEY" \
 python3 scripts/stream_asr_client.py /path/to/audio.wav \
   --url ws://your-server-ip:8002/v1/transcribe/stream \
   --language zh \
@@ -224,7 +241,7 @@ python3 scripts/stream_asr_client.py /path/to/audio.wav \
 Check the deployed ASR mode during smoke tests:
 
 ```bash
-API_KEY=your-api-key \
+API_KEY="$DEPLOYED_API_KEY" \
 EXPECT_ASR_STREAM_MODE=stateful \
 EXPECT_ASR_BACKEND=qwen_vllm \
 EXPECT_ASR_STABLE_COMMIT_ENABLED=false \

@@ -6,6 +6,8 @@ from pydantic import ValidationError
 
 from app.config import Settings
 
+TEST_ONLY_LONG_API_KEY = "unit-test-only-not-a-production-secret-000000"
+
 
 def test_asr_hardening_defaults_are_conservative():
     settings = Settings(_env_file=None)
@@ -124,7 +126,68 @@ def test_asr_model_settings_reject_invalid_numeric_bounds(name, value):
 
 def test_qwen_transformers_backend_rejects_stateful_streaming():
     with pytest.raises(ValidationError, match="qwen.*stateful"):
-        Settings(_env_file=None, asr_backend="qwen", asr_stream_mode="stateful")
+        Settings(
+            _env_file=None,
+            asr_backend="qwen",
+            asr_stream_mode="stateful",
+            api_key=TEST_ONLY_LONG_API_KEY,
+        )
+
+
+@pytest.mark.parametrize("backend", ["qwen", "qwen_vllm"])
+@pytest.mark.parametrize(
+    "api_key",
+    [
+        "short",
+        "change-me",
+        "replace-with-a-long-random-secret",
+        "test-key",
+    ],
+)
+def test_production_asr_backends_reject_short_or_placeholder_api_keys(
+    backend,
+    api_key,
+):
+    with pytest.raises(ValidationError, match="API key"):
+        Settings(
+            _env_file=None,
+            asr_backend=backend,
+            asr_stream_mode="stateful" if backend == "qwen_vllm" else "chunked",
+            api_key=api_key,
+        )
+
+
+@pytest.mark.parametrize("backend", ["qwen", "qwen_vllm"])
+def test_production_asr_backends_reject_missing_api_key(monkeypatch, backend):
+    monkeypatch.delenv("API_KEY", raising=False)
+
+    with pytest.raises(ValidationError, match="API key"):
+        Settings(
+            _env_file=None,
+            asr_backend=backend,
+            asr_stream_mode="stateful" if backend == "qwen_vllm" else "chunked",
+        )
+
+
+@pytest.mark.parametrize(
+    ("backend", "stream_mode"),
+    [("qwen", "chunked"), ("qwen_vllm", "stateful")],
+)
+def test_production_asr_backends_accept_long_test_only_api_key(backend, stream_mode):
+    settings = Settings(
+        _env_file=None,
+        asr_backend=backend,
+        asr_stream_mode=stream_mode,
+        api_key=TEST_ONLY_LONG_API_KEY,
+    )
+
+    assert settings.api_key == TEST_ONLY_LONG_API_KEY
+
+
+def test_explicit_mock_backend_accepts_dummy_api_key():
+    settings = Settings(_env_file=None, asr_backend="mock", api_key="test-key")
+
+    assert settings.api_key == "test-key"
 
 
 @pytest.mark.parametrize(
@@ -140,6 +203,7 @@ def test_supported_asr_backend_stream_mode_pairs_pass(backend, stream_mode):
         _env_file=None,
         asr_backend=backend,
         asr_stream_mode=stream_mode,
+        api_key=TEST_ONLY_LONG_API_KEY,
     )
 
     assert (settings.asr_backend, settings.asr_stream_mode) == (backend, stream_mode)
@@ -151,6 +215,7 @@ def test_rollover_must_exceed_model_chunk_and_transport_frame():
             _env_file=None,
             asr_backend="qwen_vllm",
             asr_stream_mode="stateful",
+            api_key=TEST_ONLY_LONG_API_KEY,
             asr_stream_chunk_seconds=2.0,
             asr_stream_rollover_seconds=1.0,
         )
@@ -162,6 +227,7 @@ def test_normal_utterance_limit_must_exceed_model_chunk_and_transport_frame():
             _env_file=None,
             asr_backend="qwen_vllm",
             asr_stream_mode="stateful",
+            api_key=TEST_ONLY_LONG_API_KEY,
             asr_stream_chunk_seconds=2.0,
             asr_max_utterance_seconds=1.0,
         )
@@ -171,6 +237,7 @@ def test_normal_utterance_limit_must_exceed_model_chunk_and_transport_frame():
             _env_file=None,
             asr_backend="qwen_vllm",
             asr_stream_mode="stateful",
+            api_key=TEST_ONLY_LONG_API_KEY,
             asr_stream_chunk_seconds=0.1,
             asr_max_utterance_seconds=0.4,
             asr_max_frame_bytes=16000,
@@ -181,6 +248,7 @@ def test_normal_utterance_limit_must_exceed_model_chunk_and_transport_frame():
             _env_file=None,
             asr_backend="qwen_vllm",
             asr_stream_mode="stateful",
+            api_key=TEST_ONLY_LONG_API_KEY,
             asr_max_frame_bytes=512,
         )
 
@@ -189,6 +257,7 @@ def test_normal_utterance_limit_must_exceed_model_chunk_and_transport_frame():
             _env_file=None,
             asr_backend="qwen_vllm",
             asr_stream_mode="stateful",
+            api_key=TEST_ONLY_LONG_API_KEY,
             asr_stream_chunk_seconds=0.1,
             asr_stream_rollover_seconds=0.4,
             asr_max_frame_bytes=16000,
@@ -200,6 +269,7 @@ def test_chunked_stream_does_not_apply_stateful_rollover_relationships():
         _env_file=None,
         asr_backend="qwen",
         asr_stream_mode="chunked",
+        api_key=TEST_ONLY_LONG_API_KEY,
         asr_stream_chunk_seconds=2.0,
         asr_stream_rollover_seconds=1.0,
     )
@@ -213,6 +283,7 @@ def test_stateful_vad_thresholds_and_durations_are_cross_validated():
             _env_file=None,
             asr_backend="qwen_vllm",
             asr_stream_mode="stateful",
+            api_key=TEST_ONLY_LONG_API_KEY,
             asr_vad_onset_threshold=0.3,
             asr_vad_offset_threshold=0.4,
         )
@@ -222,6 +293,7 @@ def test_stateful_vad_thresholds_and_durations_are_cross_validated():
             _env_file=None,
             asr_backend="qwen_vllm",
             asr_stream_mode="stateful",
+            api_key=TEST_ONLY_LONG_API_KEY,
             asr_vad_min_silence_ms=100,
             asr_vad_hangover_ms=101,
         )
@@ -231,6 +303,7 @@ def test_stateful_vad_thresholds_and_durations_are_cross_validated():
             _env_file=None,
             asr_backend="qwen_vllm",
             asr_stream_mode="stateful",
+            api_key=TEST_ONLY_LONG_API_KEY,
             asr_max_utterance_seconds=30,
             asr_state_watchdog_seconds=30,
         )

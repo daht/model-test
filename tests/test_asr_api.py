@@ -2,12 +2,15 @@ import os
 import logging
 import threading
 import asyncio
+import wave
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
+
+TEST_ONLY_LONG_API_KEY = "unit-test-only-not-a-production-secret-000000"
 
 os.environ["API_KEY"] = "test-key"
 os.environ["ASR_BACKEND"] = "mock"
@@ -231,7 +234,9 @@ def _start_stream(websocket, *, expect_sequence=False):
     expected = {"type": "ready"}
     if expect_sequence:
         expected["sequence"] = 1
-    assert websocket.receive_json() == expected
+    event = websocket.receive_json()
+    assert event == expected
+    return event
 
 
 def _send_transcribable_chunk(websocket):
@@ -781,11 +786,15 @@ def test_transcribe_accepts_audio_upload_with_language_hint():
 
 
 def test_transcribe_rejects_unsupported_extension():
-    response = client.post(
-        "/v1/transcribe",
-        headers={"X-API-Key": "test-key"},
-        files={"file": ("sample.txt", b"not audio", "text/plain")},
-    )
+    _override_asr_dependencies(FakeCoordinator())
+    try:
+        response = client.post(
+            "/v1/transcribe",
+            headers={"X-API-Key": "test-key"},
+            files={"file": ("sample.txt", b"not audio", "text/plain")},
+        )
+    finally:
+        _clear_asr_dependency_overrides()
 
     assert response.status_code == 400
     assert response.json()["detail"] == "Unsupported audio file type"
@@ -831,6 +840,7 @@ def test_stream_info_reports_streaming_mode_and_stateful_settings(monkeypatch):
     monkeypatch.setenv("ASR_STABLE_COMMIT_MIN_CHARS", "8")
     monkeypatch.setenv("ASR_STABLE_COMMIT_MIN_UPDATES", "2")
     monkeypatch.setenv("ASR_COMMIT_ON_PUNCTUATION", "true")
+    monkeypatch.setenv("API_KEY", TEST_ONLY_LONG_API_KEY)
 
     try:
         response = client.get("/v1/transcribe/stream-info")
@@ -1744,6 +1754,77 @@ def test_chunked_stream_preserves_repeated_independent_chunks():
         _clear_asr_dependency_overrides()
 
 
+def test_chunked_explicit_segments_flush_each_sub_chunk_without_loss_or_duplication():
+    class ExactChunkCoordinator(ProtocolCoordinator):
+        def __init__(self):
+            super().__init__()
+            self.chunk_pcm = []
+            self.texts = iter(["甲", "乙", "丙"])
+
+        async def transcribe_stream_chunk(
+            self,
+            _session_id,
+            audio_path,
+            _language,
+            _audio_seconds,
+        ):
+            with wave.open(audio_path, "rb") as wav_file:
+                self.chunk_pcm.append(wav_file.readframes(wav_file.getnframes()))
+            return TranscriptionResult(next(self.texts), "zh")
+
+    first = _pcm_s16le_samples(101, 73)
+    second = _pcm_s16le_samples(202, 89)
+    final = _pcm_s16le_samples(303, 107)
+    coordinator = ExactChunkCoordinator()
+    _override_protocol(
+        coordinator,
+        asr_stream_mode="chunked",
+        asr_stream_chunk_seconds=1.0,
+        asr_stable_commit_enabled=False,
+        asr_commit_on_punctuation=False,
+    )
+    events = []
+    try:
+        with client.websocket_connect("/v1/transcribe/stream") as websocket:
+            events.append(_start_stream(websocket, expect_sequence=True))
+
+            websocket.send_bytes(first)
+            websocket.send_json({"type": "segment"})
+            events.extend(websocket.receive_json() for _ in range(3))
+
+            websocket.send_json({"type": "segment"})
+
+            websocket.send_bytes(second)
+            websocket.send_json({"type": "segment"})
+            events.extend(websocket.receive_json() for _ in range(3))
+
+            websocket.send_bytes(final)
+            websocket.send_json({"type": "end"})
+            events.extend(websocket.receive_json() for _ in range(2))
+            _assert_closed(websocket, 1000)
+    finally:
+        _clear_asr_dependency_overrides()
+
+    assert coordinator.chunk_pcm == [first, second, final]
+    assert [(event["type"], event.get("text", "")) for event in events] == [
+        ("ready", ""),
+        ("partial", "甲"),
+        ("sentence_final", "甲"),
+        ("partial", ""),
+        ("partial", "乙"),
+        ("sentence_final", "乙"),
+        ("partial", ""),
+        ("partial", "丙"),
+        ("final", "丙"),
+    ]
+    assert [event["sequence"] for event in events] == list(range(1, 10))
+    confirmed = "".join(
+        event["text"] for event in events if event["type"] == "sentence_final"
+    )
+    final_tail = next(event["text"] for event in events if event["type"] == "final")
+    assert confirmed + final_tail == "甲乙丙"
+
+
 def test_chunked_stream_honors_legacy_immediate_punctuation_when_stable_enabled():
     coordinator = ProtocolCoordinator(["你好。"])
     _override_protocol(
@@ -1821,7 +1902,9 @@ def test_qwen_vllm_backend_can_be_selected():
     from app.asr import QwenVLLMASRTranscriber, create_asr_transcriber
     from app.config import Settings
 
-    transcriber = create_asr_transcriber(Settings(asr_backend="qwen_vllm"))
+    transcriber = create_asr_transcriber(
+        Settings(asr_backend="qwen_vllm", api_key=TEST_ONLY_LONG_API_KEY)
+    )
 
     assert isinstance(transcriber, QwenVLLMASRTranscriber)
 
@@ -1887,6 +1970,7 @@ def test_qwen_vllm_streaming_session_feeds_pcm_and_finishes(monkeypatch):
     transcriber = QwenVLLMASRTranscriber(
         Settings(
             asr_backend="qwen_vllm",
+            api_key=TEST_ONLY_LONG_API_KEY,
             asr_max_frame_bytes=32000,
             asr_ws_max_queue=1,
         )
@@ -1930,7 +2014,9 @@ def test_qwen_vllm_warmup_loads_model_once(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "qwen_asr", types.SimpleNamespace(Qwen3ASRModel=FakeQwen3ASRModel))
 
-    transcriber = QwenVLLMASRTranscriber(Settings(asr_backend="qwen_vllm"))
+    transcriber = QwenVLLMASRTranscriber(
+        Settings(asr_backend="qwen_vllm", api_key=TEST_ONLY_LONG_API_KEY)
+    )
     transcriber.warmup()
     transcriber.warmup()
 
@@ -1949,6 +2035,7 @@ def test_qwen_vllm_stateful_warmup_fails_fast_without_vad_asset(
             _env_file=None,
             asr_backend="qwen_vllm",
             asr_stream_mode="stateful",
+            api_key=TEST_ONLY_LONG_API_KEY,
             asr_vad_model_path=str(tmp_path / "missing.onnx"),
         )
     )
@@ -2018,6 +2105,7 @@ def test_qwen_vllm_stateful_warmup_performs_non_silent_streaming_decode(
             _env_file=None,
             asr_backend="qwen_vllm",
             asr_stream_mode="stateful",
+            api_key=TEST_ONLY_LONG_API_KEY,
             asr_stream_chunk_seconds=0.5,
         )
     )
@@ -2068,7 +2156,9 @@ def test_stateful_segment_reset_reinitializes_official_state(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "qwen_asr", types.SimpleNamespace(Qwen3ASRModel=FakeQwen3ASRModel))
 
-    transcriber = QwenVLLMASRTranscriber(Settings(asr_backend="qwen_vllm"))
+    transcriber = QwenVLLMASRTranscriber(
+        Settings(asr_backend="qwen_vllm", api_key=TEST_ONLY_LONG_API_KEY)
+    )
     session = transcriber.create_streaming_session(language="zh")
     first = session.add_pcm_s16le(b"\x00\x00", 16000)
     segment = session.reset_segment()
@@ -2127,6 +2217,7 @@ def test_stateful_segment_finish_flushes_buffer_before_reinitializing(monkeypatc
             _env_file=None,
             asr_backend="qwen_vllm",
             asr_stream_mode="stateful",
+            api_key=TEST_ONLY_LONG_API_KEY,
             asr_stream_chunk_seconds=1.0,
             asr_max_frame_bytes=28800,
             asr_ws_max_queue=1,
@@ -2203,6 +2294,7 @@ def test_stateful_rollover_bounds_official_state_and_preserves_exact_text(monkey
             _env_file=None,
             asr_backend="qwen_vllm",
             asr_stream_mode="stateful",
+            api_key=TEST_ONLY_LONG_API_KEY,
             asr_stream_chunk_seconds=0.1,
             asr_stream_rollover_seconds=120.0,
             asr_max_utterance_seconds=0.25,
@@ -2262,7 +2354,11 @@ def test_stateful_invariant_watchdog_aborts_instead_of_normal_rollover(monkeypat
         types.SimpleNamespace(Qwen3ASRModel=FakeQwen3ASRModel),
     )
     session = QwenVLLMASRTranscriber(
-        Settings(_env_file=None, asr_backend="qwen_vllm")
+        Settings(
+            _env_file=None,
+            asr_backend="qwen_vllm",
+            api_key=TEST_ONLY_LONG_API_KEY,
+        )
     ).create_streaming_session("zh")
     session._max_utterance_samples = 100000
     session._watchdog_samples = 1000
@@ -2297,7 +2393,9 @@ def test_stateful_abort_releases_state(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "qwen_asr", types.SimpleNamespace(Qwen3ASRModel=FakeQwen3ASRModel))
 
-    transcriber = QwenVLLMASRTranscriber(Settings(asr_backend="qwen_vllm"))
+    transcriber = QwenVLLMASRTranscriber(
+        Settings(asr_backend="qwen_vllm", api_key=TEST_ONLY_LONG_API_KEY)
+    )
     session = transcriber.create_streaming_session(language="zh")
     session.abort()
 
@@ -2331,7 +2429,9 @@ def test_qwen_vllm_file_transcribe_normalizes_language_code(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "qwen_asr", types.SimpleNamespace(Qwen3ASRModel=FakeQwen3ASRModel))
 
-    transcriber = QwenVLLMASRTranscriber(Settings(asr_backend="qwen_vllm"))
+    transcriber = QwenVLLMASRTranscriber(
+        Settings(asr_backend="qwen_vllm", api_key=TEST_ONLY_LONG_API_KEY)
+    )
     result = transcriber.transcribe("sample.wav", language="en")
 
     assert result.text == "hello"
@@ -2364,7 +2464,9 @@ def test_qwen_vllm_file_transcribe_normalizes_regional_language_code(monkeypatch
 
     monkeypatch.setitem(sys.modules, "qwen_asr", types.SimpleNamespace(Qwen3ASRModel=FakeQwen3ASRModel))
 
-    transcriber = QwenVLLMASRTranscriber(Settings(asr_backend="qwen_vllm"))
+    transcriber = QwenVLLMASRTranscriber(
+        Settings(asr_backend="qwen_vllm", api_key=TEST_ONLY_LONG_API_KEY)
+    )
     transcriber.transcribe("sample.wav", language="en-US")
 
     assert calls[1] == ("transcribe", {"audio": "sample.wav", "language": "English"})

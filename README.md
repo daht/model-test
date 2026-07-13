@@ -80,7 +80,11 @@ cp cloud/A10.env.example .env
 openssl rand -hex 32
 ```
 
-Put the generated secret into `.env` as `API_KEY`.
+Put the generated secret into `.env` as `API_KEY`. The `qwen` and `qwen_vllm`
+backends refuse to start with a missing key, a key shorter than 32 characters,
+or a known example value. Explicit `mock` backends continue to accept dummy
+keys for local tests.
+Client command examples use `DEPLOYED_API_KEY` for that generated value.
 
 If your model weights are local, copy them into:
 
@@ -90,6 +94,29 @@ models/Qwen3-ASR-1.7B-hf
 models/CosyVoice
 models/CosyVoice-ttsfrd
 ```
+
+Qwen model provenance is a target-host deployment gate. The release operator
+must choose an approved immutable upstream revision, download it on a trusted
+staging host, and create the approval manifest there:
+
+```bash
+hf download Qwen/Qwen3-ASR-1.7B-hf \
+  --revision "$APPROVED_QWEN_REVISION" \
+  --local-dir models/Qwen3-ASR-1.7B-hf
+python3 -m app.asr_artifacts create \
+  --model-dir models/Qwen3-ASR-1.7B-hf \
+  --output models/Qwen3-ASR-1.7B-hf.manifest.json \
+  --source Qwen/Qwen3-ASR-1.7B-hf \
+  --revision "$APPROVED_QWEN_REVISION"
+```
+
+Transfer the model and manifest to the target through the approved release
+channel. Do not create the approval manifest from an unverified target-host
+download: that records hashes but establishes no provenance. At Qwen startup,
+the service rejects missing, extra, changed, or symlinked artifacts when
+`ASR_REQUIRE_MODEL_MANIFEST=true`. Repository tests cannot supply the accepted
+revision or manifest because the production weights and release approval are
+external artifacts.
 
 CosyVoice also needs the official runtime code in the build context:
 
@@ -106,6 +133,8 @@ DEVICE=auto
 TORCH_DTYPE=float16
 MAX_NEW_TOKENS=1024
 ASR_MODEL_ID=/models/Qwen3-ASR-1.7B-hf
+ASR_REQUIRE_MODEL_MANIFEST=true
+ASR_MODEL_MANIFEST_PATH=/models/Qwen3-ASR-1.7B-hf.manifest.json
 ASR_BACKEND=qwen_vllm
 ASR_STREAM_MODE=stateful
 ASR_STREAM_CHUNK_SECONDS=1.0
@@ -200,8 +229,8 @@ SERVICE=qwen-asr-api BASE_URL=http://127.0.0.1:8002 scripts/update_service.sh bu
 Verify:
 
 ```bash
-API_KEY=your-api-key BASE_URL=http://your-server-ip:8000 scripts/smoke_test.sh
-API_KEY=your-api-key BASE_URL=http://your-server-ip:8002 scripts/smoke_asr.sh
+API_KEY="$DEPLOYED_API_KEY" BASE_URL=http://your-server-ip:8000 scripts/smoke_test.sh
+API_KEY="$DEPLOYED_API_KEY" BASE_URL=http://your-server-ip:8002 scripts/smoke_asr.sh
 curl -H "X-API-Key: your-api-key" \
   -H "Content-Type: application/json" \
   -d '{"text":"你好，欢迎使用。"}' \
@@ -213,7 +242,7 @@ Remote deploy from your local machine is also supported:
 
 ```bash
 REMOTE_HOST=root@your-server-ip ENV_FILE=.env scripts/deploy_remote.sh
-API_KEY=your-api-key BASE_URL=http://your-server-ip:8000 scripts/smoke_test.sh
+API_KEY="$DEPLOYED_API_KEY" BASE_URL=http://your-server-ip:8000 scripts/smoke_test.sh
 ```
 
 ## Quick Start
@@ -227,7 +256,7 @@ cp .env.example .env
 Edit `.env`:
 
 ```bash
-API_KEY=your-production-api-key
+# Set API_KEY to the previously generated value.
 MODEL_ID=/models/HY-MT1.5-1.8B
 MODEL_BACKEND=transformers
 MODEL_TASK=causal-lm
@@ -235,10 +264,12 @@ MODEL_TASK=causal-lm
 
 If the model is on Hugging Face, set `MODEL_ID` to the model id. If the model is local, put the weights under `./models/HY-MT1.5-1.8B`.
 
-For Qwen3-ASR, download the model to:
+For Qwen3-ASR, use the approved immutable revision and trusted-staging manifest
+procedure above. The target layout is:
 
-```bash
-hf download Qwen/Qwen3-ASR-1.7B-hf --local-dir models/Qwen3-ASR-1.7B-hf
+```text
+models/Qwen3-ASR-1.7B-hf/
+models/Qwen3-ASR-1.7B-hf.manifest.json
 ```
 
 For CosyVoice TTS, download the model and runtime resources:
@@ -340,16 +371,21 @@ End the stream with:
 {"type":"end"}
 ```
 
-Clear pending audio while keeping the WebSocket session open:
+Finalize pending audio while keeping the WebSocket session open:
 
 ```json
 {"type":"segment"}
 ```
 
+In both streaming modes, `segment` first transcribes any buffered PCM, appends
+the returned text, emits `sentence_final` followed by the clearing `partial`
+when the segment is non-empty, and only then resets the segment. An empty
+buffer is a valid no-op boundary.
+
 You can test the ASR stream with the included client:
 
 ```bash
-API_KEY=your-production-api-key \
+API_KEY="$DEPLOYED_API_KEY" \
 python scripts/stream_asr_client.py /path/to/audio.wav \
   --url ws://127.0.0.1:8002/v1/transcribe/stream \
   --language zh \
@@ -388,7 +424,7 @@ SERVICE=qwen-asr-api BASE_URL=http://127.0.0.1:8002 scripts/update_service.sh bu
 Smoke-test the expected ASR mode:
 
 ```bash
-API_KEY=your-production-api-key \
+API_KEY="$DEPLOYED_API_KEY" \
 EXPECT_ASR_STREAM_MODE=stateful \
 EXPECT_ASR_BACKEND=qwen_vllm \
 EXPECT_ASR_STABLE_COMMIT_ENABLED=false \
@@ -435,8 +471,8 @@ Use the mock backend when you only want to verify the API service:
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
-MODEL_BACKEND=mock API_KEY=test-key .venv/bin/python -m pytest tests/test_api.py -q
-MODEL_BACKEND=mock API_KEY=test-key .venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+MODEL_BACKEND=mock ASR_BACKEND=mock TTS_BACKEND=mock API_KEY=test-key .venv/bin/python -m pytest tests/test_api.py -q
+MODEL_BACKEND=mock ASR_BACKEND=mock TTS_BACKEND=mock API_KEY=test-key .venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 ## Cloud VM Notes
@@ -530,7 +566,8 @@ Response:
 
 ## Production Checklist
 
-- Replace `API_KEY` with a long random secret.
+- Generate `API_KEY` with `openssl rand -hex 32`; production ASR rejects short and known placeholder values.
+- Supply the operator-approved Qwen manifest and keep `ASR_REQUIRE_MODEL_MANIFEST=true`.
 - Use HTTPS in front of the service.
 - Add request rate limiting at Nginx, API Gateway, or load balancer level.
 - Mount model weights read-only.

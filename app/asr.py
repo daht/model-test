@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
 
+from app.asr_artifacts import verify_model_manifest
 from app.config import Settings
 from app.asr_vad import create_vad_endpoint_detector
 
@@ -251,6 +252,7 @@ class QwenASRTranscriber(ASRTranscriber):
         if self._processor is not None and self._model is not None:
             return
 
+        self._verify_model_artifacts()
         import torch
         from transformers import AutoModelForMultimodalLM, AutoProcessor
 
@@ -287,6 +289,13 @@ class QwenASRTranscriber(ASRTranscriber):
                 **model_kwargs,
             )
         self._model.eval()
+
+    def _verify_model_artifacts(self) -> None:
+        if self.settings.asr_model_manifest_path:
+            verify_model_manifest(
+                self.settings.asr_model_id,
+                self.settings.asr_model_manifest_path,
+            )
 
     def warmup(self) -> None:
         with self._lock:
@@ -515,6 +524,11 @@ class QwenVLLMASRTranscriber(ASRTranscriber):
     def _load(self) -> None:
         if self._model is not None:
             return
+        if self.settings.asr_model_manifest_path:
+            verify_model_manifest(
+                self.settings.asr_model_id,
+                self.settings.asr_model_manifest_path,
+            )
         from qwen_asr import Qwen3ASRModel
 
         self._model = Qwen3ASRModel.LLM(

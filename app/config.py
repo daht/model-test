@@ -8,6 +8,15 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 SILERO_VAD_SHA256 = (
     "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"
 )
+PRODUCTION_API_KEY_MIN_LENGTH = 32
+PRODUCTION_API_KEY_PLACEHOLDERS = {
+    "change-me",
+    "replace-with-a-long-random-secret",
+    "test-key",
+    "your-api-key",
+    "your-production-api-key",
+    "<your-api-key>",
+}
 
 
 class Settings(BaseSettings):
@@ -20,6 +29,8 @@ class Settings(BaseSettings):
     model_task: Literal["causal-lm", "seq2seq-lm"] = "causal-lm"
     asr_model_name: str = "Qwen3-ASR-1.7B"
     asr_model_id: str = "/models/Qwen3-ASR-1.7B-hf"
+    asr_require_model_manifest: bool = False
+    asr_model_manifest_path: str | None = None
     asr_backend: Literal["qwen", "qwen_vllm", "mock"] = "qwen"
     asr_stream_mode: Literal["chunked", "stateful"] = "chunked"
     api_key: str = Field(default="change-me", description="Required X-API-Key value")
@@ -104,8 +115,29 @@ class Settings(BaseSettings):
             raise ValueError("asr_vad_model_sha256 must match the pinned model")
         return normalized
 
+    @field_validator("asr_model_manifest_path")
+    @classmethod
+    def normalize_optional_manifest_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip() or None
+
     @model_validator(mode="after")
     def bound_websocket_buffered_audio(self) -> "Settings":
+        if self.asr_backend in {"qwen", "qwen_vllm"}:
+            normalized_api_key = self.api_key.strip()
+            if (
+                len(normalized_api_key) < PRODUCTION_API_KEY_MIN_LENGTH
+                or normalized_api_key.lower() in PRODUCTION_API_KEY_PLACEHOLDERS
+            ):
+                raise ValueError(
+                    "Production ASR API key must be at least 32 characters and not a known placeholder"
+                )
+            self.api_key = normalized_api_key
+            if self.asr_require_model_manifest and not self.asr_model_manifest_path:
+                raise ValueError(
+                    "Production ASR model manifest path is required when manifest verification is enabled"
+                )
         frame_audio_seconds = self.asr_max_frame_bytes / (2 * 16000)
         buffered_audio_seconds = self.asr_ws_max_queue * frame_audio_seconds
         if buffered_audio_seconds > self.asr_max_connection_lag_seconds:

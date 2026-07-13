@@ -909,12 +909,13 @@ async def _run_chunked_transcribe_stream(
             await controller.validate_audio_frame(pcm_bytes)
             buffer.extend(pcm_bytes)
             if len(buffer) >= min_chunk_bytes:
-                segment_text = await controller.transcribe_chunk(bytes(buffer), language)
-                buffer.clear()
-                if segment_text:
-                    await controller._send_events(
-                        controller.transcript.append_independent_segment(segment_text)
-                    )
+                await _flush_chunked_buffer(
+                    controller,
+                    buffer,
+                    language,
+                    silence_detector,
+                    commit_boundary=False,
+                )
             if silence_detector.add_audio(pcm_bytes, sample_rate):
                 await controller._send_events(controller.transcript.commit_pending())
         elif "text" in message and message["text"] is not None:
@@ -927,12 +928,13 @@ async def _run_chunked_transcribe_stream(
                 await controller.fail("invalid_message", "Expected a JSON object", 1003)
                 raise _StreamClosed
             if payload.get("type") == "end":
-                if buffer:
-                    segment_text = await controller.transcribe_chunk(bytes(buffer), language)
-                    if segment_text:
-                        await controller._send_events(
-                            controller.transcript.append_independent_segment(segment_text)
-                        )
+                await _flush_chunked_buffer(
+                    controller,
+                    buffer,
+                    language,
+                    silence_detector,
+                    commit_boundary=False,
+                )
                 await controller._ensure_session_active()
                 await controller._send_event(
                     controller.transcript.new_event("final", controller.transcript.partial_text)
@@ -941,10 +943,38 @@ async def _run_chunked_transcribe_stream(
                 await websocket.close(code=1000)
                 return
             if payload.get("type") == "segment":
-                buffer.clear()
-                silence_detector.reset()
+                await _flush_chunked_buffer(
+                    controller,
+                    buffer,
+                    language,
+                    silence_detector,
+                    commit_boundary=True,
+                )
                 continue
             await controller.fail("invalid_message", "Unsupported stream command", 1003)
             raise _StreamClosed
         elif message.get("type") == "websocket.disconnect":
             return
+
+
+async def _flush_chunked_buffer(
+    controller: StreamingSessionController,
+    buffer: bytearray,
+    language: str | None,
+    silence_detector: SilenceEndpointDetector,
+    *,
+    commit_boundary: bool,
+) -> None:
+    if buffer:
+        segment_text = await controller.transcribe_chunk(bytes(buffer), language)
+        if segment_text:
+            await controller._send_events(
+                controller.transcript.append_independent_segment(segment_text)
+            )
+    if commit_boundary:
+        await controller._ensure_session_active()
+        await controller._send_events(controller.transcript.commit_pending())
+    buffer.clear()
+    if commit_boundary:
+        controller.transcript.reset_segment()
+        silence_detector.reset()

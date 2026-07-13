@@ -174,6 +174,7 @@ def test_production_stateful_backend_fails_fast_when_vad_asset_is_missing(tmp_pa
         _env_file=None,
         asr_backend="qwen_vllm",
         asr_stream_mode="stateful",
+        api_key="unit-test-only-not-a-production-secret-000000",
         asr_vad_model_path=str(tmp_path / "missing.onnx"),
     )
 

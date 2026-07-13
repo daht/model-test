@@ -36,6 +36,12 @@ X-API-Key: <your-api-key>
 
 WebSocket streaming sends the API key in the first JSON message.
 
+Production `qwen` and `qwen_vllm` configuration fails closed unless `API_KEY`
+is at least 32 characters and is not a known placeholder. Generate it with
+`openssl rand -hex 32`. Explicit `ASR_BACKEND=mock` test configurations may use
+dummy keys.
+Shell examples use `DEPLOYED_API_KEY` for the generated deployment value.
+
 ## Health Checks
 
 ### Translation Health
@@ -232,9 +238,19 @@ and Silero VAD v6.2.1 with SHA256
 `1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3`.
 VAD runs only on `CPUExecutionProvider` with bounded intra/inter-op threads.
 
+The Qwen weights have no checksum invented in this repository. Production
+deployment requires an operator-approved JSON manifest created on a trusted
+staging host with `python3 -m app.asr_artifacts create`, delivered alongside
+the model through the release channel. Startup verifies the exact local file
+set, sizes, SHA256 values, and absence of symlinks before loading Qwen. The
+operator's approval and authenticated delivery of that manifest remain an
+external provenance gate.
+
 ```bash
 ASR_BACKEND=qwen_vllm
 ASR_STREAM_MODE=stateful
+ASR_REQUIRE_MODEL_MANIFEST=true
+ASR_MODEL_MANIFEST_PATH=/models/Qwen3-ASR-1.7B-hf.manifest.json
 ASR_STREAM_CHUNK_SECONDS=1.0
 ASR_MAX_UTTERANCE_SECONDS=30.0
 ASR_STATE_WATCHDOG_SECONDS=120.0
@@ -306,7 +322,7 @@ End the stream:
 }
 ```
 
-Clear the pending server audio buffer without closing the connection:
+Finalize the pending server audio buffer without closing the connection:
 
 ```json
 {
@@ -314,7 +330,12 @@ Clear the pending server audio buffer without closing the connection:
 }
 ```
 
-Use `segment` when the client needs an explicit utterance boundary without closing the socket. It flushes and finalizes the current non-empty segment exactly once, then initializes a fresh official Qwen streaming state.
+Use `segment` when the client needs an explicit utterance boundary without
+closing the socket. Stateful mode flushes and finalizes the official Qwen
+state. Chunked mode atomically transcribes any remainder below the normal chunk
+threshold, appends it, emits `sentence_final` and the clearing `partial`, and
+then clears the buffer. Both modes finalize a non-empty segment exactly once;
+an empty boundary is valid.
 
 Server final response:
 
@@ -344,7 +365,7 @@ One GPU must be owned by one ASR process with one Uvicorn worker. Horizontal sca
 Test client:
 
 ```bash
-API_KEY=<your-api-key> \
+API_KEY="$DEPLOYED_API_KEY" \
 python3 scripts/stream_asr_client.py /path/to/audio.wav \
   --url wss://asr-api.example.com/v1/transcribe/stream \
   --language zh \

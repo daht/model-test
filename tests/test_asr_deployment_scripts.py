@@ -65,6 +65,23 @@ def test_a10_runbook_blocks_unvalidated_three_service_gpu_colocation():
     assert "nvidia-smi" in content
 
 
+def test_production_examples_fail_closed_on_secrets_and_model_provenance():
+    generic_env = Path(".env.example").read_text()
+    a10_env = Path("cloud/A10.env.example").read_text()
+    runbook = Path("cloud/README-A10.md").read_text()
+
+    for example in (generic_env, a10_env):
+        assert "API_KEY=\n" in example
+        assert "ASR_REQUIRE_MODEL_MANIFEST=true" in example
+        assert (
+            "ASR_MODEL_MANIFEST_PATH=/models/Qwen3-ASR-1.7B-hf.manifest.json"
+            in example
+        )
+    assert "APPROVED_QWEN_REVISION" in runbook
+    assert "external deployment gate" in runbook
+    assert "unverified target-host download" in runbook
+
+
 def _read_websocket_frame(stream):
     first, second = stream.read(2)
     length = second & 0x7F
