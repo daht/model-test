@@ -1,9 +1,10 @@
 import argparse
 import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
-from websockets.exceptions import ConnectionClosedError
+from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 from websockets.frames import Close
 
 from scripts import stream_asr_client
@@ -66,7 +67,7 @@ def test_strict_protocol_requires_continuous_sequence_and_sentence_final():
     class WebSocket:
         def __init__(self, payloads, *, close_code=1000, close_error=None):
             self.payloads = iter(json.dumps(payload) for payload in payloads)
-            self.close_code = close_code
+            self.protocol = SimpleNamespace(close_rcvd=Close(close_code, ""))
             self.close_error = close_error
 
         def __aiter__(self):
@@ -122,9 +123,8 @@ def test_strict_protocol_requires_continuous_sequence_and_sentence_final():
 
 def test_strict_protocol_rejects_abnormal_close_after_final():
     class WebSocket:
-        close_code = 1011
-
         def __init__(self):
+            self.protocol = SimpleNamespace(close_rcvd=Close(1011, "server failure"))
             self.payloads = iter(
                 json.dumps(payload)
                 for payload in (
@@ -161,9 +161,8 @@ def test_strict_protocol_rejects_abnormal_close_after_final():
 
 def test_strict_protocol_rejects_event_after_final():
     class WebSocket:
-        close_code = 1000
-
         def __init__(self):
+            self.protocol = SimpleNamespace(close_rcvd=Close(1000, ""))
             self.payloads = iter(
                 json.dumps(payload)
                 for payload in (
@@ -193,6 +192,214 @@ def test_strict_protocol_rejects_event_after_final():
                 verify_protocol=True,
             )
         )
+
+
+def test_strict_protocol_rejects_malformed_json_immediately(capsys):
+    class WebSocket:
+        protocol = SimpleNamespace(close_rcvd=Close(1000, ""))
+
+        def __init__(self):
+            self.messages = iter(
+                (
+                    "not-json",
+                    json.dumps(
+                        {"type": "sentence_final", "sequence": 2, "text": "speech"}
+                    ),
+                    json.dumps({"type": "final", "sequence": 3, "text": ""}),
+                )
+            )
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self.messages)
+            except StopIteration:
+                raise StopAsyncIteration from None
+
+    tracker = stream_asr_client.SequenceTracker()
+    tracker.observe({"type": "ready", "sequence": 1})
+
+    with pytest.raises(stream_asr_client.StreamClientError, match="malformed JSON"):
+        asyncio.run(
+            stream_asr_client.receive_messages(
+                WebSocket(),
+                sequence_tracker=tracker,
+                verify_protocol=True,
+            )
+        )
+    assert "not-json" not in capsys.readouterr().out
+
+
+def test_non_strict_protocol_keeps_malformed_json_visible(capsys):
+    class WebSocket:
+        close_code = 1000
+
+        def __init__(self):
+            self.messages = iter(("not-json", json.dumps({"type": "final"})))
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self.messages)
+            except StopIteration:
+                raise StopAsyncIteration from None
+
+    asyncio.run(stream_asr_client.receive_messages(WebSocket()))
+
+    assert "not-json" in capsys.readouterr().out
+
+
+def test_strict_protocol_rejects_sent_only_normal_close():
+    class WebSocket:
+        protocol = SimpleNamespace(
+            close_rcvd=Close(1000, "contradictory protocol state")
+        )
+
+        def __init__(self):
+            self.messages = iter(
+                json.dumps(payload)
+                for payload in (
+                    {"type": "sentence_final", "sequence": 2, "text": "speech"},
+                    {"type": "final", "sequence": 3, "text": ""},
+                )
+            )
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self.messages)
+            except StopIteration:
+                raise ConnectionClosedError(
+                    None,
+                    Close(1000, "local close"),
+                    None,
+                ) from None
+
+    tracker = stream_asr_client.SequenceTracker()
+    tracker.observe({"type": "ready", "sequence": 1})
+
+    with pytest.raises(stream_asr_client.StreamClientError, match="received.*close"):
+        asyncio.run(
+            stream_asr_client.receive_messages(
+                WebSocket(),
+                sequence_tracker=tracker,
+                verify_protocol=True,
+            )
+        )
+
+
+def test_strict_protocol_accepts_received_normal_close_after_final():
+    class WebSocket:
+        protocol = SimpleNamespace(close_rcvd=Close(1000, "normal"))
+
+        def __init__(self):
+            self.messages = iter(
+                json.dumps(payload)
+                for payload in (
+                    {"type": "sentence_final", "sequence": 2, "text": "speech"},
+                    {"type": "final", "sequence": 3, "text": ""},
+                )
+            )
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self.messages)
+            except StopIteration:
+                raise ConnectionClosedOK(
+                    Close(1000, "normal"),
+                    Close(1000, "normal"),
+                    True,
+                ) from None
+
+    tracker = stream_asr_client.SequenceTracker()
+    tracker.observe({"type": "ready", "sequence": 1})
+
+    asyncio.run(
+        stream_asr_client.receive_messages(
+            WebSocket(),
+            sequence_tracker=tracker,
+            verify_protocol=True,
+        )
+    )
+
+
+def test_api_key_source_is_tracked_and_strict_mode_requires_environment(monkeypatch):
+    environment_marker = "environment-source-marker"
+    argument_marker = "argument-source-marker"
+    monkeypatch.setenv("API_KEY", environment_marker)
+
+    environment_args = stream_asr_client.parse_args(
+        ["external-audio.flac", "--verify-protocol"]
+    )
+    argument_args = stream_asr_client.parse_args(
+        [
+            "external-audio.flac",
+            "--verify-protocol",
+            "--api-key",
+            argument_marker,
+        ]
+    )
+    manual_args = stream_asr_client.parse_args(
+        ["external-audio.flac", "--api-key", argument_marker]
+    )
+
+    assert environment_args.api_key_source == "environment"
+    assert argument_args.api_key_source == "argument"
+    assert manual_args.api_key_source == "argument"
+    stream_asr_client.validate_api_key_input(environment_args)
+    stream_asr_client.validate_api_key_input(manual_args)
+    with pytest.raises(SystemExit, match="API_KEY environment"):
+        stream_asr_client.validate_api_key_input(argument_args)
+
+
+def test_strict_mode_missing_key_names_only_environment_input(monkeypatch):
+    monkeypatch.delenv("API_KEY", raising=False)
+    args = stream_asr_client.parse_args(["external-audio.flac", "--verify-protocol"])
+
+    assert args.api_key_source == "missing"
+    with pytest.raises(SystemExit, match="Missing API_KEY environment variable"):
+        stream_asr_client.validate_api_key_input(args)
+
+
+def test_stream_runtime_rejects_strict_argument_key_without_logging_it(
+    monkeypatch, capsys
+):
+    argument_marker = "argument-source-marker"
+    monkeypatch.delenv("API_KEY", raising=False)
+    args = stream_asr_client.parse_args(
+        [
+            "external-audio.flac",
+            "--verify-protocol",
+            "--api-key",
+            argument_marker,
+        ]
+    )
+
+    with pytest.raises(SystemExit, match="API_KEY environment"):
+        asyncio.run(stream_asr_client.stream_audio(args))
+
+    captured = capsys.readouterr()
+    assert argument_marker not in captured.out
+    assert argument_marker not in captured.err
+
+
+def test_cli_help_explains_strict_credential_source(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        stream_asr_client.parse_args(["--help"])
+
+    assert exc_info.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "manual non-strict use" in help_text
+    assert "API_KEY environment variable" in help_text
 
 
 def test_error_payload_is_not_treated_as_transcript():

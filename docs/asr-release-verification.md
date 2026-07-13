@@ -84,7 +84,12 @@ and GPU host described above.
 Supply two external files containing actual speech. Do not copy or generate
 audio under the repository. Provide the deployed API key only through the
 environment; never place it in a command argument, shell history, repository
-file, evidence filename, or issue text.
+file, evidence filename, or issue text. The streaming client's strict
+`--verify-protocol` mode accepts the key only from the `API_KEY` environment
+variable and rejects `--api-key`, even when both are present. The argument
+remains available for ordinary, non-strict manual use. This source distinction
+is explicit; the client never compares or prints key values to infer where a
+key came from.
 
 ```bash
 export ASR_LIVE_BASE_URL="https://asr.example.internal"
@@ -107,7 +112,9 @@ mode runs the existing readiness/WebSocket smoke, then Chinese and Japanese
 speech at 200 ms and 500 ms real-time chunks. Strict client validation requires
 `ready` at sequence 1, continuous event sequences, no `error`, at least one
 `sentence_final`, exactly one terminal `final`, no later event, and normal close
-code 1000. It then runs the
+code 1000 received from the server. Malformed JSON fails immediately. A locally
+sent close frame is not proof of server closure, and a missing received close
+frame fails strict verification. It then runs the
 Chinese and Japanese 200 ms streams concurrently and enforces completion overhead
 for every stream. GPU `memory.used` is polled every 0.25 seconds throughout the
 live gates. L04 requires zero failed `nvidia-smi` queries, at least four valid

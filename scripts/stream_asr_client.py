@@ -16,6 +16,19 @@ class StreamClientError(RuntimeError):
     pass
 
 
+class APIKeyAction(argparse.Action):
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: str,
+        option_string: str | None = None,
+    ) -> None:
+        del parser, option_string
+        namespace.api_key = values
+        namespace.api_key_source = "argument"
+
+
 class DisplayState:
     def __init__(self) -> None:
         self.confirmed: list[str] = []
@@ -53,7 +66,7 @@ class SequenceTracker:
         return None
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Test Qwen ASR WebSocket streaming.")
     parser.add_argument("audio_file", help="Input audio file, such as wav/mp3/m4a/flac")
     parser.add_argument(
@@ -63,8 +76,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--api-key",
+        action=APIKeyAction,
         default=os.environ.get("API_KEY"),
-        help="API key, defaults to API_KEY env var",
+        help=(
+            "API key for manual non-strict use; strict verification requires "
+            "the API_KEY environment variable"
+        ),
     )
     parser.add_argument("--language", default=os.environ.get("LANGUAGE", "zh"))
     parser.add_argument("--sample-rate", type=int, default=16000)
@@ -80,9 +97,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--verify-protocol",
         action="store_true",
-        help="Require strict sequences, sentence_final, one terminal final, and close code 1000.",
+        help=(
+            "Require API_KEY from the environment, strict sequences, sentence_final, "
+            "one terminal final, and a received close code 1000."
+        ),
     )
-    return parser.parse_args()
+    parser.set_defaults(
+        api_key_source="environment" if os.environ.get("API_KEY") else "missing"
+    )
+    return parser.parse_args(argv)
+
+
+def validate_api_key_input(args: argparse.Namespace) -> None:
+    source = getattr(args, "api_key_source", "missing")
+    if getattr(args, "verify_protocol", False):
+        if source == "argument":
+            raise SystemExit(
+                "Strict protocol verification requires the API_KEY environment "
+                "variable; --api-key is not allowed."
+            )
+        if source != "environment" or not args.api_key:
+            raise SystemExit(
+                "Missing API_KEY environment variable for strict protocol verification."
+            )
+        return
+    if not args.api_key:
+        raise SystemExit("Missing API key. Pass --api-key or set API_KEY.")
 
 
 def default_stream_info_url(ws_url: str) -> str:
@@ -135,14 +175,19 @@ async def receive_messages(
     tracker = sequence_tracker or SequenceTracker()
     final_count = 0
     sentence_final_count = 0
-    close_code = None
+    received_close_code = None
+    connection_closed_exception = False
     try:
         async for message in websocket:
             if verify_protocol and final_count:
                 raise StreamClientError("server sent an event after final")
             try:
                 payload = json.loads(message)
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as exc:
+                if verify_protocol:
+                    raise StreamClientError(
+                        "server returned a malformed JSON event"
+                    ) from exc
                 print(message)
                 continue
             if not isinstance(payload, dict):
@@ -182,24 +227,24 @@ async def receive_messages(
             else:
                 print(json.dumps(payload, ensure_ascii=False))
     except websockets.ConnectionClosed as exc:
+        connection_closed_exception = True
         if exc.rcvd is not None:
-            close_code = exc.rcvd.code
-        elif exc.sent is not None:
-            close_code = exc.sent.code
-        else:
-            close_code = None
-        if verify_protocol and close_code != 1000:
+            received_close_code = exc.rcvd.code
+    if received_close_code is None and not connection_closed_exception:
+        protocol = getattr(websocket, "protocol", None)
+        close_rcvd = getattr(protocol, "close_rcvd", None)
+        if close_rcvd is not None:
+            received_close_code = close_rcvd.code
+    if verify_protocol:
+        if received_close_code is None:
             raise StreamClientError(
-                f"server closed with code {close_code}; expected normal close code 1000"
-            ) from exc
-        if final_count != 1:
-            raise StreamClientError("server closed before final") from exc
-    if close_code is None:
-        close_code = getattr(websocket, "close_code", None)
-    if verify_protocol and close_code != 1000:
-        raise StreamClientError(
-            f"server closed with code {close_code!r}; expected normal close code 1000"
-        )
+                "server did not send a received close frame; expected normal close code 1000"
+            )
+        if received_close_code != 1000:
+            raise StreamClientError(
+                f"server close frame used code {received_close_code}; "
+                "expected normal close code 1000"
+            )
     if final_count != 1:
         if final_count == 0:
             raise StreamClientError("server closed before final")
@@ -325,8 +370,7 @@ async def run_stream_tasks(
 
 
 async def stream_audio(args: argparse.Namespace) -> None:
-    if not args.api_key:
-        raise SystemExit("Missing API key. Pass --api-key or set API_KEY.")
+    validate_api_key_input(args)
 
     if args.show_stream_info:
         stream_info_url = args.stream_info_url or default_stream_info_url(args.url)
