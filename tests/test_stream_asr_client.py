@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import json
 
 import pytest
 
@@ -35,6 +36,81 @@ def test_sequence_tracker_reports_gap_and_non_increasing_sequence():
     assert tracker.observe({"sequence": 1}) is None
     assert tracker.observe({"sequence": 3}) == "server event sequence gap: expected 2, got 3"
     assert tracker.observe({"sequence": 3}) == "server event sequence is not increasing: 3 after 3"
+
+
+def test_strict_ready_validation_requires_ready_at_sequence_one():
+    tracker = stream_asr_client.SequenceTracker()
+
+    stream_asr_client.validate_ready_event(
+        {"type": "ready", "sequence": 1},
+        tracker,
+        verify_protocol=True,
+    )
+    with pytest.raises(stream_asr_client.StreamClientError, match="ready"):
+        stream_asr_client.validate_ready_event(
+            {"type": "partial", "sequence": 1},
+            stream_asr_client.SequenceTracker(),
+            verify_protocol=True,
+        )
+    with pytest.raises(stream_asr_client.StreamClientError, match="sequence"):
+        stream_asr_client.validate_ready_event(
+            {"type": "ready", "sequence": 2},
+            stream_asr_client.SequenceTracker(),
+            verify_protocol=True,
+        )
+
+
+def test_strict_protocol_requires_continuous_sequence_and_sentence_final():
+    class WebSocket:
+        def __init__(self, payloads):
+            self.payloads = iter(json.dumps(payload) for payload in payloads)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self.payloads)
+            except StopIteration:
+                raise StopAsyncIteration from None
+
+    async def receive(payloads):
+        tracker = stream_asr_client.SequenceTracker()
+        tracker.observe({"type": "ready", "sequence": 1})
+        await stream_asr_client.receive_messages(
+            WebSocket(payloads),
+            sequence_tracker=tracker,
+            verify_protocol=True,
+        )
+
+    asyncio.run(
+        receive(
+            [
+                {"type": "sentence_final", "sequence": 2, "text": "hello"},
+                {"type": "final", "sequence": 3, "text": ""},
+            ]
+        )
+    )
+    with pytest.raises(stream_asr_client.StreamClientError, match="sequence"):
+        asyncio.run(
+            receive(
+                [
+                    {"type": "sentence_final", "sequence": 3, "text": "hello"},
+                    {"type": "final", "sequence": 4, "text": ""},
+                ]
+            )
+        )
+    with pytest.raises(stream_asr_client.StreamClientError, match="sequence"):
+        asyncio.run(
+            receive(
+                [
+                    {"type": "sentence_final", "text": "hello"},
+                    {"type": "final", "sequence": 2, "text": ""},
+                ]
+            )
+        )
+    with pytest.raises(stream_asr_client.StreamClientError, match="sentence_final"):
+        asyncio.run(receive([{"type": "final", "sequence": 2, "text": ""}]))
 
 
 def test_error_payload_is_not_treated_as_transcript():

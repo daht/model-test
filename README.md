@@ -42,6 +42,7 @@ and includes the upstream MIT license. Runtime startup never downloads VAD asset
 - `scripts/deploy_remote.sh`: rsync and remote Docker Compose deployment.
 - `scripts/smoke_test.sh`: post-deploy API check.
 - `scripts/smoke_asr.sh`: post-deploy Qwen3-ASR API check.
+- `scripts/verify_asr_release.sh`: layered commit, release, and live ASR verification. See `docs/asr-release-verification.md`.
 - `scripts/update_service.sh`: update/recreate the cloud Docker service.
 - `cloud/README-A10.md`: A10-specific deployment runbook.
 

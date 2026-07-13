@@ -158,6 +158,11 @@ MODEL_TASK=seq2seq-lm
 
 ## 4. Deploy
 
+Before promotion and again against the deployed service, follow the layered
+commit, release, and live gates in `docs/asr-release-verification.md`. The runner
+fails closed when Docker, GPU, approved model, manifest, live audio, runtime
+secret, or SLO inputs are unavailable.
+
 From the server:
 
 ```bash

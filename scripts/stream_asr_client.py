@@ -77,6 +77,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Sleep between chunks to simulate microphone streaming.",
     )
+    parser.add_argument(
+        "--verify-protocol",
+        action="store_true",
+        help="Fail on sequence gaps and require sentence_final plus exactly one final.",
+    )
     return parser.parse_args()
 
 
@@ -124,10 +129,12 @@ async def receive_messages(
     websocket: websockets.ClientConnection,
     print_mode: str = "events",
     sequence_tracker: SequenceTracker | None = None,
+    verify_protocol: bool = False,
 ) -> None:
     display_state = DisplayState()
     tracker = sequence_tracker or SequenceTracker()
     final_count = 0
+    sentence_final_count = 0
     try:
         async for message in websocket:
             try:
@@ -138,7 +145,18 @@ async def receive_messages(
             if not isinstance(payload, dict):
                 raise StreamClientError("server returned a non-object event")
 
+            sequence = payload.get("sequence")
+            if verify_protocol and (
+                isinstance(sequence, bool)
+                or not isinstance(sequence, int)
+                or sequence <= 0
+            ):
+                raise StreamClientError(
+                    f"event sequence must be a positive integer, got {sequence!r}"
+                )
             if warning := tracker.observe(payload):
+                if verify_protocol:
+                    raise StreamClientError(warning)
                 print(f"warning: {warning}", file=sys.stderr)
 
             message_type = payload.get("type")
@@ -149,6 +167,8 @@ async def receive_messages(
                 )
             if message_type == "final":
                 final_count += 1
+            elif message_type == "sentence_final":
+                sentence_final_count += 1
             if print_mode == "display":
                 display_text = display_state.apply(payload)
                 if display_text is not None:
@@ -166,6 +186,26 @@ async def receive_messages(
         if final_count == 0:
             raise StreamClientError("server closed before final")
         raise StreamClientError(f"server sent {final_count} final events")
+    if verify_protocol and sentence_final_count == 0:
+        raise StreamClientError("server sent no sentence_final event for speech audio")
+
+
+def validate_ready_event(
+    payload: dict[str, object],
+    sequence_tracker: SequenceTracker,
+    *,
+    verify_protocol: bool,
+) -> str | None:
+    if payload.get("type") != "ready":
+        raise StreamClientError(f"expected ready event, got {payload!r}")
+    sequence = payload.get("sequence")
+    if verify_protocol and (
+        isinstance(sequence, bool) or not isinstance(sequence, int) or sequence != 1
+    ):
+        raise StreamClientError(
+            f"ready event sequence must start at 1, got {sequence!r}"
+        )
+    return sequence_tracker.observe(payload)
 
 
 async def send_audio(
@@ -236,7 +276,12 @@ async def run_stream_tasks(
 ) -> None:
     sender = asyncio.create_task(send_audio(websocket, process, args, chunk_size))
     receiver = asyncio.create_task(
-        receive_messages(websocket, args.print_mode, sequence_tracker)
+        receive_messages(
+            websocket,
+            args.print_mode,
+            sequence_tracker,
+            verify_protocol=getattr(args, "verify_protocol", False),
+        )
     )
     tasks = {sender, receiver}
     try:
@@ -301,7 +346,11 @@ async def stream_audio(args: argparse.Namespace) -> None:
             )
 
         sequence_tracker = SequenceTracker()
-        if warning := sequence_tracker.observe(first):
+        if warning := validate_ready_event(
+            first,
+            sequence_tracker,
+            verify_protocol=getattr(args, "verify_protocol", False),
+        ):
             print(f"warning: {warning}", file=sys.stderr)
 
         process = await start_ffmpeg(args.audio_file, args.sample_rate)
