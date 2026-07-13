@@ -11,6 +11,9 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+_OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
+_STAT_SUPPORTS_DIR_FD = os.stat in os.supports_dir_fd
+_STAT_SUPPORTS_NOFOLLOW = os.stat in os.supports_follow_symlinks
 
 
 class ModelArtifactVerificationError(RuntimeError):
@@ -197,29 +200,44 @@ def _read_manifest_bytes(path: Path) -> bytes:
         resolved_parent = path.parent.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
         raise ModelArtifactVerificationError("Model manifest does not exist") from exc
-    resolved = resolved_parent / path.name
     if not path.name:
         raise ModelArtifactVerificationError("Model manifest must be a regular file")
 
     no_follow = getattr(os, "O_NOFOLLOW", None)
-    if no_follow is None or os.stat not in os.supports_follow_symlinks:
+    directory_only = getattr(os, "O_DIRECTORY", None)
+    if (
+        no_follow is None
+        or directory_only is None
+        or not _OPEN_SUPPORTS_DIR_FD
+        or not _STAT_SUPPORTS_DIR_FD
+        or not _STAT_SUPPORTS_NOFOLLOW
+    ):
         raise ModelArtifactVerificationError(
             "Safe model manifest verification is unsupported on this platform"
         )
-    flags = (
-        os.O_RDONLY
-        | no_follow
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NONBLOCK", 0)
-    )
+    common_flags = os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0)
     try:
-        descriptor = os.open(resolved, flags)
+        parent_descriptor = os.open(
+            resolved_parent,
+            common_flags | directory_only,
+        )
     except OSError as exc:
         raise ModelArtifactVerificationError(
-            "Unable to open model manifest safely"
+            "Unable to open model manifest parent safely"
         ) from exc
 
+    descriptor = None
     try:
+        parent_before = os.fstat(parent_descriptor)
+        if not stat.S_ISDIR(parent_before.st_mode):
+            raise ModelArtifactVerificationError(
+                "Model manifest parent must be a directory"
+            )
+        descriptor = os.open(
+            path.name,
+            common_flags | getattr(os, "O_NONBLOCK", 0),
+            dir_fd=parent_descriptor,
+        )
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode):
             raise ModelArtifactVerificationError(
@@ -229,22 +247,29 @@ def _read_manifest_bytes(path: Path) -> bytes:
         while chunk := os.read(descriptor, 1024 * 1024):
             chunks.append(chunk)
         after = os.fstat(descriptor)
+        current = os.stat(
+            path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        parent_after = os.fstat(parent_descriptor)
+        named_parent = os.stat(resolved_parent, follow_symlinks=False)
+    except ModelArtifactVerificationError:
+        raise
     except OSError as exc:
         raise ModelArtifactVerificationError(
             "Unable to read model manifest safely"
         ) from exc
     finally:
-        os.close(descriptor)
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent_descriptor)
 
     manifest_bytes = b"".join(chunks)
-    try:
-        current = os.stat(resolved, follow_symlinks=False)
-    except OSError as exc:
-        raise ModelArtifactVerificationError(
-            "Model manifest changed during verification"
-        ) from exc
     if (
-        _file_state(before) != _file_state(after)
+        _file_identity(parent_before) != _file_identity(parent_after)
+        or _file_identity(parent_after) != _file_identity(named_parent)
+        or _file_state(before) != _file_state(after)
         or _file_state(after) != _file_state(current)
         or len(manifest_bytes) != after.st_size
     ):
@@ -254,11 +279,17 @@ def _read_manifest_bytes(path: Path) -> bytes:
     return manifest_bytes
 
 
-def _file_state(metadata: os.stat_result) -> tuple[int, ...]:
+def _file_identity(metadata: os.stat_result) -> tuple[int, ...]:
     return (
         metadata.st_dev,
         metadata.st_ino,
         metadata.st_mode,
+    )
+
+
+def _file_state(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        *_file_identity(metadata),
         metadata.st_nlink,
         metadata.st_size,
         metadata.st_mtime_ns,

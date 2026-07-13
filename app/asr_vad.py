@@ -212,9 +212,13 @@ class StreamingVADEndpointDetector:
         else:
             discarded += len(self._input_buffer) // 2
             if self.state is VADEndpointState.SPEECH_CANDIDATE:
-                discarded += self._candidate_speech_samples
+                discarded += len(self._candidate) // 2
+                transitions.append(
+                    self._transition(VADEndpointState.WAITING_FOR_SPEECH)
+                )
         self._input_buffer.clear()
         self._candidate.clear()
+        self._candidate_speech_samples = 0
         self._trailing.clear()
         return VADDecision(bytes(audio), False, discarded, tuple(transitions))
 

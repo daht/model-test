@@ -141,6 +141,40 @@ def test_endpoint_retains_only_silence_not_released_as_hangover():
     ) == 7
 
 
+def test_finish_input_discards_and_resets_entire_unconfirmed_candidate():
+    vad = detector(
+        [0.1, 0.9],
+        sample_rate=1000,
+        frame_samples=1,
+        min_speech_ms=2,
+        pre_roll_ms=10,
+    )
+
+    decisions = [
+        vad.add_audio(pcm(1, samples=1)),
+        vad.add_audio(pcm(2, samples=1)),
+        vad.finish_input(),
+    ]
+    released_samples = sum(len(decision.audio_to_model) // 2 for decision in decisions)
+    discarded_samples = sum(decision.discarded_samples for decision in decisions)
+    retained_samples = sum(
+        len(buffer) // 2
+        for buffer in (
+            vad._input_buffer,
+            vad._pre_roll,
+            vad._candidate,
+            vad._trailing,
+        )
+    )
+
+    assert released_samples == 0
+    assert discarded_samples == 2
+    assert retained_samples == 0
+    assert released_samples + discarded_samples + retained_samples == 2
+    assert vad._candidate_speech_samples == 0
+    assert vad.state is VADEndpointState.WAITING_FOR_SPEECH
+
+
 def test_trailing_silence_is_released_when_speech_resumes():
     vad = detector([0.9, 0.9, 0.9, 0.1, 0.1, 0.8])
     speech = [pcm(1000 + index) for index in range(3)]

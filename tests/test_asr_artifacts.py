@@ -1,5 +1,6 @@
 import hashlib
 import json
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -174,6 +175,44 @@ def test_model_manifest_rejects_path_replacement_during_descriptor_read(
 
     with pytest.raises(ModelArtifactVerificationError, match="changed"):
         verify_model_manifest(model_dir, manifest)
+
+
+def test_model_manifest_rejects_parent_symlink_swap_before_leaf_open(
+    tmp_path,
+    monkeypatch,
+):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    content = b"approved-test-content"
+    (model_dir / "model.safetensors").write_bytes(content)
+    release_dir = tmp_path / "release"
+    release_dir.mkdir()
+    manifest = release_dir / "manifest.json"
+    entries = [_entry("model.safetensors", content)]
+    _write_manifest(manifest, entries)
+    attacker_dir = tmp_path / "attacker-release"
+    attacker_dir.mkdir()
+    _write_manifest(attacker_dir / manifest.name, entries)
+    held_release_dir = tmp_path / "held-release"
+    original_open = asr_artifacts.os.open
+    swapped = False
+
+    def swap_parent_then_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if not swapped and (
+            Path(path) == manifest or kwargs.get("dir_fd") is not None
+        ):
+            swapped = True
+            release_dir.rename(held_release_dir)
+            release_dir.symlink_to(attacker_dir, target_is_directory=True)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(asr_artifacts.os, "open", swap_parent_then_open)
+
+    with pytest.raises(ModelArtifactVerificationError, match="manifest"):
+        verify_model_manifest(model_dir, manifest)
+
+    assert swapped is True
 
 
 @pytest.mark.parametrize("schema_version", [True, False, 1.0, "1", 2])
