@@ -493,6 +493,7 @@ class ASRInferenceCoordinator:
         while True:
             job = self._jobs.get()
             self._release_queue_slot(job)
+            job_succeeded = False
             try:
                 if job.action == "shutdown":
                     job.started.set_result(None)
@@ -548,9 +549,7 @@ class ASRInferenceCoordinator:
                     if decoded_audio_seconds
                     else 0.0,
                 )
-                if not job.result.done():
-                    self._release_session_reservation(job)
-                    job.result.set_result(result)
+                job_succeeded = True
             except Exception as exc:
                 if not job.started.done():
                     job.started.set_result(None)
@@ -565,12 +564,24 @@ class ASRInferenceCoordinator:
                     job.result.set_exception(worker_error)
                 raise
             finally:
+                cleanup_error: BaseException | None = None
                 try:
                     self._cleanup_poisoned_session(sessions, job.session_id)
+                except BaseException as exc:
+                    cleanup_error = exc
                 finally:
                     self._release_audio_reservation(job.audio_seconds)
                     self._release_session_reservation(job)
                     self._jobs.task_done()
+                if cleanup_error is not None:
+                    worker_error = ASRNotReady("ASR owner worker stopped unexpectedly")
+                    if not job.started.done():
+                        job.started.set_exception(worker_error)
+                    if not job.result.done():
+                        job.result.set_exception(worker_error)
+                    raise cleanup_error
+                if job_succeeded and not job.result.done():
+                    job.result.set_result(result)
 
     def _job_expired_before_start(self, job: _Job) -> bool:
         with self._lock:

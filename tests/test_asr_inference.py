@@ -741,17 +741,61 @@ def test_poison_abort_failure_isolated_and_worker_remains_ready():
     assert registries == (set(), set())
 
 
+def test_success_result_waits_for_worker_cleanup():
+    async def scenario():
+        coordinator, _records, _holder = make_coordinator()
+        await coordinator.start()
+
+        submitted_job = {}
+        original_new_job = coordinator._new_job
+
+        def capture_job(*args, **kwargs):
+            job = original_new_job(*args, **kwargs)
+            if job.action == "create_stream":
+                submitted_job["job"] = job
+            return job
+
+        coordinator._new_job = capture_job
+        cleanup_started = threading.Event()
+        release_cleanup = threading.Event()
+        original_cleanup = coordinator._cleanup_poisoned_session
+
+        def blocking_cleanup(sessions, session_id):
+            cleanup_started.set()
+            assert release_cleanup.wait(1)
+            original_cleanup(sessions, session_id)
+
+        coordinator._cleanup_poisoned_session = blocking_cleanup
+        create_task = asyncio.create_task(coordinator.create_stream(None))
+        try:
+            assert await asyncio.to_thread(cleanup_started.wait, 1)
+            result_published_during_cleanup = submitted_job["job"].result.done()
+        finally:
+            release_cleanup.set()
+        session_id = await create_task
+        coordinator._cleanup_poisoned_session = original_cleanup
+        await coordinator.abort_stream(session_id)
+        await coordinator.stop()
+        return result_published_during_cleanup
+
+    result_published_during_cleanup = asyncio.run(scenario())
+
+    assert result_published_during_cleanup is False
+
+
 def test_unexpected_worker_exit_clears_cached_readiness():
     async def scenario():
         coordinator, _records, _holder = make_coordinator()
         await coordinator.start()
         session_id = await coordinator.create_stream(None)
+        await asyncio.to_thread(coordinator._jobs.join)
 
         def raise_after_job(*_args):
             raise RuntimeError("unexpected cleanup failure")
 
         coordinator._cleanup_poisoned_session = raise_after_job
-        result = await coordinator.add_audio(session_id, b"ok", 16000)
+        with pytest.raises(ASRNotReady, match="owner worker stopped unexpectedly"):
+            await coordinator.add_audio(session_id, b"ok", 16000)
         await asyncio.to_thread(coordinator._thread.join, 1)
         queue_joined = threading.Event()
 
@@ -761,11 +805,10 @@ def test_unexpected_worker_exit_clears_cached_readiness():
 
         threading.Thread(target=join_queue, daemon=True).start()
         accounting_completed = await asyncio.to_thread(queue_joined.wait, 0.2)
-        return result, coordinator.snapshot(), coordinator.worker_alive, accounting_completed
+        return coordinator.snapshot(), coordinator.worker_alive, accounting_completed
 
-    result, snapshot, worker_alive, accounting_completed = asyncio.run(scenario())
+    snapshot, worker_alive, accounting_completed = asyncio.run(scenario())
 
-    assert result.text == "ok"
     assert worker_alive is False
     assert snapshot.ready is False
     assert snapshot.accepting is False
