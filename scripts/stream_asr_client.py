@@ -80,7 +80,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--verify-protocol",
         action="store_true",
-        help="Fail on sequence gaps and require sentence_final plus exactly one final.",
+        help="Require strict sequences, sentence_final, one terminal final, and close code 1000.",
     )
     return parser.parse_args()
 
@@ -135,8 +135,11 @@ async def receive_messages(
     tracker = sequence_tracker or SequenceTracker()
     final_count = 0
     sentence_final_count = 0
+    close_code = None
     try:
         async for message in websocket:
+            if verify_protocol and final_count:
+                raise StreamClientError("server sent an event after final")
             try:
                 payload = json.loads(message)
             except json.JSONDecodeError:
@@ -144,7 +147,6 @@ async def receive_messages(
                 continue
             if not isinstance(payload, dict):
                 raise StreamClientError("server returned a non-object event")
-
             sequence = payload.get("sequence")
             if verify_protocol and (
                 isinstance(sequence, bool)
@@ -180,8 +182,24 @@ async def receive_messages(
             else:
                 print(json.dumps(payload, ensure_ascii=False))
     except websockets.ConnectionClosed as exc:
+        if exc.rcvd is not None:
+            close_code = exc.rcvd.code
+        elif exc.sent is not None:
+            close_code = exc.sent.code
+        else:
+            close_code = None
+        if verify_protocol and close_code != 1000:
+            raise StreamClientError(
+                f"server closed with code {close_code}; expected normal close code 1000"
+            ) from exc
         if final_count != 1:
             raise StreamClientError("server closed before final") from exc
+    if close_code is None:
+        close_code = getattr(websocket, "close_code", None)
+    if verify_protocol and close_code != 1000:
+        raise StreamClientError(
+            f"server closed with code {close_code!r}; expected normal close code 1000"
+        )
     if final_count != 1:
         if final_count == 0:
             raise StreamClientError("server closed before final")

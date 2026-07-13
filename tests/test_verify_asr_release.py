@@ -42,6 +42,30 @@ def test_release_runner_rejects_unknown_mode():
     assert "Unknown mode" in result.stderr
 
 
+def test_commit_rejects_fake_python_interpreters_before_any_gate():
+    for fake_python in ("/bin/true", "/bin/echo"):
+        result = run_runner(
+            "commit",
+            env={"ASR_VERIFY_PYTHON": fake_python},
+        )
+
+        assert result.returncode == 1
+        assert "ASR_VERIFY_PYTHON" in result.stderr
+        assert "Full explicit-mock pytest suite" not in result.stdout
+
+
+def test_release_and_live_inherit_fake_python_rejection():
+    for mode in ("release", "live"):
+        result = run_runner(
+            mode,
+            env={"ASR_VERIFY_PYTHON": "/bin/true"},
+        )
+
+        assert result.returncode == 1
+        assert "ASR_VERIFY_PYTHON" in result.stderr
+        assert "verification passed" not in result.stdout
+
+
 def test_commit_dry_run_plans_full_suite_once_and_all_local_gates():
     result = run_runner("--dry-run", "commit")
 
@@ -86,11 +110,11 @@ def test_release_mode_missing_prerequisites_fails_before_commit_suite(tmp_path):
 
 
 def test_live_mode_never_echoes_runtime_secret_on_preflight_failure(tmp_path):
-    dummy_secret = "test-only-runtime-secret-never-print-12345"
+    redaction_sentinel = "redaction-sentinel-" + ("x" * 32)
     result = run_runner(
         "live",
         env={
-            "ASR_LIVE_API_KEY": dummy_secret,
+            "ASR_LIVE_API_KEY": redaction_sentinel,
             "ASR_RELEASE_ENV_FILE": str(tmp_path / "missing.env"),
         },
     )
@@ -98,7 +122,7 @@ def test_live_mode_never_echoes_runtime_secret_on_preflight_failure(tmp_path):
     output = result.stdout + result.stderr
     assert result.returncode == 1
     assert "Missing live prerequisites" in output
-    assert dummy_secret not in output
+    assert redaction_sentinel not in output
 
 
 def test_help_and_dry_run_leave_repo_and_temp_directory_unchanged(tmp_path):

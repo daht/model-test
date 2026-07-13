@@ -10,6 +10,7 @@ MODE=""
 PYTHON_BIN=""
 TEMP_DIR=""
 GPU_MONITOR_PID=""
+GPU_MONITOR_STATE=""
 MISSING=()
 
 usage() {
@@ -74,7 +75,7 @@ list_live_gates() {
 L01 deployed smoke: health, readiness, stream-info contract, and synthetic WebSocket lifecycle pass
 L02 speech matrix: zh and ja audio pass strict protocol validation at 200 ms and 500 ms real-time chunks
 L03 concurrent speech: zh and ja 200 ms streams pass together with no protocol or server error
-L04 live SLO: each stream meets configured completion overhead and sampled GPU memory stays within limit
+L04 live SLO: overhead passes; GPU has zero query failures and at least 4 samples spanning 0.75s
 EOF
 }
 
@@ -103,7 +104,7 @@ C05 high-confidence secret scan of tracked worktree and index
 C06 forbidden tracked paths plus binary/large staged delta checks
 C03 git ls-files '*.sh' | bash -n each script
 C02 PYTHONPYCACHEPREFIX=<temporary>/pycache python -m compileall -q app tests scripts
-C01 MODEL_BACKEND=mock ASR_BACKEND=mock TTS_BACKEND=mock API_KEY=<test-only> python -m pytest tests -q
+C01 MODEL_BACKEND=mock ASR_BACKEND=mock TTS_BACKEND=mock API_KEY=<ephemeral> python -m pytest tests -q
 EOF
 }
 
@@ -130,7 +131,7 @@ L02 stream_asr_client.py <zh-audio> --language zh --chunk-ms 500 --realtime --ve
 L02 stream_asr_client.py <ja-audio> --language ja --chunk-ms 200 --realtime --verify-protocol
 L02 stream_asr_client.py <ja-audio> --language ja --chunk-ms 500 --realtime --verify-protocol
 L03 concurrent zh+ja 200 ms strict streams
-L04 enforce configured stream overhead and sampled GPU memory limits
+L04 enforce overhead plus zero-failure GPU coverage (4 samples across 0.75s) and GPU memory limit
 EOF
 }
 
@@ -190,7 +191,17 @@ if ((DRY_RUN)); then
 fi
 
 cleanup() {
+  local attempt
   if [[ -n "${GPU_MONITOR_PID}" ]]; then
+    if [[ -n "${GPU_MONITOR_STATE}" ]]; then
+      touch "${GPU_MONITOR_STATE}/stop" 2>/dev/null || true
+    fi
+    for attempt in {1..60}; do
+      if ! kill -0 "${GPU_MONITOR_PID}" 2>/dev/null; then
+        break
+      fi
+      sleep 0.05
+    done
     kill "${GPU_MONITOR_PID}" 2>/dev/null || true
     wait "${GPU_MONITOR_PID}" 2>/dev/null || true
   fi
@@ -209,9 +220,7 @@ ensure_temp_dir() {
 }
 
 select_python() {
-  if [[ -n "${ASR_VERIFY_PYTHON:-}" ]]; then
-    PYTHON_BIN="${ASR_VERIFY_PYTHON}"
-  elif [[ -x "${ROOT_DIR}/.venv/bin/python" ]]; then
+  if [[ -x "${ROOT_DIR}/.venv/bin/python" ]]; then
     PYTHON_BIN="${ROOT_DIR}/.venv/bin/python"
   else
     PYTHON_BIN="python3"
@@ -223,12 +232,24 @@ add_missing() {
 }
 
 collect_commit_prerequisites() {
+  local python_sentinel=""
+  local pytest_sentinel=""
+  if [[ -n "${ASR_VERIFY_PYTHON:-}" ]]; then
+    add_missing "ASR_VERIFY_PYTHON is unsupported; use the repository environment"
+  fi
   command -v git >/dev/null 2>&1 || add_missing "git"
   command -v bash >/dev/null 2>&1 || add_missing "bash"
   select_python
   command -v "${PYTHON_BIN}" >/dev/null 2>&1 || add_missing "Python (${PYTHON_BIN})"
   if command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
-    "${PYTHON_BIN}" -c "import pytest" >/dev/null 2>&1 || add_missing "pytest for ${PYTHON_BIN}"
+    python_sentinel="$("${PYTHON_BIN}" -c 'print("ASR_VERIFY_PYTHON_OK")' 2>/dev/null)" || true
+    if [[ "${python_sentinel}" != "ASR_VERIFY_PYTHON_OK" ]]; then
+      add_missing "functional Python interpreter at ${PYTHON_BIN}"
+    fi
+    pytest_sentinel="$("${PYTHON_BIN}" -c 'import pytest; print("ASR_VERIFY_PYTEST_OK")' 2>/dev/null)" || true
+    if [[ "${pytest_sentinel}" != "ASR_VERIFY_PYTEST_OK" ]]; then
+      add_missing "functional pytest for ${PYTHON_BIN}"
+    fi
   fi
   git rev-parse --is-inside-work-tree >/dev/null 2>&1 || add_missing "Git worktree"
 }
@@ -427,6 +448,7 @@ run_commit_gates() {
   local script_path
   local before_status
   local after_status
+  local mock_api_key
   preflight commit
   ensure_temp_dir
   before_status="${TEMP_DIR}/git-status.before"
@@ -453,11 +475,12 @@ run_commit_gates() {
     "${PYTHON_BIN}" -m compileall -q app tests scripts
 
   gate C01 "Full explicit-mock pytest suite"
+  mock_api_key="$("${PYTHON_BIN}" -c 'import secrets; print(secrets.token_hex(32))')"
   PYTHONDONTWRITEBYTECODE=1 \
     MODEL_BACKEND=mock \
     ASR_BACKEND=mock \
     TTS_BACKEND=mock \
-    API_KEY="${ASR_VERIFY_MOCK_API_KEY:-test-key}" \
+    API_KEY="${mock_api_key}" \
     "${PYTHON_BIN}" -m pytest tests -q -p no:cacheprovider
 
   git status --porcelain=v1 --untracked-files=all >"${after_status}"
@@ -482,10 +505,13 @@ validate_compose_config() {
   model_real="$(cd "${model_dir}" && pwd)"
   manifest_real="$(cd "$(dirname "${manifest}")" && pwd)/$(basename "${manifest}")"
   root_real="$(cd "${model_root}" && pwd)"
-  "${PYTHON_BIN}" - "${rendered}" "${root_real}" "${model_real}" "${manifest_real}" <<'PY'
+  PYTHONDONTWRITEBYTECODE=1 \
+    "${PYTHON_BIN}" - "${rendered}" "${root_real}" "${model_real}" "${manifest_real}" <<'PY'
 import json
 import sys
 from pathlib import Path
+
+from app.config import PRODUCTION_API_KEY_MIN_LENGTH, PRODUCTION_API_KEY_PLACEHOLDERS
 
 config_path, model_root_raw, model_raw, manifest_raw = sys.argv[1:]
 config = json.loads(Path(config_path).read_text())
@@ -508,15 +534,10 @@ for name, expected in required.items():
     if actual != expected:
         raise SystemExit(f"Compose {name} must be {expected}, got {actual or '<missing>'}")
 api_key = str(environment.get("API_KEY", ""))
-placeholders = {
-    "change-me",
-    "replace-with-a-long-random-secret",
-    "test-key",
-    "your-api-key",
-    "your-production-api-key",
-    "<your-api-key>",
-}
-if len(api_key.strip()) < 32 or api_key.strip().lower() in placeholders:
+if (
+    len(api_key.strip()) < PRODUCTION_API_KEY_MIN_LENGTH
+    or api_key.strip().lower() in PRODUCTION_API_KEY_PLACEHOLDERS
+):
     raise SystemExit("Compose API_KEY must be a non-placeholder production secret")
 command = [str(item) for item in service.get("command") or []]
 if "--workers" not in command or command[command.index("--workers") + 1] != "1":
@@ -630,38 +651,29 @@ run_live_client() {
 }
 
 start_gpu_monitor() {
-  local samples="${TEMP_DIR}/gpu-memory.samples"
-  local stop_file="${TEMP_DIR}/gpu-memory.stop"
-  : >"${samples}"
-  (
-    while [[ ! -e "${stop_file}" ]]; do
-      nvidia-smi \
-        --id="${ASR_LIVE_GPU_INDEX:-0}" \
-        --query-gpu=memory.used \
-        --format=csv,noheader,nounits 2>/dev/null \
-        | head -n 1 >>"${samples}" || true
-      sleep 0.25
-    done
-  ) &
+  GPU_MONITOR_STATE="${TEMP_DIR}/gpu-monitor"
+  mkdir -p "${GPU_MONITOR_STATE}"
+  PYTHONDONTWRITEBYTECODE=1 "${PYTHON_BIN}" scripts/asr_gpu_monitor.py record \
+    --state-dir "${GPU_MONITOR_STATE}" \
+    --gpu-index "${ASR_LIVE_GPU_INDEX:-0}" \
+    --interval-seconds 0.25 &
   GPU_MONITOR_PID=$!
 }
 
 stop_and_validate_gpu_monitor() {
-  local samples="${TEMP_DIR}/gpu-memory.samples"
-  local maximum
-  touch "${TEMP_DIR}/gpu-memory.stop"
-  wait "${GPU_MONITOR_PID}" || true
+  local monitor_status=0
+  touch "${GPU_MONITOR_STATE}/stop"
+  wait "${GPU_MONITOR_PID}" || monitor_status=$?
   GPU_MONITOR_PID=""
-  maximum="$(awk 'BEGIN { max = -1 } $1 ~ /^[0-9]+$/ && $1 > max { max = $1 } END { print max }' "${samples}")"
-  if [[ ! "${maximum}" =~ ^[0-9]+$ ]]; then
-    echo "GPU memory sampling produced no valid values." >&2
+  if ((monitor_status != 0)); then
+    echo "GPU monitor process failed with status ${monitor_status}." >&2
     return 1
   fi
-  echo "GPU memory sampled peak: ${maximum} MiB"
-  if ((maximum > ASR_LIVE_MAX_GPU_MEMORY_MIB)); then
-    echo "GPU memory limit exceeded: ${maximum} > ${ASR_LIVE_MAX_GPU_MEMORY_MIB} MiB" >&2
-    return 1
-  fi
+  PYTHONDONTWRITEBYTECODE=1 "${PYTHON_BIN}" scripts/asr_gpu_monitor.py validate \
+    --state-dir "${GPU_MONITOR_STATE}" \
+    --maximum-memory-mib "${ASR_LIVE_MAX_GPU_MEMORY_MIB}" \
+    --minimum-samples 4 \
+    --minimum-span-seconds 0.75
 }
 
 run_concurrent_live_gate() {

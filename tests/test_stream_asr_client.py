@@ -3,6 +3,8 @@ import asyncio
 import json
 
 import pytest
+from websockets.exceptions import ConnectionClosedError
+from websockets.frames import Close
 
 from scripts import stream_asr_client
 
@@ -62,8 +64,10 @@ def test_strict_ready_validation_requires_ready_at_sequence_one():
 
 def test_strict_protocol_requires_continuous_sequence_and_sentence_final():
     class WebSocket:
-        def __init__(self, payloads):
+        def __init__(self, payloads, *, close_code=1000, close_error=None):
             self.payloads = iter(json.dumps(payload) for payload in payloads)
+            self.close_code = close_code
+            self.close_error = close_error
 
         def __aiter__(self):
             return self
@@ -72,13 +76,16 @@ def test_strict_protocol_requires_continuous_sequence_and_sentence_final():
             try:
                 return next(self.payloads)
             except StopIteration:
+                if self.close_error is not None:
+                    error, self.close_error = self.close_error, None
+                    raise error
                 raise StopAsyncIteration from None
 
-    async def receive(payloads):
+    async def receive(payloads, **websocket_options):
         tracker = stream_asr_client.SequenceTracker()
         tracker.observe({"type": "ready", "sequence": 1})
         await stream_asr_client.receive_messages(
-            WebSocket(payloads),
+            WebSocket(payloads, **websocket_options),
             sequence_tracker=tracker,
             verify_protocol=True,
         )
@@ -111,6 +118,81 @@ def test_strict_protocol_requires_continuous_sequence_and_sentence_final():
         )
     with pytest.raises(stream_asr_client.StreamClientError, match="sentence_final"):
         asyncio.run(receive([{"type": "final", "sequence": 2, "text": ""}]))
+
+
+def test_strict_protocol_rejects_abnormal_close_after_final():
+    class WebSocket:
+        close_code = 1011
+
+        def __init__(self):
+            self.payloads = iter(
+                json.dumps(payload)
+                for payload in (
+                    {"type": "sentence_final", "sequence": 2, "text": "speech"},
+                    {"type": "final", "sequence": 3, "text": ""},
+                )
+            )
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self.payloads)
+            except StopIteration:
+                raise ConnectionClosedError(
+                    Close(1011, "server failure"),
+                    None,
+                    None,
+                ) from None
+
+    tracker = stream_asr_client.SequenceTracker()
+    tracker.observe({"type": "ready", "sequence": 1})
+
+    with pytest.raises(stream_asr_client.StreamClientError, match="close.*1011"):
+        asyncio.run(
+            stream_asr_client.receive_messages(
+                WebSocket(),
+                sequence_tracker=tracker,
+                verify_protocol=True,
+            )
+        )
+
+
+def test_strict_protocol_rejects_event_after_final():
+    class WebSocket:
+        close_code = 1000
+
+        def __init__(self):
+            self.payloads = iter(
+                json.dumps(payload)
+                for payload in (
+                    {"type": "sentence_final", "sequence": 2, "text": "speech"},
+                    {"type": "final", "sequence": 3, "text": ""},
+                    {"type": "partial", "sequence": 4, "text": "late"},
+                )
+            )
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self.payloads)
+            except StopIteration:
+                raise StopAsyncIteration from None
+
+    tracker = stream_asr_client.SequenceTracker()
+    tracker.observe({"type": "ready", "sequence": 1})
+
+    with pytest.raises(stream_asr_client.StreamClientError, match="after final"):
+        asyncio.run(
+            stream_asr_client.receive_messages(
+                WebSocket(),
+                sequence_tracker=tracker,
+                verify_protocol=True,
+            )
+        )
 
 
 def test_error_payload_is_not_treated_as_transcript():

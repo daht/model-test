@@ -33,8 +33,8 @@ git add -- <intended-files>
 scripts/verify_asr_release.sh commit
 ```
 
-Commit mode runs the full explicit-mock pytest suite exactly once, with a local
-test-only key supplied internally to the mock process. It also redirects
+Commit mode runs the full explicit-mock pytest suite exactly once, with an
+ephemeral generated credential supplied only to the mock process. It also redirects
 `compileall` bytecode under temporary storage, checks every tracked shell script
 with `bash -n`, checks staged and unstaged whitespace, scans tracked worktree and
 index content for high-confidence credentials, rejects forbidden tracked paths,
@@ -106,9 +106,15 @@ headroom policy; the example values are inputs, not performance claims. Live
 mode runs the existing readiness/WebSocket smoke, then Chinese and Japanese
 speech at 200 ms and 500 ms real-time chunks. Strict client validation requires
 `ready` at sequence 1, continuous event sequences, no `error`, at least one
-`sentence_final`, exactly one `final`, and a normal completion. It then runs the
-Chinese and Japanese 200 ms streams concurrently, enforces completion overhead
-for every stream, and samples GPU `memory.used` throughout the live gates.
+`sentence_final`, exactly one terminal `final`, no later event, and normal close
+code 1000. It then runs the
+Chinese and Japanese 200 ms streams concurrently and enforces completion overhead
+for every stream. GPU `memory.used` is polled every 0.25 seconds throughout the
+live gates. L04 requires zero failed `nvidia-smi` queries, at least four valid
+samples, at least 0.75 seconds between the first and last valid samples, and a
+sampled maximum no greater than `ASR_LIVE_MAX_GPU_MEMORY_MIB`. Attempt, success,
+failure, and monotonic timing data remain in the protected temporary directory
+until the runner removes it on exit.
 
 The two-stream gate matches the conservative default rollout concurrency. A
 higher intended concurrency or multi-service GPU topology still requires its
@@ -136,7 +142,7 @@ first-partial p95, or multi-service headroom from this gate.
 | L01 | Deployed health, readiness, stream-info, and synthetic WebSocket lifecycle pass. |
 | L02 | All four zh/ja and 200/500 ms strict speech cases pass. |
 | L03 | Concurrent zh and ja streams both pass. |
-| L04 | Stream overhead and sampled GPU memory remain within the supplied limits. |
+| L04 | Stream overhead passes; GPU sampling has zero failures, at least four valid samples spanning 0.75 seconds, and stays within the supplied limit. |
 
 ## Pass, evidence, and failure handling
 
