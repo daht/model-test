@@ -94,6 +94,21 @@ def test_live_dry_run_includes_release_and_strict_language_chunk_matrix():
     assert "GPU memory" in result.stdout
 
 
+def test_deployed_live_plan_is_receipt_bound_and_never_starts_a_model_owner():
+    result = run_runner("deployed-live", "--dry-run")
+    inventory = run_runner("--list-gates", "deployed-live")
+
+    assert result.returncode == 0
+    assert inventory.returncode == 0
+    assert "D01" in inventory.stdout
+    assert "L01" in inventory.stdout
+    assert "protected release receipt" in result.stdout
+    assert "No image build" in result.stdout
+    assert "warmup container" in result.stdout
+    assert "docker compose" not in result.stdout
+    assert "real Qwen warmup" not in result.stdout
+
+
 def test_release_mode_missing_prerequisites_fails_before_commit_suite(tmp_path):
     result = run_runner(
         "release",

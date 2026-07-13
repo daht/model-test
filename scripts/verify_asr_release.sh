@@ -16,13 +16,15 @@ MISSING=()
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/verify_asr_release.sh [--dry-run] [--list-gates] commit|release|live
-  scripts/verify_asr_release.sh --list-gates [commit|release|live]
+  scripts/verify_asr_release.sh [--dry-run] [--list-gates] commit|release|live|deployed-live
+  scripts/verify_asr_release.sh --list-gates [commit|release|live|deployed-live]
 
 Modes:
   commit   Repeatable local gate; a fresh checkout is not required.
   release  Commit gates plus clean checkout, Docker, GPU, config, artifacts, and warmup.
   live     Release gates plus deployed smoke, speech matrix, concurrency, latency, and VRAM.
+  deployed-live
+            Evidence-bound deployed gates only; does not build, warm up, or start another model.
 
 Options:
   --dry-run     Print the ordered command plan without checking prerequisites or executing gates.
@@ -33,6 +35,9 @@ Release environment:
   ASR_RELEASE_ENV_FILE       Must identify the repository .env file. Default: .env
   ASR_RELEASE_MODEL_DIR      Host path to the approved Qwen model directory.
   ASR_RELEASE_MANIFEST       Host path to the operator-approved model manifest.
+
+Deployed-live environment:
+  ASR_DEPLOYED_RELEASE_RECEIPT  Protected receipt created after a successful release gate.
 
 Live environment:
   ASR_LIVE_BASE_URL                    Deployed HTTP base URL.
@@ -79,6 +84,17 @@ L04 live SLO: overhead passes; GPU has zero query failures and at least 4 sample
 EOF
 }
 
+list_deployed_binding_gate() {
+  cat <<'EOF'
+D01 deployed release binding: clean SHA, config, model, manifest, running image ID, and protected release evidence match one receipt
+EOF
+}
+
+list_deployed_live_gates() {
+  list_deployed_binding_gate
+  list_live_gates
+}
+
 list_gates() {
   case "${MODE:-all}" in
     commit)
@@ -88,10 +104,19 @@ list_gates() {
       list_commit_gates
       list_release_gates
       ;;
-    live|all)
+    live)
       list_commit_gates
       list_release_gates
       list_live_gates
+      ;;
+    all)
+      list_commit_gates
+      list_release_gates
+      list_live_gates
+      list_deployed_binding_gate
+      ;;
+    deployed-live)
+      list_deployed_live_gates
       ;;
   esac
 }
@@ -135,12 +160,24 @@ L04 enforce overhead plus zero-failure GPU coverage (4 samples across 0.75s) and
 EOF
 }
 
+print_deployed_live_plan() {
+  cat <<'EOF'
+D01 validate protected release receipt against clean SHA, current config/model/manifest, release evidence, and the one running image ID
+L01 API_KEY=<runtime-env> BASE_URL=<live> scripts/smoke_asr.sh
+L02 run the strict zh/ja 200/500 ms speech matrix against the deployed image
+L03 run concurrent zh+ja 200 ms strict streams against the deployed image
+L04 enforce overhead plus zero-failure GPU coverage and the GPU memory limit
+No image build, Compose run, warmup container, or service recreation occurs.
+EOF
+}
+
 print_plan() {
   echo "DRY RUN: no prerequisites checked and no commands executed."
   case "${MODE}" in
     commit) print_commit_plan ;;
     release) print_release_plan ;;
     live) print_live_plan ;;
+    deployed-live) print_deployed_live_plan ;;
   esac
 }
 
@@ -172,7 +209,7 @@ while (($#)); do
   shift
 done
 
-if [[ -n "${MODE}" && "${MODE}" != "commit" && "${MODE}" != "release" && "${MODE}" != "live" ]]; then
+if [[ -n "${MODE}" && "${MODE}" != "commit" && "${MODE}" != "release" && "${MODE}" != "live" && "${MODE}" != "deployed-live" ]]; then
   echo "Unknown mode: ${MODE}" >&2
   usage >&2
   exit 2
@@ -349,15 +386,28 @@ collect_live_prerequisites() {
   fi
 }
 
+collect_deployed_live_prerequisites() {
+  local receipt="${ASR_DEPLOYED_RELEASE_RECEIPT:-}"
+  if [[ -z "${receipt}" || ! -f "${receipt}" || -L "${receipt}" ]]; then
+    add_missing "regular protected receipt at ASR_DEPLOYED_RELEASE_RECEIPT"
+  fi
+  if [[ ! -f "${ROOT_DIR}/scripts/asr_deploy_receipt.py" || -L "${ROOT_DIR}/scripts/asr_deploy_receipt.py" ]]; then
+    add_missing "ASR deployment receipt validator"
+  fi
+}
+
 preflight() {
   local requested_mode="$1"
   MISSING=()
   collect_commit_prerequisites
-  if [[ "${requested_mode}" == "release" || "${requested_mode}" == "live" ]]; then
+  if [[ "${requested_mode}" == "release" || "${requested_mode}" == "live" || "${requested_mode}" == "deployed-live" ]]; then
     collect_release_prerequisites
   fi
-  if [[ "${requested_mode}" == "live" ]]; then
+  if [[ "${requested_mode}" == "live" || "${requested_mode}" == "deployed-live" ]]; then
     collect_live_prerequisites
+  fi
+  if [[ "${requested_mode}" == "deployed-live" ]]; then
+    collect_deployed_live_prerequisites
   fi
   if ((${#MISSING[@]})); then
     echo "Missing ${requested_mode} prerequisites:" >&2
@@ -566,6 +616,40 @@ if environment.get("ASR_MODEL_MANIFEST_PATH") != expected_manifest:
 PY
 }
 
+validate_deployed_release_receipt() {
+  local container_ids
+  local container_count
+  local container_id
+  local running_image_id
+  local candidate_sha
+  local env_file="${ASR_RELEASE_ENV_FILE:-${ROOT_DIR}/.env}"
+
+  container_ids="$(docker compose --env-file "${env_file}" ps -q qwen-asr-api)"
+  container_count="$(printf '%s\n' "${container_ids}" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')"
+  if [[ "${container_count}" != "1" ]]; then
+    echo "Deployed-live requires exactly one running qwen-asr-api container; found ${container_count}." >&2
+    return 1
+  fi
+  container_id="${container_ids}"
+  running_image_id="$(docker inspect --format '{{.Image}}' "${container_id}")"
+  candidate_sha="$(git rev-parse HEAD)"
+
+  PYTHONDONTWRITEBYTECODE=1 "${PYTHON_BIN}" scripts/asr_deploy_receipt.py \
+    validate-receipt \
+    --kind release \
+    --receipt "${ASR_DEPLOYED_RELEASE_RECEIPT}" \
+    --repository "${ROOT_DIR}" \
+    --candidate-sha "${candidate_sha}" \
+    --image-id "${running_image_id}" \
+    --env-file "${env_file}" \
+    --model-dir "${ASR_RELEASE_MODEL_DIR}" \
+    --manifest "${ASR_RELEASE_MANIFEST}"
+  validate_compose_config
+  PYTHONDONTWRITEBYTECODE=1 "${PYTHON_BIN}" -m app.asr_artifacts verify \
+    --model-dir "${ASR_RELEASE_MODEL_DIR}" \
+    --manifest "${ASR_RELEASE_MANIFEST}"
+}
+
 run_release_gates() {
   local env_file="${ASR_RELEASE_ENV_FILE:-${ROOT_DIR}/.env}"
   preflight release
@@ -698,9 +782,7 @@ run_concurrent_live_gate() {
   fi
 }
 
-run_live_gates() {
-  preflight live
-  run_release_gates
+run_live_acceptance_gates() {
   ensure_temp_dir
   start_gpu_monitor
 
@@ -727,10 +809,24 @@ run_live_gates() {
   stop_and_validate_gpu_monitor
 }
 
+run_live_gates() {
+  preflight live
+  run_release_gates
+  run_live_acceptance_gates
+}
+
+run_deployed_live_gates() {
+  preflight deployed-live
+  gate D01 "Release receipt bound to the one deployed image and artifact set"
+  validate_deployed_release_receipt
+  run_live_acceptance_gates
+}
+
 case "${MODE}" in
   commit) run_commit_gates ;;
   release) run_release_gates ;;
   live) run_live_gates ;;
+  deployed-live) run_deployed_live_gates ;;
 esac
 
 echo "ASR ${MODE} verification passed."

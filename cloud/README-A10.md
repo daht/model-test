@@ -177,6 +177,13 @@ back on any post-cutover failure. Evidence and rollback backups default to
 protected `/secure` directories outside the repository. Use
 `scripts/deploy_asr_cloud.sh --dry-run` to inspect the ordered workflow.
 
+This is a planned-downtime deployment on one A10. The wrapper verifies and
+receipts the current rollback baseline, stops the old Qwen owner, then runs R08;
+it never loads old and candidate models together. After cutover it runs the
+receipt-bound `deployed-live` L01-L04 layer, which does not build or start a
+second model container. Do not run the full `verify_asr_release.sh live` mode
+beside a loaded ASR on the same GPU because full live mode includes R08.
+
 From the server:
 
 ```bash

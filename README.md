@@ -141,6 +141,11 @@ configuration, and approved manifest after a post-cutover failure. Inspect the
 workflow with `scripts/deploy_asr_cloud.sh --dry-run`; `--skip-live` is an
 explicit reduced gate and does not establish live verification.
 
+The one-command workflow has planned downtime on a single GPU. It validates and
+receipts the running rollback baseline, stops that model owner, and only then
+runs release R08. After cutover it uses the receipt-bound `deployed-live` layer,
+which runs L01-L04 without building, warming, or starting another Qwen owner.
+
 CosyVoice also needs the official runtime code in the build context:
 
 ```bash

@@ -8,16 +8,18 @@ PYTHON_BIN=""
 CANDIDATE_SHA=""
 RELEASE_ID=""
 RELEASE_IMAGE_ID=""
-LIVE_VERIFIED_IMAGE_ID=""
 RELEASE_IMAGE_REF=""
 ROLLBACK_IMAGE_ID=""
 ROLLBACK_IMAGE_REF=""
+ROLLBACK_CONTAINER_ID=""
 BACKUP_RUN_DIR=""
 ENV_BACKUP=""
 MANIFEST_BACKUP=""
+ROLLBACK_RECEIPT=""
+RELEASE_RECEIPT=""
 ENV_SHA256=""
 MANIFEST_SHA256=""
-CUTOVER_STARTED=0
+MAINTENANCE_STARTED=0
 DEPLOYMENT_COMPLETE=0
 SNAPSHOT_READY=0
 
@@ -26,8 +28,9 @@ usage() {
 Usage:
   scripts/deploy_asr_cloud.sh [--dry-run] [--skip-live]
 
-Build, verify, deploy, and live-verify one production ASR image. Full
-release/deploy/live verification is the fail-closed default.
+Verify, deploy, and live-verify one production ASR image during an explicit
+single-GPU maintenance window. Full release/deploy/live verification is the
+fail-closed default.
 
 Options:
   --dry-run    Print the ordered workflow without checking prerequisites or changing anything.
@@ -58,6 +61,8 @@ Deployment environment:
 
 The wrapper never creates a model manifest and never cleans, resets, stashes,
 checks out, or pulls Git state. External release assets must already exist.
+The existing ASR is stopped before release warmup, so this workflow has planned
+downtime but never runs two Qwen model owners on one GPU.
 EOF
 }
 
@@ -67,15 +72,18 @@ DRY RUN: no prerequisites checked and no commands executed.
 01 validate clean committed checkout and external release/live inputs
 02 prepare repository .venv with pinned requirements-dev.txt when needed
 03 snapshot current deployment image and back up .env plus approved manifest
-04 run scripts/verify_asr_release.sh release with protected evidence
-05 capture and tag the exact release-verified image ID
-06 deploy the exact release-verified image without rebuilding
-07 verify local readiness and WebSocket smoke
-08 run scripts/verify_asr_release.sh live with protected evidence
-09 reassert the accepted image ID and unchanged config/model/manifest
-On any failure or interruption after step 06: atomically restore the previous
-image, .env, and approved manifest, verify the unchanged model, then rerun local
-readiness and WebSocket smoke while preserving the original exit status.
+04 verify and receipt the running rollback image/config/model/manifest baseline
+05 stop the existing ASR model owner and begin the maintenance window
+06 run scripts/verify_asr_release.sh release with protected evidence
+07 receipt and tag the exact release-verified image ID
+08 deploy the exact release-verified image without rebuilding
+09 verify local readiness and WebSocket smoke
+10 run evidence-bound deployed-live gates without another model owner
+11 reassert the accepted image ID and unchanged config/model/manifest
+On any failure or interruption after step 05: atomically restore the receipted
+previous image, .env, and approved manifest, verify the unchanged model and
+container baseline, then rerun local readiness and WebSocket smoke while
+preserving the original exit status.
 EOF
 }
 
@@ -171,6 +179,7 @@ validate_checkout_and_assets() {
   require_regular_file "${ROOT_DIR}/requirements-dev.txt"
   require_regular_file "${ROOT_DIR}/scripts/verify_asr_release.sh"
   require_regular_file "${ROOT_DIR}/scripts/smoke_asr.sh"
+  require_regular_file "${ROOT_DIR}/scripts/asr_deploy_receipt.py"
   [[ -x "${ROOT_DIR}/scripts/verify_asr_release.sh" ]] || fail "release verifier is not executable"
   [[ -x "${ROOT_DIR}/scripts/smoke_asr.sh" ]] || fail "ASR smoke script is not executable"
   require_regular_file "${ASR_RELEASE_ENV_FILE}"
@@ -240,6 +249,17 @@ select_or_prepare_python() {
   fi
 }
 
+assert_candidate_checkout_unchanged() {
+  if [[ "$(git rev-parse HEAD)" != "${CANDIDATE_SHA}" ]]; then
+    fail "candidate commit changed during deployment"
+    return 1
+  fi
+  if [[ -n "$(git status --porcelain=v1 --untracked-files=all)" ]]; then
+    fail "candidate checkout changed during deployment"
+    return 1
+  fi
+}
+
 obtain_api_key() {
   if [[ -n "${ASR_LIVE_API_KEY:-}" ]]; then
     export ASR_LIVE_API_KEY
@@ -278,11 +298,27 @@ current_container_id() {
   printf '%s\n' "${ids}"
 }
 
+assert_no_running_model_owner() {
+  local ids
+  local count
+  ids="$(compose ps -q qwen-asr-api)"
+  count="$(printf '%s\n' "${ids}" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')"
+  if [[ "${count}" != "0" ]]; then
+    fail "expected no running qwen-asr-api model owner during maintenance, found ${count}"
+    return 1
+  fi
+}
+
+stop_model_owner() {
+  MAINTENANCE_STARTED=1
+  compose stop qwen-asr-api
+  assert_no_running_model_owner
+}
+
 snapshot_current_deployment() {
-  local current_container
   local timestamp
-  current_container="$(current_container_id)"
-  ROLLBACK_IMAGE_ID="$(docker inspect --format '{{.Image}}' "${current_container}")"
+  ROLLBACK_CONTAINER_ID="$(current_container_id)"
+  ROLLBACK_IMAGE_ID="$(docker inspect --format '{{.Image}}' "${ROLLBACK_CONTAINER_ID}")"
   [[ -n "${ROLLBACK_IMAGE_ID}" ]] || fail "could not inspect the current ASR image ID"
   timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
   RELEASE_ID="${CANDIDATE_SHA:0:12}-${timestamp}"
@@ -306,6 +342,60 @@ snapshot_current_deployment() {
   } >"${BACKUP_RUN_DIR}/identity.txt"
   chmod 600 -- "${BACKUP_RUN_DIR}/identity.txt"
   SNAPSHOT_READY=1
+}
+
+validate_running_rollback_baseline() {
+  if ! PYTHONDONTWRITEBYTECODE=1 "${PYTHON_BIN}" scripts/asr_deploy_receipt.py \
+    validate-running-baseline \
+    --container-id "${ROLLBACK_CONTAINER_ID}" \
+    --repository "${ROOT_DIR}" \
+    --env-file "${ASR_RELEASE_ENV_FILE}" \
+    --model-dir "${ASR_RELEASE_MODEL_DIR}" \
+    --manifest "${ASR_RELEASE_MANIFEST}"; then
+    fail "running rollback baseline does not match the current image/config/model/manifest assets"
+    return 1
+  fi
+}
+
+verify_rollback_baseline() {
+  assert_release_assets_unchanged || return $?
+  validate_running_rollback_baseline || return $?
+  verify_local_deployment || return $?
+  echo "ASR rollback baseline verification passed."
+}
+
+create_deployment_receipt() {
+  local kind="$1"
+  local output="$2"
+  local image_id="$3"
+  local evidence="$4"
+  PYTHONDONTWRITEBYTECODE=1 "${PYTHON_BIN}" scripts/asr_deploy_receipt.py \
+    create-receipt \
+    --kind "${kind}" \
+    --output "${output}" \
+    --repository "${ROOT_DIR}" \
+    --candidate-sha "${CANDIDATE_SHA}" \
+    --image-id "${image_id}" \
+    --env-file "${ASR_RELEASE_ENV_FILE}" \
+    --model-dir "${ASR_RELEASE_MODEL_DIR}" \
+    --manifest "${ASR_RELEASE_MANIFEST}" \
+    --evidence "${evidence}"
+}
+
+validate_deployment_receipt() {
+  local kind="$1"
+  local receipt="$2"
+  local image_id="$3"
+  PYTHONDONTWRITEBYTECODE=1 "${PYTHON_BIN}" scripts/asr_deploy_receipt.py \
+    validate-receipt \
+    --kind "${kind}" \
+    --receipt "${receipt}" \
+    --repository "${ROOT_DIR}" \
+    --candidate-sha "${CANDIDATE_SHA}" \
+    --image-id "${image_id}" \
+    --env-file "${ASR_RELEASE_ENV_FILE}" \
+    --model-dir "${ASR_RELEASE_MODEL_DIR}" \
+    --manifest "${ASR_RELEASE_MANIFEST}"
 }
 
 assert_release_assets_unchanged() {
@@ -395,9 +485,16 @@ rollback_deployment() {
   local rollback_failed=0
   echo "Attempting atomic ASR rollback..." >&2
 
+  assert_candidate_checkout_unchanged || rollback_failed=1
   if [[ -L "${ASR_RELEASE_ENV_FILE}" || -L "${ASR_RELEASE_MANIFEST}" ]]; then
     echo "Rollback refused to write through a release asset symlink." >&2
     rollback_failed=1
+  fi
+  if ((rollback_failed == 0)); then
+    compose stop qwen-asr-api || rollback_failed=1
+  fi
+  if ((rollback_failed == 0)); then
+    assert_no_running_model_owner || rollback_failed=1
   fi
   if ((rollback_failed == 0)); then
     install -m 600 -- "${ENV_BACKUP}" "${ASR_RELEASE_ENV_FILE}" || rollback_failed=1
@@ -407,6 +504,10 @@ rollback_deployment() {
     assert_release_assets_unchanged || rollback_failed=1
   fi
   if ((rollback_failed == 0)); then
+    validate_deployment_receipt rollback-baseline "${ROLLBACK_RECEIPT}" "${ROLLBACK_IMAGE_ID}" \
+      || rollback_failed=1
+  fi
+  if ((rollback_failed == 0)); then
     docker tag "${ROLLBACK_IMAGE_ID}" qwen-asr-api:latest || rollback_failed=1
   fi
   if ((rollback_failed == 0)); then
@@ -414,6 +515,10 @@ rollback_deployment() {
   fi
   if ((rollback_failed == 0)); then
     assert_running_image "${ROLLBACK_IMAGE_ID}" || rollback_failed=1
+  fi
+  if ((rollback_failed == 0)); then
+    ROLLBACK_CONTAINER_ID="$(current_container_id)"
+    validate_running_rollback_baseline || rollback_failed=1
   fi
   if ((rollback_failed == 0)); then
     verify_local_deployment || rollback_failed=1
@@ -430,7 +535,7 @@ on_exit() {
   local original_status=$?
   local rollback_status=0
   trap - EXIT HUP INT TERM
-  if ((CUTOVER_STARTED && !DEPLOYMENT_COMPLETE)); then
+  if ((MAINTENANCE_STARTED && !DEPLOYMENT_COMPLETE)); then
     if ((original_status == 0)); then
       original_status=1
     fi
@@ -458,7 +563,7 @@ on_exit() {
 
 handle_signal() {
   local status="$1"
-  echo "Deployment interrupted; rollback will be attempted if cutover started." >&2
+  echo "Deployment interrupted; rollback will be attempted if maintenance started." >&2
   exit "${status}"
 }
 
@@ -480,6 +585,20 @@ prepare_protected_directories
 snapshot_current_deployment
 assert_release_assets_unchanged
 
+baseline_evidence="${ASR_DEPLOY_EVIDENCE_DIR}/asr-rollback-baseline-${RELEASE_ID}.log"
+baseline_status=0
+run_with_evidence "${baseline_evidence}" verify_rollback_baseline || baseline_status=$?
+if ((baseline_status != 0)); then
+  echo "Rollback baseline verification failed with status ${baseline_status}; maintenance was not started." >&2
+  exit "${baseline_status}"
+fi
+ROLLBACK_RECEIPT="${BACKUP_RUN_DIR}/rollback-baseline.receipt.json"
+create_deployment_receipt rollback-baseline "${ROLLBACK_RECEIPT}" \
+  "${ROLLBACK_IMAGE_ID}" "${baseline_evidence}"
+
+echo "Entering the single-GPU ASR maintenance window; stopping the current model owner."
+stop_model_owner
+
 release_evidence="${ASR_DEPLOY_EVIDENCE_DIR}/asr-release-${RELEASE_ID}.log"
 release_status=0
 run_with_evidence "${release_evidence}" \
@@ -489,13 +608,17 @@ if ((release_status != 0)); then
   exit "${release_status}"
 fi
 
+assert_no_running_model_owner
 assert_release_assets_unchanged
 RELEASE_IMAGE_ID="$(docker image inspect --format '{{.Id}}' qwen-asr-api:latest)"
 [[ -n "${RELEASE_IMAGE_ID}" ]] || fail "release verifier did not produce qwen-asr-api:latest"
 docker tag "${RELEASE_IMAGE_ID}" "${RELEASE_IMAGE_REF}"
 docker tag "${RELEASE_IMAGE_ID}" qwen-asr-api:latest
+RELEASE_RECEIPT="${BACKUP_RUN_DIR}/release.receipt.json"
+create_deployment_receipt release "${RELEASE_RECEIPT}" \
+  "${RELEASE_IMAGE_ID}" "${release_evidence}"
+export ASR_DEPLOYED_RELEASE_RECEIPT="${RELEASE_RECEIPT}"
 
-CUTOVER_STARTED=1
 compose up -d --force-recreate --no-deps --no-build qwen-asr-api
 assert_running_image "${RELEASE_IMAGE_ID}"
 deploy_evidence="${ASR_DEPLOY_EVIDENCE_DIR}/asr-cutover-${RELEASE_ID}.log"
@@ -510,23 +633,19 @@ if ((RUN_LIVE)); then
   live_evidence="${ASR_DEPLOY_EVIDENCE_DIR}/asr-live-${RELEASE_ID}.log"
   live_status=0
   run_with_evidence "${live_evidence}" \
-    "${ROOT_DIR}/scripts/verify_asr_release.sh" live || live_status=$?
+    "${ROOT_DIR}/scripts/verify_asr_release.sh" deployed-live || live_status=$?
   if ((live_status != 0)); then
-    echo "Live verification failed with status ${live_status}." >&2
+    echo "Evidence-bound deployed-live verification failed with status ${live_status}." >&2
     exit "${live_status}"
-  fi
-  LIVE_VERIFIED_IMAGE_ID="$(docker image inspect --format '{{.Id}}' qwen-asr-api:latest)"
-  if [[ "${LIVE_VERIFIED_IMAGE_ID}" != "${RELEASE_IMAGE_ID}" ]]; then
-    fail "live verification rebuilt a different image ID; refusing mixed-image evidence"
   fi
 else
   echo "Live verification skipped by explicit operator request."
 fi
 
-# Live mode includes another release build and must reproduce the accepted ID.
-# Keep the deployed and canonical tag pinned to that exact image.
+# Keep the deployed and canonical tag pinned to the exact release image.
 docker tag "${RELEASE_IMAGE_ID}" qwen-asr-api:latest
 assert_running_image "${RELEASE_IMAGE_ID}"
+assert_candidate_checkout_unchanged
 assert_release_assets_unchanged
 DEPLOYMENT_COMPLETE=1
 

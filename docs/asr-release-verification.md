@@ -76,7 +76,7 @@ Silero verification, or warmup fails the release.
 ### One-command cloud deployment
 
 On an existing cloud ASR host, `scripts/deploy_asr_cloud.sh` orchestrates the
-release and live runners without weakening their gates. It requires a clean
+release and deployed-live runners without weakening their gates. It requires a clean
 committed checkout, the repository `.env`, an approved model and matching
 manifest under `models/`, and exactly one currently deployed ASR container to
 serve as the rollback point. It prepares the ignored repository `.venv` from
@@ -91,19 +91,29 @@ run:
 scripts/deploy_asr_cloud.sh
 ```
 
-Full release, exact-image cutover, local readiness/WebSocket smoke, and live
-verification are the default. Protected evidence and rollback backups default
+Full release, exact-image cutover, local readiness/WebSocket smoke, and
+receipt-bound deployed-live verification are the default. Protected evidence and rollback backups default
 to `/secure/asr-release-evidence` and `/secure/asr-release-backup`; override
 them with `ASR_DEPLOY_EVIDENCE_DIR` and `ASR_DEPLOY_BACKUP_DIR`, which must stay
-outside the repository. The wrapper tags the currently running image before the
-release build, deploys the release-verified image ID with Compose `--no-build`,
-and verifies that exact ID after cutover. It does not modify model files. It
-hashes and backs up `.env` and the manifest and revalidates the model against
-that manifest before and after cutover.
+outside the repository. Before maintenance it compares the running container's
+effective environment, command, read-only model mount, and start time with the
+current Compose configuration and artifact timestamps. It revalidates the
+approved manifest and requires current readiness/WebSocket smoke, then records
+a protected rollback-baseline receipt. Prechanged or unmatched config, model,
+manifest, image, or Compose state fails before the service is stopped.
 
-Any error or HUP/INT/TERM after cutover attempts to restore the previous image,
+The wrapper then stops the existing ASR container and confirms that no model
+owner remains. This begins a planned maintenance window that includes the full
+release build and R08 warmup. Only after R08 exits does the wrapper deploy the
+release-verified image ID with Compose `--no-build`. It records a release
+receipt bound to the clean commit SHA, exact image ID, `.env`, manifest, model
+path, and protected release evidence. It does not modify model files.
+
+Any error or HUP/INT/TERM after maintenance starts attempts to stop the current
+owner and restore the receipted previous image,
 `.env`, and approved manifest, revalidates the unchanged model directory, and
-runs restored readiness and smoke. The original failing status is preserved;
+revalidates the recreated container against the rollback baseline, then runs
+restored readiness and smoke. The original failing status is preserved;
 rollback failure is reported separately. Use `--dry-run` to inspect the plan
 without prerequisites. `--skip-live` must be deliberate and does not produce
 live-verified evidence.
@@ -115,6 +125,24 @@ rollout against the release candidate deployment, or immediately after a
 deployment against the deployed service. It includes release and commit mode,
 so use the same fresh validation checkout, `.env`, approved model, Docker host,
 and GPU host described above.
+
+`live` includes R08 and therefore starts a disposable full Qwen model. Do not
+run it while another model-owning ASR container is loaded on the same GPU. On a
+single A10, use the maintenance workflow above. Its post-cutover command is the
+receipt-bound layer:
+
+```bash
+export ASR_DEPLOYED_RELEASE_RECEIPT=/secure/asr-release-backup/<release-id>/release.receipt.json
+scripts/verify_asr_release.sh deployed-live
+```
+
+`deployed-live` first proves D01: the clean candidate SHA, exact running image
+ID, `.env`, model path, manifest hashes, protected release evidence, and current
+Compose production contract must match the release receipt. It then runs the
+same L01-L04 smoke, speech matrix, concurrency, overhead, and VRAM gates. It
+never builds an image, invokes Compose `run`, warms a model, or recreates the
+service. Without the matching protected receipt it fails closed and cannot be
+used as release evidence.
 
 Supply two external files containing actual speech. Do not copy or generate
 audio under the repository. Provide the deployed API key only through the
@@ -185,6 +213,7 @@ first-partial p95, or multi-service headroom from this gate.
 | L02 | All four zh/ja and 200/500 ms strict speech cases pass. |
 | L03 | Concurrent zh and ja streams both pass. |
 | L04 | Stream overhead passes; GPU sampling has zero failures, at least four valid samples spanning 0.75 seconds, and stays within the supplied limit. |
+| D01 | A protected release receipt matches the clean SHA, exact running image ID, current config/model/manifest, and successful release evidence before deployed-only L01-L04. |
 
 ## Pass, evidence, and failure handling
 

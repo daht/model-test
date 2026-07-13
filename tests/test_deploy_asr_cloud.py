@@ -33,10 +33,12 @@ def test_help_and_dry_run_are_deterministic_without_cloud_prerequisites():
         "validate clean committed checkout and external release/live inputs",
         "prepare repository .venv with pinned requirements-dev.txt when needed",
         "snapshot current deployment image and back up .env plus approved manifest",
+        "verify and receipt the running rollback image/config/model/manifest baseline",
+        "stop the existing ASR model owner and begin the maintenance window",
         "run scripts/verify_asr_release.sh release",
         "deploy the exact release-verified image without rebuilding",
         "verify local readiness and WebSocket smoke",
-        "run scripts/verify_asr_release.sh live",
+        "run evidence-bound deployed-live gates without another model owner",
     ]
     positions = [dry_result.stdout.index(item) for item in ordered]
     assert positions == sorted(positions)
@@ -58,6 +60,7 @@ def _make_harness(tmp_path: Path):
         path.mkdir(parents=True, exist_ok=True)
 
     shutil.copy2(RUNNER, scripts / RUNNER.name)
+    shutil.copy2(Path("scripts/asr_deploy_receipt.py"), scripts / "asr_deploy_receipt.py")
     (repo / "requirements-dev.txt").write_text("pytest==9.1.1\n")
     (repo / ".env").write_text("API_KEY=stored-outside-command-line\n")
     (repo / "models" / "Qwen3-ASR-1.7B-hf.manifest.json").write_text(
@@ -115,6 +118,25 @@ if [[ "${1:-}" == -m && "${2:-}" == app.asr_artifacts ]]; then
   printf 'asset-verify\\n' >>"$FAKE_STATE/events"
   exit "${FAKE_ASSET_VERIFY_STATUS:-0}"
 fi
+if [[ "$*" == *scripts/asr_deploy_receipt.py* ]]; then
+  if [[ "$*" == *validate-running-baseline* ]]; then
+    printf 'receipt:validate-baseline\\n' >>"$FAKE_STATE/events"
+    exit "${FAKE_BASELINE_MISMATCH:-0}"
+  fi
+  if [[ "$*" == *create-receipt* ]]; then
+    printf 'receipt:create\\n' >>"$FAKE_STATE/events"
+    previous=""
+    for argument in "$@"; do
+      if [[ "$previous" == --output ]]; then printf '{}\\n' >"$argument"; break; fi
+      previous="$argument"
+    done
+    exit 0
+  fi
+  if [[ "$*" == *validate-receipt* ]]; then
+    printf 'receipt:validate\\n' >>"$FAKE_STATE/events"
+    exit "${FAKE_RECEIPT_STATUS:-0}"
+  fi
+fi
 exit 0
 """,
     )
@@ -124,11 +146,21 @@ exit 0
 set -eu
 printf 'docker:%s\\n' "$*" >>"$FAKE_STATE/events"
 if [[ "${1:-}" == compose && "$*" == *' ps -q qwen-asr-api' ]]; then
-  if [[ "$(cat "$FAKE_STATE/deployed")" == sha256:old ]]; then echo oldcid; else echo newcid; fi
+  deployed="$(cat "$FAKE_STATE/deployed")"
+  if [[ "$deployed" == sha256:old ]]; then echo oldcid; fi
+  if [[ "$deployed" == sha256:new ]]; then echo newcid; fi
   exit 0
 fi
-if [[ "${1:-}" == inspect && "$*" == *oldcid ]]; then echo sha256:old; exit 0; fi
-if [[ "${1:-}" == inspect && "$*" == *newcid ]]; then cat "$FAKE_STATE/deployed"; exit 0; fi
+if [[ "${1:-}" == inspect && "$*" == *'--format'* && "$*" == *oldcid ]]; then echo sha256:old; exit 0; fi
+if [[ "${1:-}" == inspect && "$*" == *'--format'* && "$*" == *newcid ]]; then cat "$FAKE_STATE/deployed"; exit 0; fi
+if [[ "${1:-}" == inspect && "$*" == *oldcid ]]; then
+  mismatch_value=qwen_vllm
+  if [[ "${FAKE_BASELINE_MISMATCH:-0}" == 1 ]]; then mismatch_value=mock; fi
+  cat <<JSON
+[{"Image":"sha256:old","Config":{"Env":["API_KEY=stored-outside-command-line-1234567890","ASR_BACKEND=$mismatch_value","ASR_STREAM_MODE=stateful","ASR_REQUIRE_MODEL_MANIFEST=true","ASR_EAGER_LOAD=true","ASR_FILE_TRANSCRIBE_ENABLED=false","ASR_MODEL_ID=/models/Qwen3-ASR-1.7B-hf","ASR_MODEL_MANIFEST_PATH=/models/Qwen3-ASR-1.7B-hf.manifest.json"],"Cmd":["python","-m","uvicorn","app.asr_api:app","--workers","1"]},"State":{"Running":true,"StartedAt":"2099-01-01T00:00:00Z"},"Mounts":[{"Destination":"/models","Source":"$FAKE_REPO/models","RW":false}]}]
+JSON
+  exit 0
+fi
 if [[ "${1:-}" == image && "${2:-}" == inspect ]]; then cat "$FAKE_STATE/latest"; exit 0; fi
 if [[ "${1:-}" == tag ]]; then
   source_image="$2"
@@ -141,8 +173,21 @@ if [[ "${1:-}" == tag ]]; then
   if [[ "$target_image" == qwen-asr-api:latest ]]; then printf '%s\\n' "$resolved" >"$FAKE_STATE/latest"; fi
   exit 0
 fi
+if [[ "${1:-}" == compose && "$*" == *' config --format json'* ]]; then
+  cat <<JSON
+{"services":{"qwen-asr-api":{"environment":{"API_KEY":"stored-outside-command-line-1234567890","ASR_BACKEND":"qwen_vllm","ASR_STREAM_MODE":"stateful","ASR_REQUIRE_MODEL_MANIFEST":"true","ASR_EAGER_LOAD":"true","ASR_FILE_TRANSCRIBE_ENABLED":"false","ASR_MODEL_ID":"/models/Qwen3-ASR-1.7B-hf","ASR_MODEL_MANIFEST_PATH":"/models/Qwen3-ASR-1.7B-hf.manifest.json"},"command":["python","-m","uvicorn","app.asr_api:app","--workers","1"]}}}
+JSON
+  exit 0
+fi
+if [[ "${1:-}" == compose && "$*" == *' stop qwen-asr-api'* ]]; then
+  deployed="$(cat "$FAKE_STATE/deployed")"
+  printf 'owner-stop:%s\\n' "$deployed" >>"$FAKE_STATE/events"
+  echo stopped >"$FAKE_STATE/deployed"
+  exit 0
+fi
 if [[ "${1:-}" == compose && "$*" == *' up '* ]]; then
   cat "$FAKE_STATE/latest" >"$FAKE_STATE/deployed"
+  printf 'owner-start:%s\\n' "$(cat "$FAKE_STATE/deployed")" >>"$FAKE_STATE/events"
   printf 'cutover:%s\\n' "$(cat "$FAKE_STATE/deployed")" >>"$FAKE_STATE/events"
   exit 0
 fi
@@ -166,12 +211,17 @@ exit "${FAKE_READY_STATUS:-0}"
 set -eu
 printf 'verify:%s\\n' "$1" >>"$FAKE_STATE/events"
 if [[ "$1" == release ]]; then
+  if [[ "$(cat "$FAKE_STATE/deployed")" != stopped ]]; then
+    echo 'release attempted while another model owner was running' >&2
+    exit 88
+  fi
   echo sha256:new >"$FAKE_STATE/latest"
   echo 'ASR release verification passed.'
   exit "${FAKE_RELEASE_STATUS:-0}"
 fi
-echo 'ASR live verification started.'
-if [[ "${FAKE_LIVE_IMAGE_DRIFT:-0}" == 1 ]]; then echo sha256:drift >"$FAKE_STATE/latest"; fi
+if [[ "$1" != deployed-live ]]; then exit 89; fi
+if [[ "$(cat "$FAKE_STATE/deployed")" != sha256:new ]]; then exit 90; fi
+echo 'ASR deployed-live verification started.'
 exit "${FAKE_LIVE_STATUS:-0}"
 """,
     )
@@ -182,6 +232,12 @@ set -eu
 deployed="$(cat "$FAKE_STATE/deployed")"
 printf 'smoke:%s\\n' "$deployed" >>"$FAKE_STATE/events"
 if [[ "$deployed" == sha256:new ]]; then exit "${FAKE_NEW_SMOKE_STATUS:-0}"; fi
+old_count_file="$FAKE_STATE/old-smoke-count"
+old_count=0
+if [[ -f "$old_count_file" ]]; then old_count="$(cat "$old_count_file")"; fi
+old_count=$((old_count + 1))
+echo "$old_count" >"$old_count_file"
+if [[ "$old_count" == 1 ]]; then exit 0; fi
 exit "${FAKE_OLD_SMOKE_STATUS:-0}"
 """,
     )
@@ -250,9 +306,10 @@ def test_full_workflow_bootstraps_then_releases_cuts_over_and_runs_live(tmp_path
     for evidence in (Path(env["ASR_DEPLOY_EVIDENCE_DIR"])).glob("*.log"):
         assert "SECRET_SENTINEL_MUST_NOT_LEAK" not in evidence.read_text()
     assert events.index("python:-m venv") < events.index("verify:release")
+    assert events.index("owner-stop:sha256:old") < events.index("verify:release")
     assert events.index("verify:release") < events.index("cutover:sha256:new")
     assert events.index("cutover:sha256:new") < events.index("smoke:sha256:new")
-    assert events.index("smoke:sha256:new") < events.index("verify:live")
+    assert events.index("smoke:sha256:new") < events.index("verify:deployed-live")
     assert "docker:compose build" not in events
     assert "--no-build" in events
     assert "docker:tag sha256:old qwen-asr-api:rollback-" in events
@@ -267,7 +324,7 @@ def test_release_failure_restores_latest_tag_without_cutover(tmp_path):
     events = (state / "events").read_text()
 
     assert result.returncode == 19
-    assert "cutover:" not in events
+    assert "cutover:sha256:new" not in events
     assert (state / "latest").read_text().strip() == "sha256:old"
     assert (state / "deployed").read_text().strip() == "sha256:old"
 
@@ -279,8 +336,8 @@ def test_post_cutover_live_failure_rolls_back_and_preserves_failure_status(tmp_p
     events = (state / "events").read_text()
 
     assert result.returncode == 23
-    assert events.index("verify:live") < events.rindex("cutover:sha256:old")
-    assert events.index("verify:live") < events.rindex("smoke:sha256:old")
+    assert events.index("verify:deployed-live") < events.rindex("cutover:sha256:old")
+    assert events.index("verify:deployed-live") < events.rindex("smoke:sha256:old")
     assert (state / "deployed").read_text().strip() == "sha256:old"
     assert "Rollback completed" in result.stderr
 
@@ -297,12 +354,48 @@ def test_rollback_failure_is_reported_without_masking_original_status(tmp_path):
     assert (state / "deployed").read_text().strip() == "sha256:old"
 
 
-def test_live_gate_must_reproduce_the_exact_release_image_identity(tmp_path):
+def test_deployed_live_receipt_failure_rolls_back_exact_baseline(tmp_path):
     runner, state, env = _make_harness(tmp_path)
-    env["FAKE_LIVE_IMAGE_DRIFT"] = "1"
+    env["FAKE_LIVE_STATUS"] = "31"
     result = _run_harness(runner, env)
 
-    assert result.returncode != 0
-    assert "refusing mixed-image evidence" in result.stderr
+    assert result.returncode == 31
+    assert "receipt:validate" in (state / "events").read_text()
     assert "Rollback completed" in result.stderr
     assert (state / "deployed").read_text().strip() == "sha256:old"
+
+
+def test_rollback_never_claims_restoration_with_an_unmatched_baseline_receipt(tmp_path):
+    runner, state, env = _make_harness(tmp_path)
+    env["FAKE_LIVE_STATUS"] = "23"
+    env["FAKE_RECEIPT_STATUS"] = "1"
+    result = _run_harness(runner, env)
+
+    assert result.returncode == 23
+    assert "ROLLBACK FAILED" in result.stderr
+    assert "Rollback completed" not in result.stderr
+    assert (state / "deployed").read_text().strip() == "stopped"
+
+
+def test_single_gpu_stops_old_owner_before_release_and_uses_deployed_live(tmp_path):
+    runner, state, env = _make_harness(tmp_path)
+    result = _run_harness(runner, env)
+    events = (state / "events").read_text()
+
+    assert result.returncode == 0, result.stderr
+    assert events.index("owner-stop:sha256:old") < events.index("verify:release")
+    assert events.index("verify:release") < events.index("cutover:sha256:new")
+    assert events.index("cutover:sha256:new") < events.index("verify:deployed-live")
+    assert "verify:live" not in events
+
+
+def test_prechanged_assets_reject_unverified_rollback_baseline(tmp_path):
+    runner, state, env = _make_harness(tmp_path)
+    env["FAKE_BASELINE_MISMATCH"] = "1"
+    result = _run_harness(runner, env)
+    events = (state / "events").read_text()
+
+    assert result.returncode != 0
+    assert "rollback baseline" in result.stderr.lower()
+    assert "verify:release" not in events
+    assert "owner-stop:" not in events
