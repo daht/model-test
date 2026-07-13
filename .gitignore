@@ -77,3 +77,4 @@ hf-cache/
 ### Runtime output ###
 *.log
 logs/
+/docs/superpowers/
