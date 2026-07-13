@@ -42,6 +42,7 @@ and includes the upstream MIT license. Runtime startup never downloads VAD asset
 - `scripts/deploy_remote.sh`: rsync and remote Docker Compose deployment.
 - `scripts/smoke_test.sh`: post-deploy API check.
 - `scripts/smoke_asr.sh`: post-deploy Qwen3-ASR API check.
+- `scripts/deploy_asr_cloud.sh`: fail-closed release, exact-image cutover, live verification, and rollback for the cloud ASR service.
 - `scripts/verify_asr_release.sh`: layered commit, release, and live ASR verification. See `docs/asr-release-verification.md`.
 - `scripts/update_service.sh`: update/recreate the cloud Docker service.
 - `cloud/README-A10.md`: A10-specific deployment runbook.
@@ -118,6 +119,27 @@ the service rejects missing, extra, changed, or symlinked artifacts when
 `ASR_REQUIRE_MODEL_MANIFEST=true`. Repository tests cannot supply the accepted
 revision or manifest because the production weights and release approval are
 external artifacts.
+
+After `.env`, the approved model/manifest, and external Chinese/Japanese live
+speech inputs exist, deploy ASR with the one-command wrapper:
+
+```bash
+export ASR_LIVE_ZH_AUDIO=/secure/release-input/chinese-speech.flac
+export ASR_LIVE_JA_AUDIO=/secure/release-input/japanese-speech.flac
+export ASR_LIVE_MAX_STREAM_OVERHEAD_SECONDS=10
+export ASR_LIVE_MAX_GPU_MEMORY_MIB=23000
+read -rsp "Deployed ASR API key: " ASR_LIVE_API_KEY; echo
+export ASR_LIVE_API_KEY
+scripts/deploy_asr_cloud.sh
+unset ASR_LIVE_API_KEY
+```
+
+The thresholds must come from the approved service SLO and GPU headroom policy.
+The wrapper defaults to full release/deploy/live verification, retains evidence
+and rollback backups below `/secure`, and restores the previous image,
+configuration, and approved manifest after a post-cutover failure. Inspect the
+workflow with `scripts/deploy_asr_cloud.sh --dry-run`; `--skip-live` is an
+explicit reduced gate and does not establish live verification.
 
 CosyVoice also needs the official runtime code in the build context:
 

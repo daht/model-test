@@ -163,6 +163,20 @@ commit, release, and live gates in `docs/asr-release-verification.md`. The runne
 fails closed when Docker, GPU, approved model, manifest, live audio, runtime
 secret, or SLO inputs are unavailable.
 
+For an existing ASR deployment, export the external Chinese/Japanese speech
+paths and approved overhead/VRAM thresholds, provide `ASR_LIVE_API_KEY` through
+the environment or hidden prompt, then run the fail-closed full workflow:
+
+```bash
+scripts/deploy_asr_cloud.sh
+```
+
+It verifies the release, deploys the exact verified image without rebuilding,
+checks local readiness and WebSocket lifecycle, runs the live matrix, and rolls
+back on any post-cutover failure. Evidence and rollback backups default to
+protected `/secure` directories outside the repository. Use
+`scripts/deploy_asr_cloud.sh --dry-run` to inspect the ordered workflow.
+
 From the server:
 
 ```bash

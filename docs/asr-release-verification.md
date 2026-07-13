@@ -73,6 +73,41 @@ Compose container for real Qwen model, manifest, VAD, and streaming warmup. The
 container uses `--rm`; a failure in Docker build/runtime, GPU access, Qwen load,
 Silero verification, or warmup fails the release.
 
+### One-command cloud deployment
+
+On an existing cloud ASR host, `scripts/deploy_asr_cloud.sh` orchestrates the
+release and live runners without weakening their gates. It requires a clean
+committed checkout, the repository `.env`, an approved model and matching
+manifest under `models/`, and exactly one currently deployed ASR container to
+serve as the rollback point. It prepares the ignored repository `.venv` from
+the pinned `requirements-dev.txt` only when needed; it never creates a manifest
+or changes Git state.
+
+Set the live audio and approved thresholds shown below, provide
+`ASR_LIVE_API_KEY` through the environment or the wrapper's hidden prompt, then
+run:
+
+```bash
+scripts/deploy_asr_cloud.sh
+```
+
+Full release, exact-image cutover, local readiness/WebSocket smoke, and live
+verification are the default. Protected evidence and rollback backups default
+to `/secure/asr-release-evidence` and `/secure/asr-release-backup`; override
+them with `ASR_DEPLOY_EVIDENCE_DIR` and `ASR_DEPLOY_BACKUP_DIR`, which must stay
+outside the repository. The wrapper tags the currently running image before the
+release build, deploys the release-verified image ID with Compose `--no-build`,
+and verifies that exact ID after cutover. It does not modify model files. It
+hashes and backs up `.env` and the manifest and revalidates the model against
+that manifest before and after cutover.
+
+Any error or HUP/INT/TERM after cutover attempts to restore the previous image,
+`.env`, and approved manifest, revalidates the unchanged model directory, and
+runs restored readiness and smoke. The original failing status is preserved;
+rollback failure is reported separately. Use `--dry-run` to inspect the plan
+without prerequisites. `--skip-live` must be deliberate and does not produce
+live-verified evidence.
+
 ### Live mode
 
 The release engineer or service operator runs live mode only immediately before
