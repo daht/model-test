@@ -15,6 +15,7 @@ from app.asr_inference import (
     ASRQueueFull,
     ASRQueueTimeout,
     ASRSessionBusy,
+    ASRSessionLimit,
     ASRSessionPoisoned,
 )
 from app.config import Settings
@@ -123,6 +124,198 @@ def make_coordinator(**setting_overrides):
     return coordinator, records, holder
 
 
+@pytest.mark.parametrize("create_method", ["create_stream", "create_chunked_stream"])
+def test_stream_capacity_is_not_double_counted_during_pending_to_active_transition(
+    create_method,
+):
+    async def scenario():
+        coordinator, _records, _holder = make_coordinator(
+            asr_inference_queue_size=3,
+            asr_max_active_streams=2,
+            asr_stream_queue_timeout_seconds=1.0,
+            asr_stream_inference_timeout_seconds=1.0,
+        )
+        await coordinator.start()
+
+        first_cleanup_started = threading.Event()
+        release_first_cleanup = threading.Event()
+        original_cleanup = coordinator._cleanup_poisoned_session
+        cleanup_calls = 0
+
+        def block_first_create_cleanup(sessions, session_id):
+            nonlocal cleanup_calls
+            cleanup_calls += 1
+            if cleanup_calls == 1:
+                first_cleanup_started.set()
+                assert release_first_cleanup.wait(1)
+            original_cleanup(sessions, session_id)
+
+        coordinator._cleanup_poisoned_session = block_first_create_cleanup
+        create = getattr(coordinator, create_method)
+        first = asyncio.create_task(create("zh"))
+        assert await asyncio.to_thread(first_cleanup_started.wait, 1)
+
+        second_submit_started = asyncio.Event()
+        original_submit = coordinator._submit
+
+        async def record_second_submit(*args, **kwargs):
+            second_submit_started.set()
+            return await original_submit(*args, **kwargs)
+
+        coordinator._submit = record_second_submit
+        second = asyncio.create_task(create("ja"))
+        submit_observer = asyncio.create_task(second_submit_started.wait())
+        try:
+            completed, _pending = await asyncio.wait(
+                {second, submit_observer},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            assert submit_observer in completed
+            assert second.done() is False
+            assert coordinator.snapshot().queue_depth == 1
+            with pytest.raises(ASRSessionLimit):
+                await create("en")
+        finally:
+            release_first_cleanup.set()
+
+        first_id, second_id = await asyncio.gather(first, second)
+        submit_observer.cancel()
+        assert coordinator.snapshot().active_streams == 2
+        await coordinator.abort_stream(first_id)
+        await coordinator.abort_stream(second_id)
+        await coordinator.stop()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("create_method", "job_action"),
+    [
+        ("create_stream", "create_stream"),
+        ("create_chunked_stream", "create_chunked_stream"),
+    ],
+)
+def test_failed_stream_create_releases_capacity_reservation(create_method, job_action):
+    async def scenario():
+        coordinator, _records, _holder = make_coordinator(
+            asr_max_active_streams=1,
+        )
+        await coordinator.start()
+        create = getattr(coordinator, create_method)
+        original_execute = coordinator._execute_job
+        fail_next_create = True
+
+        def fail_first_create(transcriber, sessions, job):
+            nonlocal fail_next_create
+            if job.action == job_action and fail_next_create:
+                fail_next_create = False
+                raise RuntimeError("fake create failure")
+            return original_execute(transcriber, sessions, job)
+
+        coordinator._execute_job = fail_first_create
+        with pytest.raises(RuntimeError, match="fake create failure"):
+            await create(None)
+
+        session_id = await create(None)
+        assert coordinator.snapshot().active_streams == 1
+        await coordinator.abort_stream(session_id)
+        await coordinator.stop()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("create_method", ["create_stream", "create_chunked_stream"])
+def test_cancelled_stream_create_releases_capacity_reservation(create_method):
+    async def scenario():
+        records = []
+        warmup_started = threading.Event()
+        release_warmup = threading.Event()
+
+        class SlowWarmupTranscriber(FakeTranscriber):
+            def warmup(self):
+                self.record("warmup")
+                warmup_started.set()
+                release_warmup.wait(1)
+
+        coordinator = ASRInferenceCoordinator(
+            settings(
+                asr_eager_load=False,
+                asr_max_active_streams=1,
+                asr_stream_queue_timeout_seconds=1.0,
+                asr_stream_inference_timeout_seconds=1.0,
+            ),
+            lambda: SlowWarmupTranscriber(records),
+        )
+        await coordinator.start()
+        create = getattr(coordinator, create_method)
+        cancelled_create = asyncio.create_task(create(None))
+        assert await asyncio.to_thread(warmup_started.wait, 1)
+        cancelled_create.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled_create
+
+        release_warmup.set()
+        await asyncio.to_thread(coordinator._jobs.join)
+        session_id = await create(None)
+        assert coordinator.snapshot().active_streams == 1
+        await coordinator.abort_stream(session_id)
+        await coordinator.stop()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("create_method", ["create_stream", "create_chunked_stream"])
+def test_cancelled_stream_create_after_worker_cleanup_releases_capacity(
+    create_method,
+):
+    async def scenario():
+        coordinator, _records, _holder = make_coordinator(
+            asr_max_active_streams=1,
+            asr_stream_queue_timeout_seconds=1.0,
+            asr_stream_inference_timeout_seconds=1.0,
+        )
+        await coordinator.start()
+
+        cleanup_completed = threading.Event()
+        release_result_publication = threading.Event()
+        original_cleanup = coordinator._cleanup_poisoned_session
+
+        def block_after_cleanup(sessions, session_id):
+            original_cleanup(sessions, session_id)
+            cleanup_completed.set()
+            assert release_result_publication.wait(1)
+
+        coordinator._cleanup_poisoned_session = block_after_cleanup
+        create = getattr(coordinator, create_method)
+        cancelled_create = asyncio.create_task(create(None))
+        assert await asyncio.to_thread(cleanup_completed.wait, 1)
+
+        cancelled_create.cancel()
+        await asyncio.sleep(0)
+        assert cancelled_create.done() is False
+        release_result_publication.set()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled_create
+
+        coordinator._cleanup_poisoned_session = original_cleanup
+        await asyncio.to_thread(coordinator._jobs.join)
+        snapshot = coordinator.snapshot()
+        registries = (
+            set(coordinator._active_sessions),
+            set(coordinator._stream_reservations),
+            set(coordinator._poisoned_sessions),
+        )
+        next_id = await create(None)
+        await coordinator.abort_stream(next_id)
+        await coordinator.stop()
+        return snapshot, registries
+
+    snapshot, registries = asyncio.run(scenario())
+
+    assert snapshot.active_streams == 0
+    assert registries == (set(), set(), set())
+
+
 def test_model_construction_and_calls_share_owner_thread():
     async def scenario():
         coordinator, records, _holder = make_coordinator(asr_file_transcribe_enabled=True)
@@ -193,6 +386,8 @@ def test_queue_full_raises_asr_queue_full():
             await asyncio.sleep(0)
         with pytest.raises(ASRQueueFull):
             await coordinator.add_audio(third_id, b"third", 16000)
+        with pytest.raises(ASRSessionLimit):
+            await coordinator.create_stream(None)
         holder["transcriber"].release_call.set()
         await first
         await second
@@ -1220,7 +1415,7 @@ def test_finished_and_aborted_sessions_need_no_timing_registry():
 
 def test_stop_and_restart_clear_all_session_registries():
     async def scenario():
-        coordinator, _records, _holder = make_coordinator()
+        coordinator, _records, _holder = make_coordinator(asr_max_active_streams=1)
         await coordinator.start()
         session_id = await coordinator.create_stream(None)
         result = await coordinator.add_audio(session_id, b"timed", 16000)
@@ -1229,19 +1424,24 @@ def test_stop_and_restart_clear_all_session_registries():
         stopped_registries = (
             set(coordinator._poisoned_sessions),
             set(coordinator._active_sessions),
+            set(coordinator._stream_reservations),
         )
         await coordinator.start()
         restarted_registries = (
             set(coordinator._poisoned_sessions),
             set(coordinator._active_sessions),
+            set(coordinator._stream_reservations),
         )
+        restarted_id = await coordinator.create_stream(None)
+        await coordinator.abort_stream(restarted_id)
         await coordinator.stop()
-        return stopped_registries, restarted_registries
+        return stopped_registries, restarted_registries, restarted_id
 
-    stopped, restarted = asyncio.run(scenario())
+    stopped, restarted, restarted_id = asyncio.run(scenario())
 
-    assert stopped == (set(), set())
-    assert restarted == (set(), set())
+    assert stopped == (set(), set(), set())
+    assert restarted == (set(), set(), set())
+    assert restarted_id
 
 
 def test_stream_chunk_transcription_runs_on_owner_thread_when_file_upload_is_disabled():

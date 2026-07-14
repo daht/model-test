@@ -86,6 +86,7 @@ class _Job:
     result: Future[Any] = field(compare=False, default_factory=Future)
     cancelled: threading.Event = field(compare=False, default_factory=threading.Event)
     holds_session_reservation: bool = field(compare=False, default=False)
+    holds_stream_reservation: bool = field(compare=False, default=False)
 
 
 class ASRInferenceCoordinator:
@@ -112,7 +113,7 @@ class ASRInferenceCoordinator:
         self._queued_audio_seconds = 0.0
         self._queued_business_jobs = 0
         self._active_sessions: set[str] = set()
-        self._pending_streams = 0
+        self._stream_reservations: set[str] = set()
         self._poisoned_sessions: set[str] = set()
         self._busy_sessions: set[str] = set()
         self._batch_pending = False
@@ -177,48 +178,28 @@ class ASRInferenceCoordinator:
             raise RuntimeError("ASR inference worker did not stop")
 
     async def create_stream(self, language: str | None) -> str:
-        with self._lock:
-            self._require_accepting_locked()
-            if self._batch_pending or self._batch_running:
-                raise ASRBatchConflict("batch transcription owns the model")
-            if len(self._active_sessions) + self._pending_streams >= self.settings.asr_max_active_streams:
-                raise ASRSessionLimit("maximum active ASR streams reached")
-            self._pending_streams += 1
         session_id = uuid.uuid4().hex[:12]
-        try:
-            return await self._submit(
-                "create_stream",
-                (session_id, language),
-                session_id,
-                priority=0,
-                queue_timeout=self.settings.asr_stream_queue_timeout_seconds,
-                inference_timeout=self.settings.asr_stream_inference_timeout_seconds,
-            )
-        finally:
-            with self._lock:
-                self._pending_streams -= 1
+        return await self._submit(
+            "create_stream",
+            (session_id, language),
+            session_id,
+            priority=0,
+            queue_timeout=self.settings.asr_stream_queue_timeout_seconds,
+            inference_timeout=self.settings.asr_stream_inference_timeout_seconds,
+            reserve_stream_capacity=True,
+        )
 
     async def create_chunked_stream(self, language: str | None) -> str:
-        with self._lock:
-            self._require_accepting_locked()
-            if self._batch_pending or self._batch_running:
-                raise ASRBatchConflict("batch transcription owns the model")
-            if len(self._active_sessions) + self._pending_streams >= self.settings.asr_max_active_streams:
-                raise ASRSessionLimit("maximum active ASR streams reached")
-            self._pending_streams += 1
         session_id = uuid.uuid4().hex[:12]
-        try:
-            return await self._submit(
-                "create_chunked_stream",
-                (session_id, language),
-                session_id,
-                priority=0,
-                queue_timeout=self.settings.asr_stream_queue_timeout_seconds,
-                inference_timeout=self.settings.asr_stream_inference_timeout_seconds,
-            )
-        finally:
-            with self._lock:
-                self._pending_streams -= 1
+        return await self._submit(
+            "create_chunked_stream",
+            (session_id, language),
+            session_id,
+            priority=0,
+            queue_timeout=self.settings.asr_stream_queue_timeout_seconds,
+            inference_timeout=self.settings.asr_stream_inference_timeout_seconds,
+            reserve_stream_capacity=True,
+        )
 
     async def add_audio(
         self,
@@ -295,7 +276,7 @@ class ASRInferenceCoordinator:
             self._require_accepting_locked()
             if not self.settings.asr_file_transcribe_enabled:
                 raise ASRFileTranscriptionDisabled("file transcription is disabled")
-            if self._active_sessions or self._pending_streams or self._batch_pending or self._batch_running:
+            if self._stream_reservations or self._batch_pending or self._batch_running:
                 raise ASRBatchConflict("live streaming owns the model")
             self._batch_pending = True
         try:
@@ -354,6 +335,7 @@ class ASRInferenceCoordinator:
         inference_timeout: float,
         audio_seconds: float = 0.0,
         reserve_session_operation: bool = False,
+        reserve_stream_capacity: bool = False,
     ) -> Any:
         job = self._new_job(
             action,
@@ -363,9 +345,20 @@ class ASRInferenceCoordinator:
             queue_timeout=queue_timeout,
             audio_seconds=audio_seconds,
             holds_session_reservation=reserve_session_operation,
+            holds_stream_reservation=reserve_stream_capacity,
         )
         with self._lock:
             self._require_accepting_locked()
+            if reserve_stream_capacity:
+                if self._batch_pending or self._batch_running:
+                    raise ASRBatchConflict("batch transcription owns the model")
+                if (
+                    len(self._stream_reservations)
+                    >= self.settings.asr_max_active_streams
+                ):
+                    raise ASRSessionLimit("maximum active ASR streams reached")
+                assert session_id is not None
+                self._stream_reservations.add(session_id)
             if reserve_session_operation:
                 self._require_session_admissible_locked(session_id)
                 assert session_id is not None
@@ -380,6 +373,7 @@ class ASRInferenceCoordinator:
                 )
                 if session_id:
                     self._busy_sessions.discard(session_id)
+                self._release_stream_reservation_locked(job)
                 raise ASRQueueFull("maximum queued audio duration reached")
             if self._queued_business_jobs >= self.settings.asr_inference_queue_size:
                 logger.warning(
@@ -388,6 +382,7 @@ class ASRInferenceCoordinator:
                 )
                 if session_id:
                     self._busy_sessions.discard(session_id)
+                self._release_stream_reservation_locked(job)
                 raise ASRQueueFull("ASR inference queue is full")
             self._queued_audio_seconds += audio_seconds
             self._queued_business_jobs += 1
@@ -401,6 +396,7 @@ class ASRInferenceCoordinator:
                 self._queued_business_jobs -= 1
                 if session_id:
                     self._busy_sessions.discard(session_id)
+                self._release_stream_reservation_locked(job)
                 raise ASRQueueFull("ASR inference queue is full") from exc
 
         started = asyncio.wrap_future(job.started)
@@ -436,7 +432,34 @@ class ASRInferenceCoordinator:
             elif session_id:
                 with self._lock:
                     self._poisoned_sessions.add(session_id)
+                await self._cleanup_cancelled_started_job(
+                    result,
+                    session_id,
+                    timeout=inference_timeout,
+                )
             raise
+
+    async def _cleanup_cancelled_started_job(
+        self,
+        result: asyncio.Future[Any],
+        session_id: str,
+        *,
+        timeout: float,
+    ) -> None:
+        try:
+            await asyncio.wait_for(asyncio.shield(result), timeout=timeout)
+        except Exception:
+            pass
+
+        with self._lock:
+            if session_id not in self._active_sessions:
+                return
+            self._poisoned_sessions.discard(session_id)
+        try:
+            await self.abort_stream(session_id)
+        except ASRCoordinatorError:
+            with self._lock:
+                self._poisoned_sessions.add(session_id)
 
     def _new_job(
         self,
@@ -448,6 +471,7 @@ class ASRInferenceCoordinator:
         queue_timeout: float,
         audio_seconds: float = 0.0,
         holds_session_reservation: bool = False,
+        holds_stream_reservation: bool = False,
     ) -> _Job:
         enqueue_time = time.monotonic()
         return _Job(
@@ -460,6 +484,7 @@ class ASRInferenceCoordinator:
             queue_deadline=enqueue_time + queue_timeout,
             audio_seconds=audio_seconds,
             holds_session_reservation=holds_session_reservation,
+            holds_stream_reservation=holds_stream_reservation,
         )
 
     def _worker_main(self) -> None:
@@ -572,6 +597,7 @@ class ASRInferenceCoordinator:
                 finally:
                     self._release_audio_reservation(job.audio_seconds)
                     self._release_session_reservation(job)
+                    self._release_stream_reservation(job)
                     self._jobs.task_done()
                 if cleanup_error is not None:
                     worker_error = ASRNotReady("ASR owner worker stopped unexpectedly")
@@ -632,6 +658,7 @@ class ASRInferenceCoordinator:
         sessions.clear()
         with self._lock:
             self._active_sessions.clear()
+            self._stream_reservations.clear()
             self._poisoned_sessions.clear()
             self._busy_sessions.clear()
             self._batch_pending = False
@@ -653,6 +680,7 @@ class ASRInferenceCoordinator:
             finally:
                 self._release_audio_reservation(job.audio_seconds)
                 self._release_session_reservation(job)
+                self._release_stream_reservation(job)
                 self._jobs.task_done()
 
     def _release_queue_slot(self, job: _Job) -> None:
@@ -667,18 +695,30 @@ class ASRInferenceCoordinator:
         with self._lock:
             self._busy_sessions.discard(job.session_id)
 
+    def _release_stream_reservation(self, job: _Job) -> None:
+        with self._lock:
+            self._release_stream_reservation_locked(job)
+
+    def _release_stream_reservation_locked(self, job: _Job) -> None:
+        if not job.holds_stream_reservation or not job.session_id:
+            return
+        self._stream_reservations.discard(job.session_id)
+        job.holds_stream_reservation = False
+
     def _execute_job(self, transcriber: ASRTranscriber, sessions: dict[str, Any], job: _Job) -> Any:
         if job.action == "create_stream":
             session_id, language = job.args
             sessions[session_id] = transcriber.create_streaming_session(language=language)
             with self._lock:
                 self._active_sessions.add(session_id)
+                job.holds_stream_reservation = False
             return session_id
         if job.action == "create_chunked_stream":
             session_id, _language = job.args
             sessions[session_id] = _ChunkedSession()
             with self._lock:
                 self._active_sessions.add(session_id)
+                job.holds_stream_reservation = False
             return session_id
         if job.action == "add_audio":
             session_id, pcm_bytes, sample_rate = job.args
@@ -698,6 +738,7 @@ class ASRInferenceCoordinator:
                 sessions.pop(session_id, None)
                 with self._lock:
                     self._active_sessions.discard(session_id)
+                    self._stream_reservations.discard(session_id)
         if job.action == "finish_segment":
             (session_id,) = job.args
             return sessions[session_id].finish_segment()
@@ -711,6 +752,7 @@ class ASRInferenceCoordinator:
             finally:
                 with self._lock:
                     self._active_sessions.discard(session_id)
+                    self._stream_reservations.discard(session_id)
         if job.action == "transcribe_file":
             audio_path, language = job.args
             with self._lock:
@@ -748,6 +790,7 @@ class ASRInferenceCoordinator:
                 self._poisoned_sessions.discard(session_id)
                 self._busy_sessions.discard(session_id)
                 self._active_sessions.discard(session_id)
+                self._stream_reservations.discard(session_id)
 
     def _require_session_admissible(self, session_id: str) -> None:
         with self._lock:
