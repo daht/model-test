@@ -37,6 +37,7 @@ target/
 .vscode/
 
 /AGENTS.md
+/.agents/
 /CLAUDE.md
 /docker-claude.sh
 /docker-codex.sh

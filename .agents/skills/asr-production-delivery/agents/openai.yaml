@@ -1,4 +1,0 @@
-interface:
-  display_name: "ASR Production Delivery"
-  short_description: "Execute this project ASR changes through production gates"
-  default_prompt: "Use $asr-production-delivery to implement and independently validate this project ASR change."
