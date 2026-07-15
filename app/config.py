@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     asr_max_upload_mb: int = 200
     asr_stream_chunk_seconds: float = Field(default=2.0, gt=0, le=30)
     asr_vllm_gpu_memory_utilization: float = Field(default=0.8, gt=0, lt=1)
+    asr_vllm_max_model_len: int = Field(default=65536, ge=512, le=65536)
     asr_vllm_max_new_tokens: int = Field(default=32, gt=0)
     asr_stream_unfixed_chunk_num: int = Field(default=2, ge=0)
     asr_stream_unfixed_token_num: int = Field(default=5, ge=0)

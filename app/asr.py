@@ -534,6 +534,7 @@ class QwenVLLMASRTranscriber(ASRTranscriber):
         self._model = Qwen3ASRModel.LLM(
             model=self.settings.asr_model_id,
             gpu_memory_utilization=self.settings.asr_vllm_gpu_memory_utilization,
+            max_model_len=self.settings.asr_vllm_max_model_len,
             max_new_tokens=self.settings.asr_vllm_max_new_tokens,
         )
 

@@ -195,6 +195,7 @@ def transcribe_stream_info(current_settings: Settings = Depends(get_settings)) -
                     else current_settings.asr_stream_rollover_seconds
                 ),
                 "vllm_gpu_memory_utilization": current_settings.asr_vllm_gpu_memory_utilization,
+                "vllm_max_model_len": current_settings.asr_vllm_max_model_len,
                 "vllm_max_new_tokens": current_settings.asr_vllm_max_new_tokens,
                 "stable_commit_enabled": (
                     current_settings.asr_stable_commit_enabled and not stateful

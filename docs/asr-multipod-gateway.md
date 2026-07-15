@@ -31,7 +31,10 @@ stickiness contract.
 
 Both backends use one Uvicorn worker and one model owner. The Compose file makes
 both containers see GPU index `0` and starts each at
-`ASR_VLLM_GPU_MEMORY_UTILIZATION=0.35` by default.
+`ASR_VLLM_GPU_MEMORY_UTILIZATION=0.40` with
+`ASR_VLLM_MAX_MODEL_LEN=4096` by default. The single-backend default remains
+`65536`; the lower multi-Pod limit prevents vLLM from reserving a 7 GiB KV cache
+for a context size that the 30-second streaming utterance boundary does not use.
 
 This is only a starting value, not proof that two models fit. Before a capacity
 run, verify all of the following:
@@ -40,6 +43,12 @@ run, verify all of the following:
 2. `nvidia-smi` shows enough steady-state and transient headroom.
 3. A simultaneous real streaming warmup succeeds on both backends.
 4. Model load plus vLLM cache and peak activations stay below physical VRAM.
+
+The A10 feasibility run must reject configurations where vLLM reports that the
+requested maximum model length needs more KV cache than the per-process memory
+budget. Do not solve that error by raising both processes above a combined GPU
+memory utilization of `0.8`; keep `4096` as the initial sequence limit and
+measure real 30-second utterances first.
 
 Without CUDA MPS, the two CUDA contexts are scheduled by the normal driver and
 may mostly time-slice. With MPS, kernels from the two processes may overlap, but

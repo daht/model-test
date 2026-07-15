@@ -597,7 +597,10 @@ def test_multipod_compose_topology_is_explicit_and_gpu_gateway_free():
         service = services[name]
         assert service["command"][service["command"].index("--workers") + 1] == "1"
         assert service["environment"]["ASR_VLLM_GPU_MEMORY_UTILIZATION"] == (
-            "${ASR_MULTIPOD_GPU_MEMORY_UTILIZATION:-0.35}"
+            "${ASR_MULTIPOD_GPU_MEMORY_UTILIZATION:-0.40}"
+        )
+        assert service["environment"]["ASR_VLLM_MAX_MODEL_LEN"] == (
+            "${ASR_MULTIPOD_MAX_MODEL_LEN:-4096}"
         )
         assert any(volume.endswith("/models:ro") for volume in service["volumes"])
         assert service["gpus"] == "all"

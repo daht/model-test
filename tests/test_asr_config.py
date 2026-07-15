@@ -112,6 +112,8 @@ def test_compose_uses_asr_transport_environment_for_uvicorn_bounds():
         ("asr_vllm_gpu_memory_utilization", 0),
         ("asr_vllm_gpu_memory_utilization", 1),
         ("asr_vllm_gpu_memory_utilization", 1.5),
+        ("asr_vllm_max_model_len", 511),
+        ("asr_vllm_max_model_len", 65537),
         ("asr_vllm_max_new_tokens", 0),
         ("asr_stream_unfixed_chunk_num", -1),
         ("asr_stream_unfixed_token_num", -1),

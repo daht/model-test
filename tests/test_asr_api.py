@@ -834,6 +834,7 @@ def test_stream_info_reports_streaming_mode_and_stateful_settings(monkeypatch):
     monkeypatch.setenv("ASR_STREAM_UNFIXED_CHUNK_NUM", "2")
     monkeypatch.setenv("ASR_STREAM_UNFIXED_TOKEN_NUM", "5")
     monkeypatch.setenv("ASR_VLLM_GPU_MEMORY_UTILIZATION", "0.8")
+    monkeypatch.setenv("ASR_VLLM_MAX_MODEL_LEN", "4096")
     monkeypatch.setenv("ASR_VLLM_MAX_NEW_TOKENS", "32")
     monkeypatch.setenv("ASR_STABLE_COMMIT_ENABLED", "true")
     monkeypatch.setenv("ASR_STABLE_COMMIT_SECONDS", "1.0")
@@ -857,6 +858,7 @@ def test_stream_info_reports_streaming_mode_and_stateful_settings(monkeypatch):
     assert body["audio_format"]["stateful"]["unfixed_chunk_num"] == 2
     assert body["audio_format"]["stateful"]["unfixed_token_num"] == 5
     assert body["audio_format"]["stateful"]["vllm_gpu_memory_utilization"] == 0.8
+    assert body["audio_format"]["stateful"]["vllm_max_model_len"] == 4096
     assert body["audio_format"]["stateful"]["vllm_max_new_tokens"] == 32
     assert body["audio_format"]["stateful"]["stable_commit_enabled"] is False
     assert body["audio_format"]["stateful"]["stable_commit_seconds"] == 1.0
@@ -1981,7 +1983,15 @@ def test_qwen_vllm_streaming_session_feeds_pcm_and_finishes(monkeypatch):
 
     assert update.text == "可以到店"
     assert final.text == "可以到店使用"
-    assert calls[0][0] == "load"
+    assert calls[0] == (
+        "load",
+        {
+            "model": "/models/Qwen3-ASR-1.7B-hf",
+            "gpu_memory_utilization": 0.8,
+            "max_model_len": 65536,
+            "max_new_tokens": 32,
+        },
+    )
     assert calls[1] == (
         "init",
         {
