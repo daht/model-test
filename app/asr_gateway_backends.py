@@ -65,11 +65,14 @@ class BackendCapabilities:
     warmed: bool = False
     sample_rate: int = 16_000
     sample_format: str = "pcm_s16le"
+    backend_id: str = ""
 
     def __post_init__(self) -> None:
         for name in ("worker_id", "model_id", "model_revision", "gpu_id"):
             if not str(getattr(self, name)).strip():
                 raise ValueError(f"{name} must not be empty")
+        if self.backend_id and not self.backend_id.strip():
+            raise ValueError("backend_id must not be blank")
         for name in (
             "protocol_version", "preferred_chunk_samples", "max_input_samples",
             "max_batch_items", "max_batch_samples", "max_in_flight",
@@ -141,6 +144,12 @@ class BackendRegistry:
                     raise ValueError("immutable model identity changed on re-registration")
                 current.capabilities = capabilities
                 return current
+            for worker in self._workers.values():
+                if worker.capabilities.gpu_id == capabilities.gpu_id:
+                    raise ValueError(
+                        f"gpu_id {capabilities.gpu_id} already has model owner "
+                        f"{worker.capabilities.worker_id}"
+                    )
             snapshot = BackendSnapshot(capabilities=capabilities)
             self._workers[capabilities.worker_id] = snapshot
             return snapshot
@@ -151,13 +160,44 @@ class BackendRegistry:
             worker.lifecycle = WorkerLifecycle.READY if ready else WorkerLifecycle.FAILED
             worker.load_error = error
 
-    async def acquire(self, *, preferred_worker_id: str | None = None) -> BackendLease:
+    async def acquire(
+        self,
+        *,
+        preferred_worker_id: str | None = None,
+        backend_id: str | None = None,
+        language: str | None = None,
+        task: str | None = None,
+        streaming_mode: StreamingMode | None = None,
+        result_modes: tuple[ResultMode, ...] | None = None,
+        model_id: str | None = None,
+        model_revision: str | None = None,
+    ) -> BackendLease:
         async with self._lock:
             candidates = [w for w in self._workers.values() if w.accepting]
             if preferred_worker_id is not None:
                 candidates = [w for w in candidates if w.capabilities.worker_id == preferred_worker_id]
+            if backend_id is not None:
+                candidates = [
+                    w for w in candidates
+                    if (w.capabilities.backend_id or w.capabilities.worker_id) == backend_id
+                ]
+            if language is not None and language != "auto":
+                candidates = [
+                    w for w in candidates
+                    if language in w.capabilities.languages or "auto" in w.capabilities.languages
+                ]
+            if task is not None:
+                candidates = [w for w in candidates if task in w.capabilities.tasks]
+            if streaming_mode is not None:
+                candidates = [w for w in candidates if w.capabilities.streaming_mode is streaming_mode]
+            if result_modes is not None:
+                candidates = [w for w in candidates if w.capabilities.result_mode in result_modes]
+            if model_id is not None:
+                candidates = [w for w in candidates if w.capabilities.model_id == model_id]
+            if model_revision is not None:
+                candidates = [w for w in candidates if w.capabilities.model_revision == model_revision]
             if not candidates:
-                raise RuntimeError("no ready backend capacity")
+                raise RuntimeError("unsupported backend route or no ready capacity")
             selected = min(candidates, key=lambda w: (w.active_leases, w.in_flight, w.capabilities.worker_id))
             selected.active_leases += 1
             return BackendLease(self, selected.capabilities.worker_id)

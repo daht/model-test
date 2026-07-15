@@ -168,12 +168,6 @@ class Settings(BaseSettings):
                 "asr_vad_hangover_ms must not exceed asr_vad_min_silence_ms"
             )
         if self.asr_stream_mode == "stateful":
-            if self.asr_backend == "qwen_vllm" and self.asr_model_id == "/models/Qwen3-ASR-1.7B-hf":
-                # The pinned qwen-asr/vLLM runtime uses the toolkit checkpoint,
-                # while the original qwen backend uses the Transformers export.
-                self.asr_model_id = "Qwen/Qwen3-ASR-1.7B"
-            elif self.asr_backend == "qwen_vllm" and self.asr_model_id.rstrip("/").endswith("-hf"):
-                raise ValueError("qwen_vllm stateful model_id must not use the -hf export")
             if self.asr_stream_rollover_seconds <= self.asr_stream_chunk_seconds:
                 raise ValueError(
                     "asr_stream_rollover_seconds must exceed the model chunk duration"
@@ -204,6 +198,13 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "asr_state_watchdog_seconds must exceed the normal utterance limit plus one frame"
                 )
+            if self.asr_backend == "qwen_vllm" and self.asr_model_id.rstrip("/").endswith("-hf"):
+                raise ValueError("qwen_vllm stateful model_id must not use the -hf export")
+            if self.asr_backend == "qwen_vllm" and self.asr_model_id != "Qwen/Qwen3-ASR-1.7B":
+                if not self.asr_require_model_manifest or not self.asr_model_manifest_path:
+                    raise ValueError(
+                        "qwen_vllm requires Qwen/Qwen3-ASR-1.7B or an approved local model with its manifest"
+                    )
         return self
 
 

@@ -38,6 +38,7 @@ class LocalCoordinatorAdapter:
             preferred_chunk_samples=24_000, max_input_samples=max_input_samples,
             max_batch_items=1, max_batch_samples=max_input_samples, max_in_flight=1,
             session_capacity=session_capacity, retry_safe=False, warmed=False,
+            backend_id="local",
         )
 
     async def warmup(self) -> None:

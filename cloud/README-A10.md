@@ -11,6 +11,9 @@ default.
 The stateful `qwen_vllm` runtime pinned to `qwen-asr==0.0.6` and `vllm==0.14.0`
 must use `Qwen/Qwen3-ASR-1.7B`, not the `-hf` Transformers export. Credentials enter
 through environment variables and must not appear in commands or logs.
+ASR WebSocket clients authenticate with `X-API-Key` during the upgrade, fetch
+stream-info with the same header, and terminate input with `{"type":"finish"}`.
+Body-key authentication and the old `end` command are not supported.
 
 A10 capacity remains unverified until the release and live gates run against
 the exact image, model, manifest, configuration, non-silent warmup, speech

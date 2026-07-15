@@ -15,7 +15,7 @@ curl -fsS "${BASE_URL}/ready"
 echo
 
 echo "ASR stream info:"
-stream_info="$(curl -fsS "${BASE_URL}/v1/transcribe/stream-info")"
+stream_info="$(curl -fsS -H "X-API-Key: ${API_KEY}" "${BASE_URL}/v1/transcribe/stream-info")"
 echo "${stream_info}"
 echo
 
@@ -73,7 +73,7 @@ if expected_stable_commit:
 PY
 fi
 
-echo "WebSocket smoke: start -> ready -> audio -> end -> final -> close"
+echo "WebSocket smoke: start -> ready -> audio -> finish -> final -> close"
 BASE_URL="${BASE_URL}" API_KEY="${API_KEY}" LANGUAGE="${LANGUAGE}" python3 - <<'PY'
 import base64
 import hashlib
@@ -164,7 +164,8 @@ request = (
     "Upgrade: websocket\r\n"
     "Connection: Upgrade\r\n"
     f"Sec-WebSocket-Key: {key}\r\n"
-    "Sec-WebSocket-Version: 13\r\n\r\n"
+    "Sec-WebSocket-Version: 13\r\n"
+    f"X-API-Key: {os.environ['API_KEY']}\r\n\r\n"
 )
 connection.sendall(request.encode())
 response = b""
@@ -185,7 +186,6 @@ send_frame(
     json.dumps(
         {
             "type": "start",
-            "api_key": os.environ["API_KEY"],
             "language": os.environ.get("LANGUAGE") or None,
             "sample_rate": 16000,
             "format": "pcm_s16le",
@@ -204,7 +204,7 @@ pcm = b"".join(
 )
 send_frame(connection, 2, pcm[:16000])
 send_frame(connection, 2, pcm[16000:])
-send_frame(connection, 1, json.dumps({"type": "end"}))
+send_frame(connection, 1, json.dumps({"type": "finish"}))
 final_count = 0
 while True:
     opcode, payload = receive_frame(connection)

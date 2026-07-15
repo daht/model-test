@@ -181,6 +181,7 @@ def test_production_asr_backends_accept_long_test_only_api_key(backend, stream_m
         asr_backend=backend,
         asr_stream_mode=stream_mode,
         api_key=TEST_ONLY_LONG_API_KEY,
+        asr_model_id="Qwen/Qwen3-ASR-1.7B" if backend == "qwen_vllm" else "/models/Qwen3-ASR-1.7B-hf",
     )
 
     assert settings.api_key == TEST_ONLY_LONG_API_KEY
@@ -206,26 +207,35 @@ def test_supported_asr_backend_stream_mode_pairs_pass(backend, stream_mode):
         asr_backend=backend,
         asr_stream_mode=stream_mode,
         api_key=TEST_ONLY_LONG_API_KEY,
+        asr_model_id="Qwen/Qwen3-ASR-1.7B" if backend == "qwen_vllm" else "/models/Qwen3-ASR-1.7B-hf",
     )
 
     assert (settings.asr_backend, settings.asr_stream_mode) == (backend, stream_mode)
 
 
 def test_qwen_vllm_stateful_uses_toolkit_checkpoint_not_hf_export():
-    settings = Settings(
-        _env_file=None,
-        asr_backend="qwen_vllm",
-        asr_stream_mode="stateful",
-        api_key=TEST_ONLY_LONG_API_KEY,
-    )
-    assert settings.asr_model_id == "Qwen/Qwen3-ASR-1.7B"
-
     with pytest.raises(ValidationError, match="-hf export"):
         Settings(
             _env_file=None,
             asr_backend="qwen_vllm",
             asr_stream_mode="stateful",
             asr_model_id="/custom/Qwen3-ASR-1.7B-hf",
+            api_key=TEST_ONLY_LONG_API_KEY,
+        )
+    settings = Settings(
+        _env_file=None,
+        asr_backend="qwen_vllm",
+        asr_stream_mode="stateful",
+        asr_model_id="Qwen/Qwen3-ASR-1.7B",
+        api_key=TEST_ONLY_LONG_API_KEY,
+    )
+    assert settings.asr_model_id == "Qwen/Qwen3-ASR-1.7B"
+    with pytest.raises(ValidationError, match="approved local"):
+        Settings(
+            _env_file=None,
+            asr_backend="qwen_vllm",
+            asr_stream_mode="stateful",
+            asr_model_id="/custom/unapproved-model",
             api_key=TEST_ONLY_LONG_API_KEY,
         )
 

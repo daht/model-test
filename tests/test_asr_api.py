@@ -830,6 +830,7 @@ def test_stream_info_reports_streaming_mode_and_stateful_settings(monkeypatch):
     asr_api.get_settings.cache_clear()
     monkeypatch.setenv("ASR_STREAM_MODE", "stateful")
     monkeypatch.setenv("ASR_BACKEND", "qwen_vllm")
+    monkeypatch.setenv("ASR_MODEL_ID", "Qwen/Qwen3-ASR-1.7B")
     monkeypatch.setenv("ASR_STREAM_CHUNK_SECONDS", "1.0")
     monkeypatch.setenv("ASR_STREAM_UNFIXED_CHUNK_NUM", "2")
     monkeypatch.setenv("ASR_STREAM_UNFIXED_TOKEN_NUM", "5")
@@ -1905,7 +1906,11 @@ def test_qwen_vllm_backend_can_be_selected():
     from app.config import Settings
 
     transcriber = create_asr_transcriber(
-        Settings(asr_backend="qwen_vllm", api_key=TEST_ONLY_LONG_API_KEY)
+        Settings(
+            asr_backend="qwen_vllm",
+            asr_model_id="Qwen/Qwen3-ASR-1.7B",
+            api_key=TEST_ONLY_LONG_API_KEY,
+        )
     )
 
     assert isinstance(transcriber, QwenVLLMASRTranscriber)
@@ -1972,6 +1977,7 @@ def test_qwen_vllm_streaming_session_feeds_pcm_and_finishes(monkeypatch):
     transcriber = QwenVLLMASRTranscriber(
         Settings(
             asr_backend="qwen_vllm",
+            asr_model_id="Qwen/Qwen3-ASR-1.7B",
             api_key=TEST_ONLY_LONG_API_KEY,
             asr_max_frame_bytes=32000,
             asr_ws_max_queue=1,
@@ -1986,7 +1992,7 @@ def test_qwen_vllm_streaming_session_feeds_pcm_and_finishes(monkeypatch):
     assert calls[0] == (
         "load",
         {
-            "model": "/models/Qwen3-ASR-1.7B-hf",
+            "model": "Qwen/Qwen3-ASR-1.7B",
             "gpu_memory_utilization": 0.8,
             "max_model_len": 65536,
             "max_new_tokens": 32,
@@ -2025,7 +2031,7 @@ def test_qwen_vllm_warmup_loads_model_once(monkeypatch):
     monkeypatch.setitem(sys.modules, "qwen_asr", types.SimpleNamespace(Qwen3ASRModel=FakeQwen3ASRModel))
 
     transcriber = QwenVLLMASRTranscriber(
-        Settings(asr_backend="qwen_vllm", api_key=TEST_ONLY_LONG_API_KEY)
+        Settings(asr_backend="qwen_vllm", asr_model_id="Qwen/Qwen3-ASR-1.7B", api_key=TEST_ONLY_LONG_API_KEY)
     )
     transcriber.warmup()
     transcriber.warmup()
@@ -2045,6 +2051,7 @@ def test_qwen_vllm_stateful_warmup_fails_fast_without_vad_asset(
             _env_file=None,
             asr_backend="qwen_vllm",
             asr_stream_mode="stateful",
+            asr_model_id="Qwen/Qwen3-ASR-1.7B",
             api_key=TEST_ONLY_LONG_API_KEY,
             asr_vad_model_path=str(tmp_path / "missing.onnx"),
         )
@@ -2115,6 +2122,7 @@ def test_qwen_vllm_stateful_warmup_performs_non_silent_streaming_decode(
             _env_file=None,
             asr_backend="qwen_vllm",
             asr_stream_mode="stateful",
+            asr_model_id="Qwen/Qwen3-ASR-1.7B",
             api_key=TEST_ONLY_LONG_API_KEY,
             asr_stream_chunk_seconds=0.5,
         )
@@ -2167,7 +2175,7 @@ def test_stateful_segment_reset_reinitializes_official_state(monkeypatch):
     monkeypatch.setitem(sys.modules, "qwen_asr", types.SimpleNamespace(Qwen3ASRModel=FakeQwen3ASRModel))
 
     transcriber = QwenVLLMASRTranscriber(
-        Settings(asr_backend="qwen_vllm", api_key=TEST_ONLY_LONG_API_KEY)
+        Settings(asr_backend="qwen_vllm", asr_model_id="Qwen/Qwen3-ASR-1.7B", api_key=TEST_ONLY_LONG_API_KEY)
     )
     session = transcriber.create_streaming_session(language="zh")
     first = session.add_pcm_s16le(b"\x00\x00", 16000)
@@ -2227,6 +2235,7 @@ def test_stateful_segment_finish_flushes_buffer_before_reinitializing(monkeypatc
             _env_file=None,
             asr_backend="qwen_vllm",
             asr_stream_mode="stateful",
+            asr_model_id="Qwen/Qwen3-ASR-1.7B",
             api_key=TEST_ONLY_LONG_API_KEY,
             asr_stream_chunk_seconds=1.0,
             asr_max_frame_bytes=28800,
@@ -2304,6 +2313,7 @@ def test_stateful_rollover_bounds_official_state_and_preserves_exact_text(monkey
             _env_file=None,
             asr_backend="qwen_vllm",
             asr_stream_mode="stateful",
+            asr_model_id="Qwen/Qwen3-ASR-1.7B",
             api_key=TEST_ONLY_LONG_API_KEY,
             asr_stream_chunk_seconds=0.1,
             asr_stream_rollover_seconds=120.0,
@@ -2367,6 +2377,7 @@ def test_stateful_invariant_watchdog_aborts_instead_of_normal_rollover(monkeypat
         Settings(
             _env_file=None,
             asr_backend="qwen_vllm",
+            asr_model_id="Qwen/Qwen3-ASR-1.7B",
             api_key=TEST_ONLY_LONG_API_KEY,
         )
     ).create_streaming_session("zh")
@@ -2404,7 +2415,7 @@ def test_stateful_abort_releases_state(monkeypatch):
     monkeypatch.setitem(sys.modules, "qwen_asr", types.SimpleNamespace(Qwen3ASRModel=FakeQwen3ASRModel))
 
     transcriber = QwenVLLMASRTranscriber(
-        Settings(asr_backend="qwen_vllm", api_key=TEST_ONLY_LONG_API_KEY)
+        Settings(asr_backend="qwen_vllm", asr_model_id="Qwen/Qwen3-ASR-1.7B", api_key=TEST_ONLY_LONG_API_KEY)
     )
     session = transcriber.create_streaming_session(language="zh")
     session.abort()
@@ -2440,7 +2451,7 @@ def test_qwen_vllm_file_transcribe_normalizes_language_code(monkeypatch):
     monkeypatch.setitem(sys.modules, "qwen_asr", types.SimpleNamespace(Qwen3ASRModel=FakeQwen3ASRModel))
 
     transcriber = QwenVLLMASRTranscriber(
-        Settings(asr_backend="qwen_vllm", api_key=TEST_ONLY_LONG_API_KEY)
+        Settings(asr_backend="qwen_vllm", asr_model_id="Qwen/Qwen3-ASR-1.7B", api_key=TEST_ONLY_LONG_API_KEY)
     )
     result = transcriber.transcribe("sample.wav", language="en")
 
@@ -2475,7 +2486,7 @@ def test_qwen_vllm_file_transcribe_normalizes_regional_language_code(monkeypatch
     monkeypatch.setitem(sys.modules, "qwen_asr", types.SimpleNamespace(Qwen3ASRModel=FakeQwen3ASRModel))
 
     transcriber = QwenVLLMASRTranscriber(
-        Settings(asr_backend="qwen_vllm", api_key=TEST_ONLY_LONG_API_KEY)
+        Settings(asr_backend="qwen_vllm", asr_model_id="Qwen/Qwen3-ASR-1.7B", api_key=TEST_ONLY_LONG_API_KEY)
     )
     transcriber.transcribe("sample.wav", language="en-US")
 

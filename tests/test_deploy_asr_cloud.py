@@ -55,7 +55,7 @@ def _make_harness(tmp_path: Path):
     fake_bin = tmp_path / "bin"
     state = tmp_path / "state"
     secure = tmp_path / "secure"
-    model = repo / "models" / "Qwen3-ASR-1.7B-hf"
+    model = repo / "models" / "Qwen3-ASR-1.7B"
     for path in (scripts, fake_bin, state, secure, model):
         path.mkdir(parents=True, exist_ok=True)
 
@@ -63,7 +63,7 @@ def _make_harness(tmp_path: Path):
     shutil.copy2(Path("scripts/asr_deploy_receipt.py"), scripts / "asr_deploy_receipt.py")
     (repo / "requirements-dev.txt").write_text("pytest==9.1.1\n")
     (repo / ".env").write_text("API_KEY=stored-outside-command-line\n")
-    (repo / "models" / "Qwen3-ASR-1.7B-hf.manifest.json").write_text(
+    (repo / "models" / "Qwen3-ASR-1.7B.manifest.json").write_text(
         '{"revision":"approved"}\n'
     )
     zh_audio = secure / "zh.flac"
@@ -157,7 +157,7 @@ if [[ "${1:-}" == inspect && "$*" == *oldcid ]]; then
   mismatch_value=qwen_vllm
   if [[ "${FAKE_BASELINE_MISMATCH:-0}" == 1 ]]; then mismatch_value=mock; fi
   cat <<JSON
-[{"Image":"sha256:old","Config":{"Env":["API_KEY=stored-outside-command-line-1234567890","ASR_BACKEND=$mismatch_value","ASR_STREAM_MODE=stateful","ASR_REQUIRE_MODEL_MANIFEST=true","ASR_EAGER_LOAD=true","ASR_FILE_TRANSCRIBE_ENABLED=false","ASR_MODEL_ID=/models/Qwen3-ASR-1.7B-hf","ASR_MODEL_MANIFEST_PATH=/models/Qwen3-ASR-1.7B-hf.manifest.json"],"Cmd":["python","-m","uvicorn","app.asr_api:app","--workers","1"]},"State":{"Running":true,"StartedAt":"2099-01-01T00:00:00Z"},"Mounts":[{"Destination":"/models","Source":"$FAKE_REPO/models","RW":false}]}]
+[{"Image":"sha256:old","Config":{"Env":["API_KEY=stored-outside-command-line-1234567890","ASR_BACKEND=$mismatch_value","ASR_STREAM_MODE=stateful","ASR_REQUIRE_MODEL_MANIFEST=true","ASR_EAGER_LOAD=true","ASR_FILE_TRANSCRIBE_ENABLED=false","ASR_MODEL_ID=/models/Qwen3-ASR-1.7B","ASR_MODEL_MANIFEST_PATH=/models/Qwen3-ASR-1.7B.manifest.json"],"Cmd":["python","-m","uvicorn","app.asr_api:app","--workers","1"]},"State":{"Running":true,"StartedAt":"2099-01-01T00:00:00Z"},"Mounts":[{"Destination":"/models","Source":"$FAKE_REPO/models","RW":false}]}]
 JSON
   exit 0
 fi
@@ -175,7 +175,7 @@ if [[ "${1:-}" == tag ]]; then
 fi
 if [[ "${1:-}" == compose && "$*" == *' config --format json'* ]]; then
   cat <<JSON
-{"services":{"qwen-asr-api":{"environment":{"API_KEY":"stored-outside-command-line-1234567890","ASR_BACKEND":"qwen_vllm","ASR_STREAM_MODE":"stateful","ASR_REQUIRE_MODEL_MANIFEST":"true","ASR_EAGER_LOAD":"true","ASR_FILE_TRANSCRIBE_ENABLED":"false","ASR_MODEL_ID":"/models/Qwen3-ASR-1.7B-hf","ASR_MODEL_MANIFEST_PATH":"/models/Qwen3-ASR-1.7B-hf.manifest.json"},"command":["python","-m","uvicorn","app.asr_api:app","--workers","1"]}}}
+{"services":{"qwen-asr-api":{"environment":{"API_KEY":"stored-outside-command-line-1234567890","ASR_BACKEND":"qwen_vllm","ASR_STREAM_MODE":"stateful","ASR_REQUIRE_MODEL_MANIFEST":"true","ASR_EAGER_LOAD":"true","ASR_FILE_TRANSCRIBE_ENABLED":"false","ASR_MODEL_ID":"/models/Qwen3-ASR-1.7B","ASR_MODEL_MANIFEST_PATH":"/models/Qwen3-ASR-1.7B.manifest.json"},"command":["python","-m","uvicorn","app.asr_api:app","--workers","1"]}}}
 JSON
   exit 0
 fi
@@ -250,7 +250,7 @@ exit "${FAKE_OLD_SMOKE_STATUS:-0}"
         "ASR_RELEASE_ENV_FILE": str(repo / ".env"),
         "ASR_RELEASE_MODEL_DIR": str(model),
         "ASR_RELEASE_MANIFEST": str(
-            repo / "models" / "Qwen3-ASR-1.7B-hf.manifest.json"
+            repo / "models" / "Qwen3-ASR-1.7B.manifest.json"
         ),
         "ASR_DEPLOY_EVIDENCE_DIR": str(secure / "evidence"),
         "ASR_DEPLOY_BACKUP_DIR": str(secure / "backup"),

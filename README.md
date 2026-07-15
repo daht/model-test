@@ -40,7 +40,7 @@ The recommended target is NVIDIA A10 24GB. The live ASR service uses one process
 
 The production path is `ASR_BACKEND=qwen_vllm` with `ASR_STREAM_MODE=stateful`. All model loading and calls run on one owner thread behind a bounded coordinator, so synchronous GPU work does not block the FastAPI event loop. `/health` is liveness only; `/ready` returns 200 only after the pinned Silero VAD asset loads and Qwen completes a real non-silent streaming decode warmup.
 
-Live streaming defaults to `ASR_FILE_TRANSCRIBE_ENABLED=false` because an in-progress file transcription cannot be preempted. Run file transcription on a separate batch ASR instance. Stateful punctuation and repeated text are always replaceable; only a VAD endpoint, explicit `segment`, the 30-second utterance boundary, or `end` can freeze text.
+Live streaming defaults to `ASR_FILE_TRANSCRIBE_ENABLED=false` because an in-progress file transcription cannot be preempted. Run file transcription on a separate batch ASR instance. Stateful punctuation and repeated text are always replaceable; only a VAD endpoint, explicit `segment`, the exact maximum-utterance boundary, or `finish` can freeze text.
 
 Protocol version 2 guarantees monotonically increasing `sequence` values. Append `sentence_final` events permanently and replace the displayed tail with every `partial` or `final`. A commit is followed by `partial: ""` when no unconfirmed tail remains.
 
@@ -398,12 +398,12 @@ WebSocket streaming protocol:
 WS ws://localhost:8002/v1/transcribe/stream
 ```
 
-Client sends a JSON start message:
+The WebSocket upgrade must include `X-API-Key`. After the authenticated upgrade,
+the client sends a JSON start message:
 
 ```json
 {
   "type": "start",
-  "api_key": "your-production-api-key",
   "language": "zh",
   "sample_rate": 16000,
   "format": "pcm_s16le"
@@ -420,7 +420,7 @@ Then the client sends binary PCM chunks. The server returns:
 {"type":"final","text":"...","sequence":5}
 ```
 
-`partial` is the current segment snapshot and is replaceable immediately, including revisions that add or remove model-generated punctuation. Silero VAD uses onset/offset hysteresis, a 250ms minimum speech duration, 800ms trailing silence, 160ms hangover, and a 200ms rolling pre-roll. Silence/noise and short bursts never reach Qwen. `ASR_COMMIT_ON_PUNCTUATION` and `ASR_STABLE_COMMIT_*` remain accepted for compatibility but are reported and applied as false in stateful mode. On `end`, `final` contains only the remaining unconfirmed segment, so clients should render:
+`partial` is the current segment snapshot and is replaceable immediately, including revisions that add or remove model-generated punctuation. Gateway-owned Silero VAD uses onset/offset hysteresis, a 250ms minimum speech duration, 800ms trailing silence, 160ms hangover, and a 200ms rolling pre-roll. Silence/noise and short bursts are explicitly discarded by the Gateway. On `finish`, `final` contains only the remaining unconfirmed segment, so clients should render:
 
 ```text
 display_text = all sentence_final text in order + latest partial or final tail
@@ -429,7 +429,7 @@ display_text = all sentence_final text in order + latest partial or final tail
 End the stream with:
 
 ```json
-{"type":"end"}
+{"type":"finish"}
 ```
 
 Finalize pending audio while keeping the WebSocket session open:
@@ -460,7 +460,7 @@ The client converts the input audio to `16kHz mono pcm_s16le` with `ffmpeg`, sen
 Check the server-selected ASR streaming mode before testing:
 
 ```bash
-curl http://localhost:8002/v1/transcribe/stream-info
+curl -H "X-API-Key: ${API_KEY}" http://localhost:8002/v1/transcribe/stream-info
 ```
 
 Stateful qwen vLLM streaming uses these production settings:

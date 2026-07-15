@@ -28,10 +28,10 @@ def _baseline_files(
 ):
     repo = tmp_path / "repo"
     model_root = repo / "models"
-    model = model_root / "Qwen3-ASR-1.7B-hf"
+    model = model_root / "Qwen3-ASR-1.7B"
     model.mkdir(parents=True)
     (model / "config.json").write_text("{}")
-    manifest = model_root / "Qwen3-ASR-1.7B-hf.manifest.json"
+    manifest = model_root / "Qwen3-ASR-1.7B.manifest.json"
     manifest.write_text('{"approved":true}\n')
     env_file = repo / ".env"
     env_file.write_text(f"API_KEY={API_KEY}\n")
@@ -42,8 +42,8 @@ def _baseline_files(
         "ASR_REQUIRE_MODEL_MANIFEST": "true",
         "ASR_EAGER_LOAD": "true",
         "ASR_FILE_TRANSCRIBE_ENABLED": "false",
-        "ASR_MODEL_ID": "/models/Qwen3-ASR-1.7B-hf",
-        "ASR_MODEL_MANIFEST_PATH": "/models/Qwen3-ASR-1.7B-hf.manifest.json",
+        "ASR_MODEL_ID": "/models/Qwen3-ASR-1.7B",
+        "ASR_MODEL_MANIFEST_PATH": "/models/Qwen3-ASR-1.7B.manifest.json",
     }
     compose = tmp_path / "compose.json"
     compose.write_text(

@@ -135,8 +135,9 @@ def default_stream_info_url(ws_url: str) -> str:
     return base.rsplit("/v1/transcribe/stream", 1)[0] + "/v1/transcribe/stream-info"
 
 
-def fetch_stream_info(url: str) -> dict[str, object]:
-    with urllib.request.urlopen(url, timeout=10) as response:
+def fetch_stream_info(url: str, api_key: str) -> dict[str, object]:
+    request = urllib.request.Request(url, headers={"X-API-Key": api_key})
+    with urllib.request.urlopen(request, timeout=10) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
@@ -299,7 +300,7 @@ async def send_audio(
     if return_code:
         raise StreamClientError(f"ffmpeg exited with status {return_code}")
     try:
-        await websocket.send(json.dumps({"type": "end"}))
+        await websocket.send(json.dumps({"type": "finish"}))
     except websockets.ConnectionClosed as exc:
         raise StreamClientError("server closed before end could be sent") from exc
 
@@ -375,17 +376,20 @@ async def stream_audio(args: argparse.Namespace) -> None:
     if args.show_stream_info:
         stream_info_url = args.stream_info_url or default_stream_info_url(args.url)
         print("ASR stream info:")
-        print(json.dumps(fetch_stream_info(stream_info_url), ensure_ascii=False, indent=2))
+        print(json.dumps(fetch_stream_info(stream_info_url, args.api_key), ensure_ascii=False, indent=2))
 
     bytes_per_second = args.sample_rate * 2
     chunk_size = max(1, bytes_per_second * args.chunk_ms // 1000)
 
-    async with websockets.connect(args.url, max_size=None) as websocket:
+    async with websockets.connect(
+        args.url,
+        max_size=None,
+        additional_headers={"X-API-Key": args.api_key},
+    ) as websocket:
         await websocket.send(
             json.dumps(
                 {
                     "type": "start",
-                    "api_key": args.api_key,
                     "language": args.language,
                     "sample_rate": args.sample_rate,
                     "format": "pcm_s16le",

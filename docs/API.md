@@ -250,7 +250,7 @@ external provenance gate.
 ASR_BACKEND=qwen_vllm
 ASR_STREAM_MODE=stateful
 ASR_REQUIRE_MODEL_MANIFEST=true
-ASR_MODEL_MANIFEST_PATH=/models/Qwen3-ASR-1.7B-hf.manifest.json
+ASR_MODEL_MANIFEST_PATH=/models/Qwen3-ASR-1.7B.manifest.json
 ASR_STREAM_CHUNK_SECONDS=1.0
 ASR_MAX_UTTERANCE_SECONDS=30.0
 ASR_STATE_WATCHDOG_SECONDS=120.0
@@ -268,12 +268,12 @@ SERVICE=qwen-asr-api BASE_URL=http://127.0.0.1:8002 scripts/update_service.sh bu
 
 Set `ASR_BACKEND=qwen` and `ASR_STREAM_MODE=chunked` to use the original chunked fallback.
 
-First client message must be JSON:
+Authenticate the WebSocket upgrade with `X-API-Key`. The first message after
+the authenticated upgrade must be JSON:
 
 ```json
 {
   "type": "start",
-  "api_key": "<your-api-key>",
   "language": "zh",
   "sample_rate": 16000,
   "format": "pcm_s16le"
@@ -319,7 +319,7 @@ End the stream:
 
 ```json
 {
-  "type": "end"
+  "type": "finish"
 }
 ```
 
@@ -528,10 +528,13 @@ async def main():
     audio_file = "/path/to/audio.wav"
     url = "wss://asr-api.example.com/v1/transcribe/stream"
 
-    async with websockets.connect(url, max_size=None) as websocket:
+    async with websockets.connect(
+        url,
+        max_size=None,
+        additional_headers={"X-API-Key": api_key},
+    ) as websocket:
         await websocket.send(json.dumps({
             "type": "start",
-            "api_key": api_key,
             "language": "zh",
             "sample_rate": 16000,
             "format": "pcm_s16le",
@@ -554,7 +557,7 @@ async def main():
         while chunk := process.stdout.read(6400):
             await websocket.send(chunk)
 
-        await websocket.send(json.dumps({"type": "end"}))
+        await websocket.send(json.dumps({"type": "finish"}))
 
         async for message in websocket:
             print(message)

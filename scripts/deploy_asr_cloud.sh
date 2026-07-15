@@ -39,8 +39,8 @@ Options:
 
 Release environment (defaults shown):
   ASR_RELEASE_ENV_FILE       <repository>/.env
-  ASR_RELEASE_MODEL_DIR      <repository>/models/Qwen3-ASR-1.7B-hf
-  ASR_RELEASE_MANIFEST       <repository>/models/Qwen3-ASR-1.7B-hf.manifest.json
+  ASR_RELEASE_MODEL_DIR      <repository>/models/Qwen3-ASR-1.7B
+  ASR_RELEASE_MANIFEST       <repository>/models/Qwen3-ASR-1.7B.manifest.json
 
 Live environment:
   ASR_LIVE_BASE_URL                    Default: http://127.0.0.1:8002
@@ -120,8 +120,8 @@ cd "${ROOT_DIR}"
 umask 077
 
 export ASR_RELEASE_ENV_FILE="${ASR_RELEASE_ENV_FILE:-${ROOT_DIR}/.env}"
-export ASR_RELEASE_MODEL_DIR="${ASR_RELEASE_MODEL_DIR:-${ROOT_DIR}/models/Qwen3-ASR-1.7B-hf}"
-export ASR_RELEASE_MANIFEST="${ASR_RELEASE_MANIFEST:-${ROOT_DIR}/models/Qwen3-ASR-1.7B-hf.manifest.json}"
+export ASR_RELEASE_MODEL_DIR="${ASR_RELEASE_MODEL_DIR:-${ROOT_DIR}/models/Qwen3-ASR-1.7B}"
+export ASR_RELEASE_MANIFEST="${ASR_RELEASE_MANIFEST:-${ROOT_DIR}/models/Qwen3-ASR-1.7B.manifest.json}"
 export ASR_LIVE_BASE_URL="${ASR_LIVE_BASE_URL:-http://127.0.0.1:8002}"
 export ASR_LIVE_WS_URL="${ASR_LIVE_WS_URL:-ws://127.0.0.1:8002/v1/transcribe/stream}"
 export ASR_LIVE_GPU_INDEX="${ASR_LIVE_GPU_INDEX:-0}"

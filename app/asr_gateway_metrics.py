@@ -54,6 +54,7 @@ class GatewayMetrics:
         self._gauges = {"active_sessions": 0, "ready_depth": 0, "queued_audio_seconds": 0.0}
         self.cancellations = 0
         self.conflicts = 0
+        self.failures = 0
 
     def complete(self, timeline: JobTimeline, *, batch_size: int, batch_capacity: int) -> None:
         timeline.require_complete()
@@ -70,7 +71,7 @@ class GatewayMetrics:
 
     def snapshot(self) -> dict[str, Any]:
         if not self._completed:
-            return {**self._gauges, "completed_jobs": 0, "cancellations": self.cancellations, "conflicts": self.conflicts}
+            return {**self._gauges, "completed_jobs": 0, "cancellations": self.cancellations, "conflicts": self.conflicts, "failures": self.failures}
         durations = [timeline.durations() for timeline, _, _ in self._completed]
         latency = {
             key: sum(item[key] for item in durations) / len(durations)
@@ -88,6 +89,7 @@ class GatewayMetrics:
             "latency": latency,
             "cancellations": self.cancellations,
             "conflicts": self.conflicts,
+            "failures": self.failures,
         }
 
 

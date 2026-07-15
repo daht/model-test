@@ -4,7 +4,7 @@ from dataclasses import replace
 import pytest
 
 from app.asr_gateway_backends import DispatchMode
-from app.asr_gateway_scheduler import BatchKey, GatewayScheduler, InferenceJob, InferenceResult
+from app.asr_gateway_scheduler import BatchKey, GatewayScheduler, InferenceJob, InferenceResult, StaleResultError
 from tests.test_asr_gateway_backends import capabilities
 
 
@@ -108,7 +108,7 @@ def test_cleanup_completes_before_success_publication_and_stale_is_discarded():
         await scheduler.run_once("worker-1", force=True)
         return cleaned, published, scheduler.snapshot()
     cleaned, published, snapshot = asyncio.run(scenario())
-    assert cleaned == ["ok-1", "ok-2"]
+    assert cleaned == ["ok-1"]
     assert published == ["ok-1"]
     assert snapshot["queued_samples"] == 0
 
@@ -128,6 +128,74 @@ def test_cancellation_before_acceptance_never_submits_and_cleanup_failure_never_
         return adapter.calls, cleaned, published, scheduler.snapshot()
     calls, cleaned, published, snapshot = asyncio.run(scenario())
     assert calls == [[job("bad")]]
-    assert cleaned == ["cancelled-1", "bad-1"]
-    assert published == []
+    assert cleaned == ["bad-1"]
+    assert published == ["bad-1"]
     assert snapshot["queued_samples"] == 0
+
+
+def test_worker_and_cleanup_failure_clear_readiness_but_stale_result_does_not():
+    async def scenario():
+        adapter = RecordingAdapter(capabilities()); adapter.release.set()
+        failures = []; published = []
+        async def failed(worker, reason): failures.append((worker, reason))
+        async def cleanup(item):
+            if item.session_id == "cleanup": raise RuntimeError("cleanup")
+            if item.session_id == "stale": raise StaleResultError("stale")
+        async def publish(result): published.append(result.job_id)
+        scheduler = GatewayScheduler({"worker-1":adapter}, clock=FakeClock(), max_wait_seconds=0, max_ready_jobs=10, max_queued_samples=1000, cleanup=cleanup, publish=publish, worker_failed=failed)
+        scheduler.enqueue(job("cleanup")); await scheduler.run_once("worker-1", force=True)
+        scheduler.enqueue(job("stale")); await scheduler.run_once("worker-1", force=True)
+        async def broken(jobs): raise RuntimeError("worker lost")
+        adapter.submit = broken
+        scheduler.enqueue(job("worker")); await scheduler.run_once("worker-1", force=True)
+        return failures, published
+    failures, published = asyncio.run(scenario())
+    assert [reason for _, reason in failures] == ["cleanup_failed", "submit_failed"]
+    assert published == ["cleanup-1", "worker-1"]
+
+
+def test_cancellation_after_worker_acceptance_waits_for_safe_completion():
+    async def scenario():
+        adapter = RecordingAdapter(capabilities())
+        scheduler = GatewayScheduler({"worker-1":adapter}, clock=FakeClock(), max_wait_seconds=0, max_ready_jobs=10, max_queued_samples=1000)
+        scheduler.enqueue(job("accepted"))
+        dispatch = asyncio.create_task(scheduler.run_once("worker-1", force=True))
+        await adapter.entered.wait()
+        scheduler.cancel_session("accepted", generation=1)
+        barrier = asyncio.create_task(scheduler.wait_session_safe("accepted", generation=1))
+        done, pending = await asyncio.wait({barrier}, timeout=0)
+        assert not done and barrier in pending
+        adapter.release.set(); await dispatch; await barrier
+        return scheduler.snapshot()
+    assert asyncio.run(scenario())["queued_samples"] == 0
+
+
+def test_queue_deadline_expires_without_worker_acceptance():
+    async def scenario():
+        clock = FakeClock(); adapter = RecordingAdapter(capabilities()); adapter.release.set()
+        rejected = []; published = []
+        async def reject(item): rejected.append(item.job_id)
+        async def publish(result): published.append(result)
+        scheduler = GatewayScheduler({"worker-1":adapter}, clock=clock, max_wait_seconds=0, max_ready_jobs=10, max_queued_samples=1000, reject=reject, publish=publish)
+        expired = replace(job("late"), queue_deadline=.5)
+        scheduler.enqueue(expired); clock.advance(.6)
+        await scheduler.run_once("worker-1", force=True)
+        return adapter.calls, rejected, published
+    calls, rejected, published = asyncio.run(scenario())
+    assert calls == [] and rejected == ["late-1"]
+    assert published[0].error == "queue_timeout"
+
+
+def test_inference_timeout_cancels_accepted_submit_and_marks_worker_failed():
+    async def scenario():
+        adapter = RecordingAdapter(capabilities())
+        failures = []
+        async def failed(worker, reason): failures.append(reason)
+        scheduler = GatewayScheduler({"worker-1":adapter}, clock=FakeClock(), max_wait_seconds=0, max_ready_jobs=10, max_queued_samples=1000, inference_timeout_seconds=.001, worker_failed=failed)
+        scheduler.enqueue(job("slow"))
+        results = await scheduler.run_once("worker-1", force=True)
+        await scheduler.wait_session_safe("slow", generation=1)
+        return failures, results
+    failures, results = asyncio.run(scenario())
+    assert failures == ["submit_failed"]
+    assert results[0].error == "TimeoutError: batch failed"

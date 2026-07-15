@@ -43,15 +43,15 @@ def test_remote_deploy_targets_asr_and_runs_websocket_smoke():
 def test_asr_smoke_always_exercises_websocket_lifecycle():
     content = script("smoke_asr.sh")
 
-    assert 'WebSocket smoke: start -> ready -> audio -> end -> final -> close' in content
+    assert 'WebSocket smoke: start -> ready -> audio -> finish -> final -> close' in content
     assert '"type": "start"' in content
-    assert '"type": "end"' in content
+    assert '"type": "finish"' in content
     assert "math.sin" in content
     assert "send_frame(connection, 2" in content
     assert 'expected ready' in content
     assert 'expected final' in content
     websocket_position = content.index(
-        "WebSocket smoke: start -> ready -> audio -> end -> final -> close"
+        "WebSocket smoke: start -> ready -> audio -> finish -> final -> close"
     )
     audio_guard_position = content.index('if [[ -z "${AUDIO_FILE}" ]]')
     assert websocket_position < audio_guard_position
@@ -74,7 +74,7 @@ def test_production_examples_fail_closed_on_secrets_and_model_provenance():
         assert "API_KEY=\n" in example
         assert "ASR_REQUIRE_MODEL_MANIFEST=true" in example
         assert (
-            "ASR_MODEL_MANIFEST_PATH=/models/Qwen3-ASR-1.7B-hf.manifest.json"
+            "ASR_MODEL_MANIFEST_PATH=/models/Qwen3-ASR-1.7B.manifest.json"
             in example
         )
     assert "APPROVED_QWEN_REVISION" in runbook
@@ -283,3 +283,16 @@ def test_semantic_gateway_replaces_multipod_proxy_contract():
     assert "one model owner" in cloud
     assert "A10 capacity remains unverified" in cloud
     assert "environment" in readme.lower() and "credential" in readme.lower()
+
+
+def test_shipped_clients_use_upgrade_auth_authenticated_info_and_finish_command():
+    client = script("stream_asr_client.py")
+    smoke = script("smoke_asr.sh")
+    assert 'additional_headers={"X-API-Key": args.api_key}' in client
+    assert 'fetch_stream_info(stream_info_url, args.api_key)' in client
+    assert 'json.dumps({"type": "finish"})' in client
+    assert '"api_key": args.api_key' not in client
+    assert 'curl -fsS -H "X-API-Key: ${API_KEY}"' in smoke
+    assert 'f"X-API-Key: {os.environ[\'API_KEY\']}\\r\\n' in smoke
+    assert 'json.dumps({"type": "finish"})' in smoke
+    assert '"type": "end"' not in smoke

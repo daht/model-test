@@ -55,8 +55,8 @@ delivered manifest below the ignored repository `models/` directory, then set:
 
 ```bash
 export ASR_RELEASE_ENV_FILE="$PWD/.env"
-export ASR_RELEASE_MODEL_DIR="$PWD/models/Qwen3-ASR-1.7B-hf"
-export ASR_RELEASE_MANIFEST="$PWD/models/Qwen3-ASR-1.7B-hf.manifest.json"
+export ASR_RELEASE_MODEL_DIR="$PWD/models/Qwen3-ASR-1.7B"
+export ASR_RELEASE_MANIFEST="$PWD/models/Qwen3-ASR-1.7B.manifest.json"
 scripts/verify_asr_release.sh release
 ```
 

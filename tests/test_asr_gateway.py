@@ -1,10 +1,11 @@
 import asyncio
 from dataclasses import replace
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.asr_gateway import GatewayRuntime, create_app
-from app.asr_gateway_backends import DispatchMode, ResultMode
+from app.asr_gateway_backends import DispatchMode, ResultMode, VadMode
 from app.asr_gateway_scheduler import InferenceResult
 from app.config import Settings
 from tests.test_asr_gateway_backends import capabilities
@@ -13,7 +14,7 @@ from tests.test_asr_gateway_backends import capabilities
 class FakeAdapter:
     def __init__(self, *, dynamic=False, result_mode=ResultMode.CUMULATIVE_SNAPSHOT):
         caps = capabilities(worker_id="fake")
-        caps = replace(caps, result_mode=result_mode)
+        caps = replace(caps, result_mode=result_mode, vad_mode=VadMode.NONE)
         self.capabilities = replace(caps, dispatch_mode=DispatchMode.DYNAMIC_MICROBATCH, max_batch_items=4, session_capacity=4) if dynamic else caps
         self.sessions = set(); self.calls = []; self.started = False
     async def warmup(self): self.started = True
@@ -30,7 +31,7 @@ class FakeAdapter:
 
 def app_with(adapter=None, **setting_overrides):
     adapter = adapter or FakeAdapter()
-    settings = Settings(model_backend="mock", asr_backend="mock", api_key="test-key", asr_gateway_schedule_max_wait_ms=1, **setting_overrides)
+    settings = Settings(model_backend="mock", asr_backend="mock", asr_stream_mode="stateful", api_key="test-key", asr_gateway_schedule_max_wait_ms=1, asr_gateway_default_backend="fake", **setting_overrides)
     runtime = GatewayRuntime(settings, {"fake": adapter})
     return create_app(runtime=runtime), adapter
 
@@ -42,6 +43,7 @@ def test_health_readiness_inventory_and_metrics_are_semantic():
         assert client.get("/ready").status_code == 200
         info = client.get("/v1/transcribe/stream-info", headers={"X-API-Key":"test-key"}).json()
         assert info["protocol_version"] == 2
+        assert client.get("/v1/transcribe/stream-info").status_code == 401
         assert client.get("/v1/asr/backends").status_code == 401
         assert client.get("/v1/asr/backends", headers={"X-API-Key":"test-key"}).json()["ready"] is True
         assert "completed_jobs" in client.get("/v1/asr/metrics", headers={"X-API-Key":"test-key"}).json()
@@ -95,10 +97,23 @@ def test_unauthorized_and_overload_fail_before_admission():
                 pass
 
 
+def test_body_key_and_end_command_are_not_legacy_compatibility_paths():
+    app, _ = app_with()
+    with TestClient(app) as client:
+        with pytest.raises(Exception):
+            with client.websocket_connect("/v1/transcribe/stream") as ws:
+                ws.send_json({"type":"start", "api_key":"test-key"})
+        with client.websocket_connect("/v1/transcribe/stream", headers={"X-API-Key":"test-key"}) as ws:
+            ws.send_json({"type":"start"}); assert ws.receive_json()["type"] == "ready"
+            ws.send_json({"type":"end"})
+            event = ws.receive_json()
+            assert event["type"] == "error" and event["code"] == "invalid_command"
+
+
 def test_runtime_barrier_forms_cross_session_dynamic_batch():
     async def scenario():
         adapter = FakeAdapter(dynamic=True)
-        settings = Settings(model_backend="mock", asr_backend="mock", api_key="test-key", asr_gateway_schedule_max_wait_ms=20, asr_gateway_max_active_sessions=4)
+        settings = Settings(model_backend="mock", asr_backend="mock", asr_stream_mode="stateful", api_key="test-key", asr_gateway_schedule_max_wait_ms=20, asr_gateway_max_active_sessions=4, asr_gateway_default_backend="fake")
         runtime = GatewayRuntime(settings, {"fake": adapter})
         await runtime.start()
         sessions = [await runtime.open_session(f"s{i}", language="zh", options={}) for i in range(3)]
@@ -115,7 +130,7 @@ def test_runtime_barrier_forms_cross_session_dynamic_batch():
 def test_runtime_uses_segment_local_protocol_for_replaceable_adapter_results():
     async def scenario():
         adapter = FakeAdapter(result_mode=ResultMode.REPLACEABLE_SEGMENT)
-        settings = Settings(model_backend="mock", asr_backend="mock", api_key="test-key", asr_gateway_schedule_max_wait_ms=0)
+        settings = Settings(model_backend="mock", asr_backend="mock", asr_stream_mode="stateful", api_key="test-key", asr_gateway_schedule_max_wait_ms=0, asr_gateway_default_backend="fake")
         runtime = GatewayRuntime(settings, {"fake": adapter}); await runtime.start()
         session = await runtime.open_session("s", language="zh", options={})
         await runtime.ingest(session, b"\x00\x00" * 4, force=True)
@@ -124,3 +139,173 @@ def test_runtime_uses_segment_local_protocol_for_replaceable_adapter_results():
         await runtime.close()
         return event
     assert asyncio.run(scenario())["type"] == "partial"
+
+
+def test_runtime_rejects_unsupported_language_before_backend_session_open():
+    async def scenario():
+        adapter = FakeAdapter()
+        adapter.capabilities = replace(adapter.capabilities, languages=("zh",), backend_id="fake")
+        settings = Settings(model_backend="mock", asr_backend="mock", asr_stream_mode="stateful", api_key="test-key", asr_gateway_default_backend="fake")
+        runtime = GatewayRuntime(settings, {"fake": adapter}); await runtime.start()
+        try:
+            with pytest.raises(RuntimeError, match="unsupported backend route"):
+                await runtime.open_session("ja", language="ja", options={})
+        finally:
+            await runtime.close()
+        return adapter.sessions
+    assert asyncio.run(scenario()) == set()
+
+
+def test_runtime_rejects_duplicate_gpu_before_second_adapter_warmup():
+    async def scenario():
+        first = FakeAdapter(); second = FakeAdapter()
+        first.capabilities = replace(first.capabilities, worker_id="first", backend_id="first", gpu_id="gpu-0")
+        second.capabilities = replace(second.capabilities, worker_id="second", backend_id="second", gpu_id="gpu-0")
+        first.warm_calls = second.warm_calls = 0
+        async def warm_first(): first.warm_calls += 1
+        async def warm_second(): second.warm_calls += 1
+        first.warmup = warm_first; second.warmup = warm_second
+        settings = Settings(model_backend="mock", asr_backend="mock", api_key="test-key")
+        runtime = GatewayRuntime(settings, {"first": first, "second": second})
+        with pytest.raises(ValueError, match="gpu_id"):
+            await runtime.start()
+        return first.warm_calls, second.warm_calls
+    assert asyncio.run(scenario()) == (0, 0)
+
+
+class FakeVad:
+    def __init__(self): self.pending = bytearray(); self.finalized = 0
+    def add_audio(self, pcm):
+        self.pending.extend(pcm)
+        if len(self.pending) < 8:
+            return type("D", (), {"audio_to_model":b"", "endpoint":False, "discarded_samples":0})()
+        audio = bytes(self.pending[:4]); del self.pending[:4]
+        return type("D", (), {"audio_to_model":audio, "endpoint":True, "discarded_samples":0})()
+    def endpoint_finalized(self):
+        self.finalized += 1
+        audio = bytes(self.pending); self.pending.clear()
+        return type("D", (), {"audio_to_model":audio, "endpoint":False, "discarded_samples":0})()
+    def finish_input(self):
+        audio = bytes(self.pending); self.pending.clear()
+        return type("D", (), {"audio_to_model":audio, "endpoint":False, "discarded_samples":0})()
+    def reset(self): self.pending.clear()
+
+
+def test_gateway_owned_vad_conserves_input_and_commits_endpoint():
+    async def scenario():
+        adapter = FakeAdapter(); adapter.capabilities = replace(adapter.capabilities, vad_mode=VadMode.GATEWAY)
+        vad = FakeVad()
+        settings = Settings(model_backend="mock", asr_backend="mock", asr_stream_mode="stateful", api_key="test-key", asr_gateway_default_backend="fake", asr_gateway_schedule_max_wait_ms=0)
+        runtime = GatewayRuntime(settings, {"fake":adapter}, vad_factory=lambda: vad); await runtime.start()
+        session = await runtime.open_session("s", language="zh", options={})
+        await runtime.ingest(session, b"\x01\x00" * 4)
+        await runtime.scheduler.run_once("fake", force=True)
+        await runtime.wait_idle("s")
+        accounting = session.sample_accounting
+        await runtime.abort("s"); await runtime.close()
+        return accounting, vad.finalized, [call[0].sample_count for call in adapter.calls]
+    accounting, finalized, submitted = asyncio.run(scenario())
+    assert accounting["accepted"] == 4
+    assert sum(accounting[key] for key in ("buffered","reserved","acknowledged","discarded","pending_vad")) == 4
+    assert finalized == 1
+    assert submitted == [2, 2]
+
+
+def test_exact_maximum_rolls_backend_state_before_remainder_submit():
+    async def scenario():
+        adapter = FakeAdapter(); adapter.capabilities = replace(adapter.capabilities, preferred_chunk_samples=6, max_input_samples=6, max_batch_samples=6)
+        order = []
+        original_submit = adapter.submit
+        async def submit(jobs): order.append(("submit", jobs[0].sample_count)); return await original_submit(jobs)
+        async def segment(session_id): order.append(("rollover", session_id)); return type("R", (), {"text":"", "tail_text":""})()
+        adapter.submit = submit; adapter.finish_segment = segment
+        settings = Settings(model_backend="mock", asr_backend="mock", asr_stream_mode="stateful", api_key="test-key", asr_gateway_default_backend="fake", asr_gateway_schedule_max_wait_ms=0)
+        runtime = GatewayRuntime(settings, {"fake":adapter}); await runtime.start()
+        session = await runtime.open_session("s", language="zh", options={})
+        await runtime.ingest(session, b"\x00\x00" * 12, force=True)
+        await runtime.scheduler.run_once("fake", force=True)
+        await runtime.scheduler.run_once("fake", force=True)
+        await runtime.abort("s"); await runtime.close()
+        return order
+    assert asyncio.run(scenario()) == [("submit",6), ("rollover","s"), ("submit",6), ("rollover","s")]
+
+
+def test_runtime_submit_failure_clears_worker_readiness_and_fails_session():
+    async def scenario():
+        adapter = FakeAdapter()
+        async def broken(jobs): raise RuntimeError("worker lost")
+        adapter.submit = broken
+        settings = Settings(model_backend="mock", asr_backend="mock", asr_stream_mode="stateful", api_key="test-key", asr_gateway_default_backend="fake", asr_gateway_schedule_max_wait_ms=0)
+        runtime = GatewayRuntime(settings, {"fake":adapter}); await runtime.start()
+        session = await runtime.open_session("s", language="zh", options={})
+        await runtime.ingest(session, b"\x00\x00" * 4, force=True)
+        await runtime.scheduler.run_once("fake", force=True)
+        event = await runtime.event_queue("s").get()
+        snapshot = await runtime.registry.snapshot()
+        await runtime.abort("s"); await runtime.close()
+        return event, snapshot
+    event, snapshot = asyncio.run(scenario())
+    assert event["type"] == "error"
+    assert snapshot["ready"] is False
+
+
+def test_runtime_records_all_job_timeline_stages_and_counters():
+    async def scenario():
+        adapter = FakeAdapter()
+        settings = Settings(model_backend="mock", asr_backend="mock", asr_stream_mode="stateful", api_key="test-key", asr_gateway_default_backend="fake", asr_gateway_schedule_max_wait_ms=0)
+        runtime = GatewayRuntime(settings, {"fake":adapter}); await runtime.start()
+        session = await runtime.open_session("s", language="zh", options={})
+        await runtime.ingest(session, b"\x00\x00" * 4, force=True)
+        await runtime.scheduler.run_once("fake", force=True)
+        snapshot = runtime.metrics.snapshot()
+        await runtime.abort("s")
+        cancelled = runtime.metrics.snapshot()
+        await runtime.close()
+        return snapshot, cancelled
+    snapshot, cancelled = asyncio.run(scenario())
+    assert snapshot["completed_jobs"] == 1
+    assert set(snapshot["latency"]) == {"chunk_wait_seconds", "batch_wait_seconds", "worker_wait_seconds", "inference_seconds", "egress_seconds"}
+    assert cancelled["cancellations"] == 1
+
+
+def test_runtime_enforces_audio_session_and_undecoded_deadlines_with_fake_clock():
+    async def scenario():
+        clock = type("Clock", (), {"value":0.0, "__call__":lambda self:self.value})()
+        adapter = FakeAdapter()
+        settings = Settings(
+            model_backend="mock", asr_backend="mock", asr_stream_mode="stateful",
+            api_key="test-key", asr_gateway_default_backend="fake",
+            asr_max_audio_seconds=.001, asr_max_session_seconds=.01,
+            asr_max_undecoded_age_seconds=.005,
+        )
+        runtime = GatewayRuntime(settings, {"fake":adapter}, clock=clock); await runtime.start()
+        session = await runtime.open_session("s", language="zh", options={})
+        with pytest.raises(RuntimeError, match="audio duration"):
+            await runtime.ingest(session, b"\x00\x00" * 17)
+        await runtime.ingest(session, b"\x00\x00" * 8)
+        clock.value = .006
+        with pytest.raises(TimeoutError, match="undecoded"):
+            await runtime.ingest(session, b"\x00\x00" * 1)
+        clock.value = .011
+        with pytest.raises(TimeoutError, match="session deadline"):
+            runtime.check_deadlines("s")
+        await runtime.abort("s"); await runtime.close()
+    asyncio.run(scenario())
+
+
+def test_drain_stops_new_routes_and_waits_for_sticky_session_release():
+    async def scenario():
+        adapter = FakeAdapter()
+        settings = Settings(model_backend="mock", asr_backend="mock", asr_stream_mode="stateful", api_key="test-key", asr_gateway_default_backend="fake", asr_gateway_drain_timeout_seconds=1)
+        runtime = GatewayRuntime(settings, {"fake":adapter}); await runtime.start()
+        await runtime.open_session("s", language="zh", options={})
+        draining = asyncio.create_task(runtime.drain_worker("fake"))
+        await asyncio.wait({draining}, timeout=0)
+        with pytest.raises(RuntimeError, match="unsupported backend route"):
+            await runtime.open_session("new", language="zh", options={})
+        assert draining.done() is False
+        await runtime.abort("s"); await draining
+        snapshot = await runtime.registry.snapshot()
+        await runtime.close()
+        return snapshot
+    assert asyncio.run(scenario())["workers"] == {}

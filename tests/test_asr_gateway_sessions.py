@@ -7,7 +7,7 @@ def test_pcm_cursors_conserve_samples_and_rollback():
     session = GatewaySession("s", "w", "b", sample_rate=16_000, max_buffer_samples=20)
     session.append_pcm(b"\x01\x00" * 10)
     reservation = session.reserve(6)
-    assert session.sample_accounting == {"accepted": 10, "buffered": 4, "reserved": 6, "acknowledged": 0, "discarded": 0}
+    assert session.sample_accounting == {"accepted": 10, "buffered": 4, "reserved": 6, "acknowledged": 0, "discarded": 0, "pending_vad": 0}
     session.rollback(reservation.job_sequence)
     assert session.sample_accounting["buffered"] == 10
     reservation = session.reserve(6)
@@ -56,3 +56,14 @@ def test_session_manager_closes_and_invalidates_generation():
     assert manager.close("s") is session
     assert session.generation == generation + 1
     assert manager.close("s") is None
+
+
+def test_abort_explicitly_discards_all_unacknowledged_pcm_once():
+    session = GatewaySession("s", "w", "b", sample_rate=16_000, max_buffer_samples=20)
+    session.append_pcm(b"\x00\x00" * 10)
+    session.reserve(4)
+    session.abort()
+    accounting = session.sample_accounting
+    assert accounting == {"accepted": 10, "buffered": 0, "reserved": 0, "acknowledged": 0, "discarded": 10, "pending_vad": 0}
+    session.abort()
+    assert session.sample_accounting == accounting

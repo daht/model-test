@@ -9,6 +9,10 @@ from typing import Any, Awaitable, Callable, Mapping, Sequence
 from app.asr_gateway_backends import DispatchMode, WorkerAdapter
 
 
+class StaleResultError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class BatchKey:
     worker_id: str
@@ -37,6 +41,7 @@ class InferenceJob:
     batch_key: BatchKey
     final: bool = False
     enqueued_at: float = 0.0
+    queue_deadline: float = float("inf")
 
     @property
     def sample_count(self) -> int:
@@ -74,6 +79,10 @@ async def _noop(_: Any) -> None:
     return None
 
 
+async def _noop_failure(_: str, __: str) -> None:
+    return None
+
+
 class GatewayScheduler:
     """Per-worker bounded EDF queues with deterministic single-iteration API."""
 
@@ -87,6 +96,10 @@ class GatewayScheduler:
         max_queued_samples: int,
         cleanup: AsyncHook = _noop,
         publish: AsyncHook = _noop,
+        worker_failed: Callable[[str, str], Awaitable[None]] = _noop_failure,
+        stage_hook: Callable[[str, Sequence[InferenceJob], int], None] | None = None,
+        reject: AsyncHook = _noop,
+        inference_timeout_seconds: float | None = None,
     ) -> None:
         if max_wait_seconds < 0 or max_ready_jobs <= 0 or max_queued_samples <= 0:
             raise ValueError("scheduler bounds must be non-negative and finite")
@@ -97,9 +110,14 @@ class GatewayScheduler:
         self.max_queued_samples = max_queued_samples
         self.cleanup = cleanup
         self.publish = publish
+        self.worker_failed = worker_failed
+        self.stage_hook = stage_hook
+        self.reject = reject
+        self.inference_timeout_seconds = inference_timeout_seconds
         self._queues: dict[str, list[InferenceJob]] = defaultdict(list)
         self._queued_samples = 0
         self._cancelled_generations: set[tuple[str, int]] = set()
+        self._accepted: dict[tuple[str, int], asyncio.Event] = {}
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._closed = False
@@ -125,8 +143,21 @@ class GatewayScheduler:
     def cancel_session(self, session_id: str, *, generation: int) -> None:
         self._cancelled_generations.add((session_id, generation))
 
+    async def wait_session_safe(self, session_id: str, *, generation: int) -> None:
+        event = self._accepted.get((session_id, generation))
+        if event is not None:
+            await event.wait()
+
     async def run_once(self, worker_id: str, *, force: bool = False) -> list[InferenceResult]:
         queue = self._queues[worker_id]
+        if not queue:
+            return []
+        expired = [item for item in queue if self.clock() > item.queue_deadline]
+        for item in expired:
+            queue.remove(item)
+            self._queued_samples -= item.sample_count
+            await self.reject(item)
+            await self.publish(InferenceResult.from_job(item, error="queue_timeout"))
         if not queue:
             return []
         cancelled = [
@@ -137,7 +168,7 @@ class GatewayScheduler:
             queue.remove(item)
             self._queued_samples -= item.sample_count
             try:
-                await self.cleanup(item)
+                await self.reject(item)
             except Exception:
                 pass
         if not queue:
@@ -171,12 +202,24 @@ class GatewayScheduler:
             return []
         for item in batch:
             queue.remove(item)
+            self._accepted.setdefault((item.session_id, item.generation), asyncio.Event())
+        self._stage("scheduler_dispatched", batch, limit)
+        self._stage("worker_accepted", batch, limit)
         try:
-            raw_results = await adapter.submit(batch)
+            self._stage("inference_started", batch, limit)
+            submission = adapter.submit(batch)
+            raw_results = (
+                await asyncio.wait_for(submission, timeout=self.inference_timeout_seconds)
+                if self.inference_timeout_seconds is not None
+                else await submission
+            )
+            self._stage("inference_completed", batch, limit)
             if len(raw_results) != len(batch):
                 raise RuntimeError("adapter result count does not match submitted batch")
             results = [self._coerce_result(job, result) for job, result in zip(batch, raw_results)]
         except Exception as exc:
+            self._stage("inference_completed", batch, limit)
+            await self.worker_failed(worker_id, "submit_failed")
             results = [InferenceResult.from_job(job, error=f"{type(exc).__name__}: batch failed") for job in batch]
 
         for job, result in zip(batch, results):
@@ -184,15 +227,36 @@ class GatewayScheduler:
             self._queued_samples -= job.sample_count
             try:
                 await self.cleanup(job)
+            except StaleResultError:
+                self._mark_safe(job)
+                continue
             except Exception:
                 # A cleanup failure poisons this result; success is never visible.
+                await self.worker_failed(worker_id, "cleanup_failed")
+                await self.publish(InferenceResult.from_job(job, error="cleanup_failed"))
+                self._mark_safe(job)
                 continue
             if (job.session_id, job.generation) in self._cancelled_generations:
+                self._mark_safe(job)
                 continue
             if result.generation != job.generation or result.job_sequence != job.job_sequence:
+                self._mark_safe(job)
                 continue
-            await self.publish(result)
+            try:
+                await self.publish(result)
+            finally:
+                self._mark_safe(job)
         return results
+
+    def _stage(self, stage: str, jobs: Sequence[InferenceJob], capacity: int) -> None:
+        if self.stage_hook is not None:
+            self.stage_hook(stage, jobs, capacity)
+
+    def _mark_safe(self, job: InferenceJob) -> None:
+        key = (job.session_id, job.generation)
+        event = self._accepted.pop(key, None)
+        if event is not None:
+            event.set()
 
     async def start(self) -> None:
         if self._task is None:

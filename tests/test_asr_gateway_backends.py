@@ -58,7 +58,7 @@ def test_registry_identity_drain_switch_and_idempotent_leases():
     async def scenario():
         registry = BackendRegistry()
         await registry.register(capabilities("old"))
-        await registry.register(capabilities("new"))
+        await registry.register(capabilities("new", gpu_id="gpu-1"))
         await registry.mark_ready("old", True)
         first = await registry.acquire(preferred_worker_id="old")
         await registry.mark_ready("new", True)
@@ -108,3 +108,33 @@ def test_snapshot_excludes_unready_and_draining_workers_from_readiness():
     assert ready["ready"] is True
     assert drained["ready"] is False
     assert drained["workers"]["worker-1"]["lifecycle"] == WorkerLifecycle.DRAINING.value
+
+
+def test_registry_filters_complete_route_capabilities():
+    async def scenario():
+        registry = BackendRegistry()
+        await registry.register(capabilities("zh", backend_id="local", languages=("zh",), tasks=("transcribe",)))
+        await registry.register(capabilities("ja", backend_id="other", gpu_id="gpu-1", languages=("ja",), tasks=("translate",)))
+        await registry.mark_ready("zh", True); await registry.mark_ready("ja", True)
+        lease = await registry.acquire(
+            backend_id="local", language="zh", task="transcribe",
+            streaming_mode=StreamingMode.STATEFUL,
+            result_modes=(ResultMode.CUMULATIVE_SNAPSHOT,),
+            model_id="Qwen/Qwen3-ASR-1.7B", model_revision="rev-1",
+        )
+        await lease.release()
+        with pytest.raises(RuntimeError, match="unsupported backend route"):
+            await registry.acquire(backend_id="local", language="ja", task="transcribe")
+        with pytest.raises(RuntimeError, match="unsupported backend route"):
+            await registry.acquire(backend_id="other", language="ja", task="transcribe")
+        return lease.worker_id
+    assert asyncio.run(scenario()) == "zh"
+
+
+def test_registry_rejects_two_model_owners_on_one_gpu():
+    async def scenario():
+        registry = BackendRegistry()
+        await registry.register(capabilities("one", gpu_id="gpu-0"))
+        with pytest.raises(ValueError, match="gpu_id"):
+            await registry.register(capabilities("two", gpu_id="gpu-0"))
+    asyncio.run(scenario())

@@ -47,6 +47,8 @@ class GatewaySession:
         self._next_job_sequence = 1
         self._reservation: SessionReservation | None = None
         self.finish_requested = False
+        self._accepted_samples = 0
+        self._external_discarded_samples = 0
         self.transcript = StreamingTranscriptState(
             sample_rate=sample_rate,
             stable_commit_enabled=False,
@@ -62,17 +64,36 @@ class GatewaySession:
     @property
     def sample_accounting(self) -> dict[str, int]:
         return {
-            "accepted": self.buffer.accepted_samples,
+            "accepted": self._accepted_samples,
             "buffered": self.buffer.buffered_samples,
             "reserved": self.buffer.reserved_samples,
             "acknowledged": self.buffer.acknowledged_samples,
-            "discarded": self.buffer.discarded_samples,
+            "discarded": self.buffer.discarded_samples + self._external_discarded_samples,
+            "pending_vad": max(
+                0,
+                self._accepted_samples
+                - self.buffer.accepted_samples
+                - self._external_discarded_samples,
+            ),
         }
 
-    def append_pcm(self, pcm: bytes) -> tuple[int, int]:
+    def append_pcm(self, pcm: bytes, *, count_accepted: bool = True) -> tuple[int, int]:
         if self.terminal_state not in {TerminalState.OPEN, TerminalState.FINISHING}:
             raise RuntimeError("session is terminal")
-        return self.buffer.append(pcm)
+        result = self.buffer.append(pcm)
+        if count_accepted:
+            self._accepted_samples += len(pcm) // 2
+        return result
+
+    def accept_vad_input(self, pcm: bytes) -> None:
+        if len(pcm) % 2:
+            raise ValueError("pcm_s16le bytes must be sample-aligned")
+        self._accepted_samples += len(pcm) // 2
+
+    def record_discarded(self, samples: int) -> None:
+        if samples < 0 or samples > self.sample_accounting["pending_vad"]:
+            raise ValueError("discarded VAD samples exceed pending input")
+        self._external_discarded_samples += samples
 
     def ready_samples(self, *, preferred: int, maximum: int | None = None, force: bool = False) -> int:
         if self.in_flight:
@@ -112,16 +133,31 @@ class GatewaySession:
         self._reservation = None
         return True
 
+    def matches_reservation(self, job_sequence: int, start_sample: int, end_sample: int) -> bool:
+        return bool(
+            self._reservation
+            and self._reservation.job_sequence == job_sequence
+            and self._reservation.generation == self.generation
+            and self._reservation.chunk.start_sample == start_sample
+            and self._reservation.chunk.end_sample == end_sample
+        )
+
     def request_finish(self) -> None:
         if not self.finish_requested:
             self.finish_requested = True
             self.terminal_state = TerminalState.FINISHING
 
     def abort(self) -> None:
+        if self.terminal_state in {TerminalState.ABORTED, TerminalState.FAILED}:
+            return
         if self._reservation:
             chunk = self._reservation.chunk
             self.buffer.rollback(chunk.start_sample, chunk.end_sample)
             self._reservation = None
+        if self.buffer.buffered_samples:
+            self.buffer.discard(self.buffer.buffered_samples)
+        pending = self.sample_accounting["pending_vad"]
+        self._external_discarded_samples += pending
         self.generation += 1
         self.terminal_state = TerminalState.ABORTED
 
