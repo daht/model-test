@@ -1,0 +1,169 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any
+
+from app.asr_gateway_chunking import PcmRingBuffer, ReadyChunk
+from app.asr_streaming import StreamingTranscriptState
+
+
+class TerminalState(str, Enum):
+    OPEN = "open"
+    FINISHING = "finishing"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    ABORTED = "aborted"
+
+
+@dataclass(frozen=True)
+class SessionReservation:
+    job_sequence: int
+    generation: int
+    chunk: ReadyChunk
+
+
+class GatewaySession:
+    def __init__(
+        self,
+        session_id: str,
+        selected_worker_id: str,
+        backend_session_id: str,
+        *,
+        sample_rate: int,
+        max_buffer_samples: int,
+        language: str = "auto",
+        options: dict[str, Any] | None = None,
+    ) -> None:
+        self.session_id = session_id
+        self.selected_worker_id = selected_worker_id
+        self.backend_session_id = backend_session_id
+        self.sample_rate = sample_rate
+        self.language = language
+        self.options = dict(options or {})
+        self.generation = 1
+        self.terminal_state = TerminalState.OPEN
+        self.buffer = PcmRingBuffer(max_samples=max_buffer_samples)
+        self._next_job_sequence = 1
+        self._reservation: SessionReservation | None = None
+        self.finish_requested = False
+        self.transcript = StreamingTranscriptState(
+            sample_rate=sample_rate,
+            stable_commit_enabled=False,
+            stable_commit_seconds=1,
+            stable_commit_min_chars=1,
+            stable_commit_min_updates=1,
+        )
+
+    @property
+    def in_flight(self) -> bool:
+        return self._reservation is not None
+
+    @property
+    def sample_accounting(self) -> dict[str, int]:
+        return {
+            "accepted": self.buffer.accepted_samples,
+            "buffered": self.buffer.buffered_samples,
+            "reserved": self.buffer.reserved_samples,
+            "acknowledged": self.buffer.acknowledged_samples,
+            "discarded": self.buffer.discarded_samples,
+        }
+
+    def append_pcm(self, pcm: bytes) -> tuple[int, int]:
+        if self.terminal_state not in {TerminalState.OPEN, TerminalState.FINISHING}:
+            raise RuntimeError("session is terminal")
+        return self.buffer.append(pcm)
+
+    def ready_samples(self, *, preferred: int, maximum: int | None = None, force: bool = False) -> int:
+        if self.in_flight:
+            return 0
+        available = self.buffer.buffered_samples
+        maximum = maximum or available
+        if available >= maximum > 0:
+            return maximum
+        if available >= preferred > 0:
+            return preferred
+        if force or self.finish_requested:
+            return available
+        return 0
+
+    def reserve(self, samples: int, *, final: bool = False) -> SessionReservation:
+        if self.in_flight:
+            raise RuntimeError("session already has an in-flight job")
+        chunk = self.buffer.reserve_range(samples, final=final)
+        reservation = SessionReservation(self._next_job_sequence, self.generation, chunk)
+        self._next_job_sequence += 1
+        self._reservation = reservation
+        return reservation
+
+    def acknowledge(self, job_sequence: int, *, generation: int) -> ReadyChunk:
+        if generation != self.generation:
+            raise RuntimeError("stale generation result")
+        reservation = self._require_reservation(job_sequence)
+        self.buffer.acknowledge(reservation.chunk.start_sample, reservation.chunk.end_sample)
+        self._reservation = None
+        return reservation.chunk
+
+    def rollback(self, job_sequence: int) -> bool:
+        if self._reservation is None or self._reservation.job_sequence != job_sequence:
+            return False
+        chunk = self._reservation.chunk
+        self.buffer.rollback(chunk.start_sample, chunk.end_sample)
+        self._reservation = None
+        return True
+
+    def request_finish(self) -> None:
+        if not self.finish_requested:
+            self.finish_requested = True
+            self.terminal_state = TerminalState.FINISHING
+
+    def abort(self) -> None:
+        if self._reservation:
+            chunk = self._reservation.chunk
+            self.buffer.rollback(chunk.start_sample, chunk.end_sample)
+            self._reservation = None
+        self.generation += 1
+        self.terminal_state = TerminalState.ABORTED
+
+    def fail(self) -> None:
+        self.abort()
+        self.terminal_state = TerminalState.FAILED
+
+    def succeed(self) -> None:
+        if self.buffer.buffered_samples or self.buffer.reserved_samples:
+            raise RuntimeError("cannot succeed with unaccounted PCM")
+        self.terminal_state = TerminalState.SUCCEEDED
+
+    def _require_reservation(self, job_sequence: int) -> SessionReservation:
+        if self._reservation is None or self._reservation.job_sequence != job_sequence:
+            raise RuntimeError("result does not match in-flight reservation")
+        return self._reservation
+
+
+class SessionManager:
+    def __init__(self, *, max_sessions: int) -> None:
+        if max_sessions <= 0:
+            raise ValueError("max_sessions must be positive")
+        self.max_sessions = max_sessions
+        self._sessions: dict[str, GatewaySession] = {}
+
+    def create(self, session_id: str, worker_id: str, backend_session_id: str, **kwargs: Any) -> GatewaySession:
+        if session_id in self._sessions:
+            raise ValueError("duplicate session_id")
+        if len(self._sessions) >= self.max_sessions:
+            raise RuntimeError("session capacity exceeded")
+        session = GatewaySession(session_id, worker_id, backend_session_id, **kwargs)
+        self._sessions[session_id] = session
+        return session
+
+    def get(self, session_id: str) -> GatewaySession:
+        return self._sessions[session_id]
+
+    def close(self, session_id: str) -> GatewaySession | None:
+        session = self._sessions.pop(session_id, None)
+        if session is not None and session.terminal_state not in {TerminalState.ABORTED, TerminalState.FAILED}:
+            session.generation += 1
+        return session
+
+    def snapshot(self) -> dict[str, Any]:
+        return {"active_sessions": len(self._sessions), "session_ids": sorted(self._sessions)}
