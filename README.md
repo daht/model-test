@@ -1,5 +1,37 @@
 # HY-MT1.5-1.8B REST API Deployment Template
 
+## Semantic ASR Gateway
+
+The ASR service starts `app.asr_gateway:app`. This semantic Gateway owns
+authentication, sessions, aligned PCM buffering, chunk cursors, deadline
+scheduling, sticky backend selection, and normalized `ready`, `partial`,
+`sentence_final`, `final`, and `error` events. It is not a transparent proxy.
+The service uses one Uvicorn worker and one local model owner per GPU.
+
+Initial scheduling controls are environment variables:
+
+```text
+ASR_GATEWAY_SCHEDULE_MAX_WAIT_MS=20
+ASR_GATEWAY_MAX_READY_JOBS=64
+ASR_GATEWAY_MAX_QUEUED_AUDIO_SECONDS=8
+ASR_GATEWAY_MAX_SESSION_BUFFER_SECONDS=4
+ASR_GATEWAY_DEFAULT_UPDATE_MS=1500
+ASR_GATEWAY_DRAIN_TIMEOUT_SECONDS=30
+ASR_GATEWAY_DEFAULT_BACKEND=local
+```
+
+Runtime credentials are supplied through environment variables only. Backend
+inventory and metrics require `X-API-Key` authentication. The local Qwen
+adapter advertises serial stateful dispatch; cross-session dynamic batching is
+enabled only for adapters that implement and advertise it. The pinned
+`qwen-asr==0.0.6` / `vllm==0.14.0` stateful path uses
+`Qwen/Qwen3-ASR-1.7B`, not the `-hf` Transformers export.
+
+Model replacement follows drain-and-switch: warm and register the replacement,
+route new sessions to it, drain the old worker for a bounded interval, abort any
+remaining sessions explicitly, then unload it. A10 throughput, accuracy,
+high-concurrency behavior, and production readiness remain external gates.
+
 This repository deploys translation, Qwen3-ASR, and CosyVoice as separate FastAPI services.
 
 The recommended target is NVIDIA A10 24GB. The live ASR service uses one process and one Uvicorn worker per GPU; do not increase `--workers` on a single GPU.
@@ -92,7 +124,7 @@ If your model weights are local, copy them into:
 
 ```text
 models/HY-MT1.5-1.8B
-models/Qwen3-ASR-1.7B-hf
+models/Qwen3-ASR-1.7B
 models/CosyVoice
 models/CosyVoice-ttsfrd
 ```
@@ -102,13 +134,13 @@ must choose an approved immutable upstream revision, download it on a trusted
 staging host, and create the approval manifest there:
 
 ```bash
-hf download Qwen/Qwen3-ASR-1.7B-hf \
+hf download Qwen/Qwen3-ASR-1.7B \
   --revision "$APPROVED_QWEN_REVISION" \
-  --local-dir models/Qwen3-ASR-1.7B-hf
+  --local-dir models/Qwen3-ASR-1.7B
 python3 -m app.asr_artifacts create \
-  --model-dir models/Qwen3-ASR-1.7B-hf \
-  --output models/Qwen3-ASR-1.7B-hf.manifest.json \
-  --source Qwen/Qwen3-ASR-1.7B-hf \
+  --model-dir models/Qwen3-ASR-1.7B \
+  --output models/Qwen3-ASR-1.7B.manifest.json \
+  --source Qwen/Qwen3-ASR-1.7B \
   --revision "$APPROVED_QWEN_REVISION"
 ```
 
@@ -160,9 +192,9 @@ MODEL_TASK=causal-lm
 DEVICE=auto
 TORCH_DTYPE=float16
 MAX_NEW_TOKENS=1024
-ASR_MODEL_ID=/models/Qwen3-ASR-1.7B-hf
+ASR_MODEL_ID=/models/Qwen3-ASR-1.7B
 ASR_REQUIRE_MODEL_MANIFEST=true
-ASR_MODEL_MANIFEST_PATH=/models/Qwen3-ASR-1.7B-hf.manifest.json
+ASR_MODEL_MANIFEST_PATH=/models/Qwen3-ASR-1.7B.manifest.json
 ASR_BACKEND=qwen_vllm
 ASR_STREAM_MODE=stateful
 ASR_STREAM_CHUNK_SECONDS=1.0
@@ -297,8 +329,8 @@ For Qwen3-ASR, use the approved immutable revision and trusted-staging manifest
 procedure above. The target layout is:
 
 ```text
-models/Qwen3-ASR-1.7B-hf/
-models/Qwen3-ASR-1.7B-hf.manifest.json
+models/Qwen3-ASR-1.7B/
+models/Qwen3-ASR-1.7B.manifest.json
 ```
 
 For CosyVoice TTS, download the model and runtime resources:

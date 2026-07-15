@@ -1,5 +1,22 @@
 # HY-MT1.5-1.8B on NVIDIA A10
 
+## Semantic Gateway topology
+
+Deploy one ASR process, one Uvicorn worker, and one model owner on each A10.
+`docker-compose.yml` starts `app.asr_gateway:app`; the Gateway and selected local
+adapter share the ASR runtime image, while CUDA/model execution remains on the
+coordinator owner thread. Do not load multiple large ASR models on one GPU by
+default.
+
+The stateful `qwen_vllm` runtime pinned to `qwen-asr==0.0.6` and `vllm==0.14.0`
+must use `Qwen/Qwen3-ASR-1.7B`, not the `-hf` Transformers export. Credentials enter
+through environment variables and must not appear in commands or logs.
+
+A10 capacity remains unverified until the release and live gates run against
+the exact image, model, manifest, configuration, non-silent warmup, speech
+corpus, concurrency levels, latency thresholds, and VRAM measurements. Unit
+tests and fake dynamic adapters establish scheduling semantics only.
+
 Recommended VM:
 
 - GPU: 1 x NVIDIA A10, 24GB VRAM
@@ -50,13 +67,13 @@ Qwen3-ASR model and approval manifest, created on a trusted staging host:
 
 ```bash
 cd /opt/model-test
-hf download Qwen/Qwen3-ASR-1.7B-hf \
+hf download Qwen/Qwen3-ASR-1.7B \
   --revision "$APPROVED_QWEN_REVISION" \
-  --local-dir models/Qwen3-ASR-1.7B-hf
+  --local-dir models/Qwen3-ASR-1.7B
 python3 -m app.asr_artifacts create \
-  --model-dir models/Qwen3-ASR-1.7B-hf \
-  --output models/Qwen3-ASR-1.7B-hf.manifest.json \
-  --source Qwen/Qwen3-ASR-1.7B-hf \
+  --model-dir models/Qwen3-ASR-1.7B \
+  --output models/Qwen3-ASR-1.7B.manifest.json \
+  --source Qwen/Qwen3-ASR-1.7B \
   --revision "$APPROVED_QWEN_REVISION"
 ```
 
@@ -95,7 +112,7 @@ MAX_NEW_TOKENS=1024
 ASR_TORCH_DTYPE=bfloat16
 ASR_DEVICE=auto
 ASR_REQUIRE_MODEL_MANIFEST=true
-ASR_MODEL_MANIFEST_PATH=/models/Qwen3-ASR-1.7B-hf.manifest.json
+ASR_MODEL_MANIFEST_PATH=/models/Qwen3-ASR-1.7B.manifest.json
 ASR_BACKEND=qwen_vllm
 ASR_STREAM_MODE=stateful
 ASR_STREAM_CHUNK_SECONDS=1.0

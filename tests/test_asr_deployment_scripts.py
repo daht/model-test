@@ -268,3 +268,18 @@ def test_asr_image_executes_official_qwen_streaming_contract_check():
         assert f'"{field}"' in contract
     assert 'require_version("qwen-asr", "0.0.6")' in contract
     assert 'require_version("vllm", "0.14.0")' in contract
+def test_semantic_gateway_replaces_multipod_proxy_contract():
+    root = Path(__file__).resolve().parents[1]
+    compose = (root / "docker-compose.yml").read_text()
+    readme = (root / "README.md").read_text()
+    cloud = (root / "cloud" / "README-A10.md").read_text()
+
+    assert not (root / "docker-compose.asr-multipod.yml").exists()
+    assert not (root / "docs" / "asr-multipod-gateway.md").exists()
+    assert "app.asr_gateway:app" in compose
+    assert compose.count("--workers") == 1
+    assert "ASR_GATEWAY_SCHEDULE_MAX_WAIT_MS" in readme
+    assert "drain-and-switch" in readme
+    assert "one model owner" in cloud
+    assert "A10 capacity remains unverified" in cloud
+    assert "environment" in readme.lower() and "credential" in readme.lower()

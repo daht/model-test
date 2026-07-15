@@ -153,10 +153,6 @@ class Settings(BaseSettings):
             raise ValueError(
                 "WebSocket buffered audio exceeds asr_max_connection_lag_seconds"
             )
-        if self.asr_gateway_max_session_buffer_seconds > self.asr_max_undecoded_age_seconds:
-            raise ValueError(
-                "asr_gateway_max_session_buffer_seconds must not exceed asr_max_undecoded_age_seconds"
-            )
         if self.asr_gateway_max_queued_audio_seconds < self.asr_gateway_max_session_buffer_seconds:
             raise ValueError(
                 "asr_gateway_max_queued_audio_seconds must cover one session buffer"
