@@ -89,6 +89,14 @@ class Settings(BaseSettings):
     asr_stream_inference_timeout_seconds: float = Field(default=15.0, gt=0, le=300)
     asr_file_inference_timeout_seconds: float = Field(default=300.0, gt=0, le=3600)
     asr_shutdown_grace_seconds: float = Field(default=10.0, gt=0, le=300)
+    asr_gateway_schedule_max_wait_ms: int = Field(default=20, ge=0, le=1000)
+    asr_gateway_max_ready_jobs: int = Field(default=64, gt=0, le=4096)
+    asr_gateway_max_queued_audio_seconds: float = Field(default=8.0, gt=0, le=600)
+    asr_gateway_max_session_buffer_seconds: float = Field(default=4.0, gt=0, le=120)
+    asr_gateway_default_update_ms: int = Field(default=1500, gt=0, le=30000)
+    asr_gateway_drain_timeout_seconds: float = Field(default=30.0, gt=0, le=3600)
+    asr_gateway_default_backend: str = Field(default="local", min_length=1, max_length=128)
+    asr_gateway_max_active_sessions: int = Field(default=2, gt=0, le=1024)
     tts_model_name: str = "CosyVoice"
     tts_backend: Literal["mock", "cosyvoice"] = "mock"
     tts_model_id: str = "/models/CosyVoice"
@@ -145,6 +153,14 @@ class Settings(BaseSettings):
             raise ValueError(
                 "WebSocket buffered audio exceeds asr_max_connection_lag_seconds"
             )
+        if self.asr_gateway_max_session_buffer_seconds > self.asr_max_undecoded_age_seconds:
+            raise ValueError(
+                "asr_gateway_max_session_buffer_seconds must not exceed asr_max_undecoded_age_seconds"
+            )
+        if self.asr_gateway_max_queued_audio_seconds < self.asr_gateway_max_session_buffer_seconds:
+            raise ValueError(
+                "asr_gateway_max_queued_audio_seconds must cover one session buffer"
+            )
         if self.asr_backend == "qwen" and self.asr_stream_mode == "stateful":
             raise ValueError("asr_backend=qwen does not support stateful streaming")
         if self.asr_vad_onset_threshold <= self.asr_vad_offset_threshold:
@@ -156,6 +172,12 @@ class Settings(BaseSettings):
                 "asr_vad_hangover_ms must not exceed asr_vad_min_silence_ms"
             )
         if self.asr_stream_mode == "stateful":
+            if self.asr_backend == "qwen_vllm" and self.asr_model_id == "/models/Qwen3-ASR-1.7B-hf":
+                # The pinned qwen-asr/vLLM runtime uses the toolkit checkpoint,
+                # while the original qwen backend uses the Transformers export.
+                self.asr_model_id = "Qwen/Qwen3-ASR-1.7B"
+            elif self.asr_backend == "qwen_vllm" and self.asr_model_id.rstrip("/").endswith("-hf"):
+                raise ValueError("qwen_vllm stateful model_id must not use the -hf export")
             if self.asr_stream_rollover_seconds <= self.asr_stream_chunk_seconds:
                 raise ValueError(
                     "asr_stream_rollover_seconds must exceed the model chunk duration"

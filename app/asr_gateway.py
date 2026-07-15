@@ -1,644 +1,365 @@
 from __future__ import annotations
 
 import asyncio
-import logging
-import math
-import os
+import json
+import uuid
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
-from typing import Any, AsyncContextManager, Callable, Iterable
-from urllib.parse import urlsplit, urlunsplit
+from typing import Any, Mapping
 
-import httpx
-import websockets
-from fastapi import FastAPI, Request, WebSocket, status
-from fastapi.responses import JSONResponse, Response
-from websockets.exceptions import ConnectionClosed
+from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect, status
+from fastapi.responses import JSONResponse
 
-logger = logging.getLogger(__name__)
-
-_HOP_BY_HOP_HEADERS = {
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-}
-_WEBSOCKET_HANDSHAKE_HEADERS = _HOP_BY_HOP_HEADERS | {
-    "host",
-    "sec-websocket-accept",
-    "sec-websocket-extensions",
-    "sec-websocket-key",
-    "sec-websocket-protocol",
-    "sec-websocket-version",
-}
-_INVALID_FORWARD_CLOSE_CODES = {1005, 1006, 1015}
-_MAX_READINESS_COUNT = 1_000_000_000
-_MAX_QUEUED_AUDIO_SECONDS = 1_000_000_000.0
-_MAX_READINESS_STRING_LENGTH = 256
-
-
-@dataclass(frozen=True)
-class BackendConfig:
-    name: str
-    http_url: str
-
-    def __post_init__(self) -> None:
-        parsed = urlsplit(self.http_url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ValueError(f"Backend {self.name!r} must use an http(s) URL")
-        if parsed.username or parsed.password or parsed.query or parsed.fragment:
-            raise ValueError(f"Backend {self.name!r} URL must not contain credentials, query, or fragment")
-
-    @property
-    def websocket_url(self) -> str:
-        parsed = urlsplit(self.http_url)
-        scheme = "wss" if parsed.scheme == "https" else "ws"
-        return urlunsplit((scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
-
-
-@dataclass(frozen=True)
-class GatewaySettings:
-    backends: tuple[BackendConfig, ...]
-    minimum_ready_backends: int = 2
-    probe_interval_seconds: float = 1.0
-    probe_timeout_seconds: float = 2.0
-    upstream_open_timeout_seconds: float = 5.0
-    upstream_close_timeout_seconds: float = 5.0
-
-    def __post_init__(self) -> None:
-        if not self.backends:
-            raise ValueError("At least one ASR gateway backend is required")
-        if len({backend.name for backend in self.backends}) != len(self.backends):
-            raise ValueError("ASR gateway backend names must be unique")
-        if not 1 <= self.minimum_ready_backends <= len(self.backends):
-            raise ValueError("Minimum ready backends must be between one and the backend count")
-        for value in (
-            self.probe_interval_seconds,
-            self.probe_timeout_seconds,
-            self.upstream_open_timeout_seconds,
-            self.upstream_close_timeout_seconds,
-        ):
-            if not math.isfinite(value) or value <= 0:
-                raise ValueError(
-                    "ASR gateway timeouts and intervals must be finite and positive"
-                )
-
-    @classmethod
-    def from_environment(cls) -> "GatewaySettings":
-        raw_backends = os.getenv(
-            "ASR_GATEWAY_BACKENDS",
-            "qwen-asr-backend-1=http://qwen-asr-backend-1:8000,"
-            "qwen-asr-backend-2=http://qwen-asr-backend-2:8000",
-        )
-        backends = []
-        for index, entry in enumerate(raw_backends.split(","), start=1):
-            entry = entry.strip()
-            if not entry:
-                continue
-            if "=" in entry:
-                name, url = entry.split("=", 1)
-            else:
-                name, url = f"asr-{index}", entry
-            backends.append(BackendConfig(name.strip(), url.strip().rstrip("/")))
-        return cls(
-            backends=tuple(backends),
-            minimum_ready_backends=int(os.getenv("ASR_GATEWAY_MIN_READY_BACKENDS", "2")),
-            probe_interval_seconds=float(os.getenv("ASR_GATEWAY_PROBE_INTERVAL_SECONDS", "1.0")),
-            probe_timeout_seconds=float(os.getenv("ASR_GATEWAY_PROBE_TIMEOUT_SECONDS", "2.0")),
-            upstream_open_timeout_seconds=float(
-                os.getenv("ASR_GATEWAY_UPSTREAM_OPEN_TIMEOUT_SECONDS", "5.0")
-            ),
-            upstream_close_timeout_seconds=float(
-                os.getenv("ASR_GATEWAY_UPSTREAM_CLOSE_TIMEOUT_SECONDS", "5.0")
-            ),
-        )
+from app.asr_gateway_backends import BackendLease, BackendRegistry, ResultMode
+from app.asr_gateway_metrics import GatewayMetrics, gateway_readiness
+from app.asr_gateway_protocol import ProtocolSession, StartCommand, parse_client_command
+from app.asr_gateway_scheduler import BatchKey, GatewayScheduler, InferenceJob, InferenceResult
+from app.asr_gateway_sessions import GatewaySession, SessionManager, TerminalState
+from app.config import Settings, get_settings
 
 
 @dataclass
-class _BackendState:
-    config: BackendConfig
-    ready: bool = False
-    remote_active_streams: int = 0
-    queue_depth: int = 0
-    queued_audio_seconds: float = 0.0
-    local_load: int = 0
-    model: str | None = None
-    backend: str | None = None
-    detail: str | None = "not probed"
-
-    @property
-    def effective_load(self) -> int:
-        # Upstream active_streams may already include gateway-owned connections.
-        # max() fills probe lag without counting those connections twice.
-        return max(self.remote_active_streams, self.local_load)
+class _SessionContext:
+    session: GatewaySession
+    lease: BackendLease
+    protocol: ProtocolSession
+    events: asyncio.Queue[dict[str, Any]]
+    idle: asyncio.Event
 
 
-class BackendLease:
-    def __init__(self, pool: "BackendPool", backend: BackendConfig) -> None:
-        self._pool = pool
-        self.backend = backend
-        self._released = False
-        self._release_lock = asyncio.Lock()
-
-    async def release(self) -> None:
-        async with self._release_lock:
-            if self._released:
-                return
-            self._released = True
-            await self._pool._release(self.backend.name)
-
-
-class BackendPool:
-    def __init__(
-        self,
-        settings: GatewaySettings,
-        *,
-        http_client: httpx.AsyncClient | None = None,
-    ) -> None:
+class GatewayRuntime:
+    def __init__(self, settings: Settings, adapters: Mapping[str, Any]) -> None:
         self.settings = settings
-        self._states = [_BackendState(config=backend) for backend in settings.backends]
-        self._lock = asyncio.Lock()
-        self._http_client = http_client or httpx.AsyncClient(
-            follow_redirects=False,
-            timeout=None,
+        self.adapters = dict(adapters)
+        self.registry = BackendRegistry()
+        self.sessions = SessionManager(max_sessions=settings.asr_gateway_max_active_sessions)
+        self.metrics = GatewayMetrics()
+        self._contexts: dict[str, _SessionContext] = {}
+        self.scheduler = GatewayScheduler(
+            self.adapters,
+            max_wait_seconds=settings.asr_gateway_schedule_max_wait_ms / 1000,
+            max_ready_jobs=settings.asr_gateway_max_ready_jobs,
+            max_queued_samples=round(settings.asr_gateway_max_queued_audio_seconds * 16_000),
+            cleanup=self._cleanup_job,
+            publish=self._publish_result,
         )
-        self._owns_http_client = http_client is None
+        self._started = False
+
+    async def start(self) -> None:
+        if self._started:
+            return
+        try:
+            for worker_id, adapter in self.adapters.items():
+                await adapter.warmup()
+                if adapter.capabilities.worker_id != worker_id:
+                    raise ValueError("adapter map key must equal capability worker_id")
+                await self.registry.register(adapter.capabilities)
+                await self.registry.mark_ready(worker_id, True)
+            await self.scheduler.start()
+            self._started = True
+        except Exception:
+            for adapter in self.adapters.values():
+                with suppress(Exception):
+                    await adapter.close()
+            raise
 
     async def close(self) -> None:
-        if self._owns_http_client:
-            await self._http_client.aclose()
+        for session_id in list(self._contexts):
+            await self.abort(session_id)
+        await self.scheduler.close()
+        for adapter in self.adapters.values():
+            await adapter.close()
+        self._started = False
 
-    async def refresh(self) -> None:
-        await asyncio.gather(*(self._probe(state.config) for state in self._states))
-
-    async def _probe(self, backend: BackendConfig) -> None:
+    async def open_session(self, session_id: str, *, language: str, options: dict[str, Any]) -> GatewaySession:
+        lease = await self.registry.acquire()
+        worker_id = lease.worker_id
+        adapter = self.adapters[worker_id]
         try:
-            response = await self._http_client.get(
-                f"{backend.http_url}/ready",
-                timeout=self.settings.probe_timeout_seconds,
+            backend_id = await adapter.open_session(session_id, language=language, **options)
+            session = self.sessions.create(
+                session_id, worker_id, backend_id, sample_rate=16_000,
+                max_buffer_samples=round(self.settings.asr_gateway_max_session_buffer_seconds * 16_000),
+                language=language, options=options,
             )
-            payload = response.json()
-            if not isinstance(payload, dict):
-                raise ValueError("readiness payload is not an object")
-            if response.status_code != 200 or payload.get("status") != "ready":
-                await self.set_probe_result(
-                    backend.name,
-                    payload,
-                    ready=False,
-                    detail=f"upstream returned HTTP {response.status_code}",
-                )
-                return
-            await self.set_probe_result(backend.name, payload)
-        except (httpx.HTTPError, OverflowError, ValueError, TypeError) as exc:
-            await self.set_probe_result(
-                backend.name,
-                {},
-                ready=False,
-                detail=f"probe failed ({type(exc).__name__})",
-            )
-
-    async def set_probe_result(
-        self,
-        backend_name: str,
-        payload: dict[str, Any],
-        *,
-        ready: bool | None = None,
-        detail: str | None = None,
-    ) -> None:
-        is_ready = payload.get("status") == "ready" if ready is None else ready
-        if is_ready:
-            (
-                remote_active_streams,
-                queue_depth,
-                queued_audio_seconds,
-                model,
-                backend,
-            ) = _validate_ready_payload(payload)
-        else:
-            remote_active_streams = 0
-            queue_depth = 0
-            queued_audio_seconds = 0.0
-            model = None
-            backend = None
-
-        async with self._lock:
-            state = self._state(backend_name)
-            state.ready = is_ready
-            state.remote_active_streams = remote_active_streams
-            state.queue_depth = queue_depth
-            state.queued_audio_seconds = queued_audio_seconds
-            state.model = model
-            state.backend = backend
-            state.detail = detail if detail is not None else _optional_string(payload.get("detail"))
-
-    async def reserve(self) -> BackendLease | None:
-        async with self._lock:
-            ready_states = [state for state in self._states if state.ready]
-            if len(ready_states) < self.settings.minimum_ready_backends:
-                return None
-            state = min(
-                ready_states,
-                key=lambda candidate: (
-                    candidate.effective_load,
-                    candidate.queue_depth,
-                    candidate.queued_audio_seconds,
-                    self._states.index(candidate),
-                ),
-            )
-            state.local_load += 1
-            return BackendLease(self, state.config)
-
-    async def _release(self, backend_name: str) -> None:
-        async with self._lock:
-            state = self._state(backend_name)
-            if state.local_load <= 0:
-                logger.error("asr_gateway_accounting_underflow backend=%s", backend_name)
-                state.ready = False
-                state.detail = "gateway accounting underflow"
-                return
-            state.local_load -= 1
-
-    async def snapshot(self) -> dict[str, Any]:
-        async with self._lock:
-            ready_count = sum(state.ready for state in self._states)
-            ready_states = [state for state in self._states if state.ready]
-            return {
-                "status": (
-                    "ready"
-                    if ready_count >= self.settings.minimum_ready_backends
-                    else "not_ready"
-                ),
-                "model": next((state.model for state in ready_states if state.model), None),
-                "backend": next((state.backend for state in ready_states if state.backend), None),
-                "active_streams": sum(
-                    max(state.remote_active_streams, state.local_load)
-                    for state in ready_states
-                ),
-                "queue_depth": sum(state.queue_depth for state in ready_states),
-                "queued_audio_seconds": sum(
-                    state.queued_audio_seconds for state in ready_states
-                ),
-                "ready_backend_count": ready_count,
-                "minimum_ready_backends": self.settings.minimum_ready_backends,
-                "backends": [
-                    {
-                        "name": state.config.name,
-                        "ready": state.ready,
-                        "remote_active_streams": state.remote_active_streams,
-                        "local_load": state.local_load,
-                        "effective_load": state.effective_load,
-                        "queue_depth": state.queue_depth,
-                        "queued_audio_seconds": state.queued_audio_seconds,
-                        "detail": state.detail,
-                    }
-                    for state in self._states
-                ],
-            }
-
-    def _state(self, backend_name: str) -> _BackendState:
-        for state in self._states:
-            if state.config.name == backend_name:
-                return state
-        raise KeyError(backend_name)
-
-
-_runtime_pool: BackendPool | None = None
-_test_pool: BackendPool | None = None
-
-
-def set_gateway_pool_for_tests(pool: BackendPool | None) -> None:
-    global _test_pool
-    _test_pool = pool
-
-
-def get_gateway_pool() -> BackendPool:
-    pool = _test_pool or _runtime_pool
-    if pool is None:
-        raise RuntimeError("ASR gateway backend pool is not initialized")
-    return pool
-
-
-@asynccontextmanager
-async def lifespan(_app: FastAPI):
-    global _runtime_pool
-    if _test_pool is not None:
-        yield
-        return
-    pool = BackendPool(GatewaySettings.from_environment())
-    _runtime_pool = pool
-    stop = asyncio.Event()
-    probe_task: asyncio.Task[None] | None = None
-    try:
-        await pool.refresh()
-        probe_task = asyncio.create_task(_probe_loop(pool, stop), name="asr-gateway-probes")
-        yield
-    finally:
-        stop.set()
-        if probe_task is not None:
-            probe_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await probe_task
-        await pool.close()
-        _runtime_pool = None
-
-
-async def _probe_loop(pool: BackendPool, stop: asyncio.Event) -> None:
-    while not stop.is_set():
-        try:
-            await asyncio.wait_for(stop.wait(), timeout=pool.settings.probe_interval_seconds)
-        except TimeoutError:
-            await pool.refresh()
-
-
-app = FastAPI(
-    title="ASR Multi-Pod Gateway",
-    version="0.1.0",
-    description="Experimental sticky proxy for independent Qwen ASR backends.",
-    lifespan=lifespan,
-)
-
-
-@app.get("/health")
-async def health() -> dict[str, Any]:
-    snapshot = await get_gateway_pool().snapshot()
-    return {
-        "status": "ok",
-        "service": "asr-gateway",
-        "ready_backend_count": snapshot["ready_backend_count"],
-    }
-
-
-@app.get("/ready")
-async def ready() -> Response:
-    snapshot = await get_gateway_pool().snapshot()
-    code = 200 if snapshot["status"] == "ready" else status.HTTP_503_SERVICE_UNAVAILABLE
-    return JSONResponse(snapshot, status_code=code)
-
-
-@app.get("/v1/transcribe/stream-info")
-async def proxy_stream_info(request: Request) -> Response:
-    pool = get_gateway_pool()
-    lease = await pool.reserve()
-    if lease is None:
-        return JSONResponse(
-            {"detail": {"code": "not_ready", "message": "ASR gateway has insufficient ready backends"}},
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        )
-    try:
-        query = request.url.query
-        url = f"{lease.backend.http_url}/v1/transcribe/stream-info"
-        if query:
-            url = f"{url}?{query}"
-        headers = _forward_http_headers(request.headers.items())
-        try:
-            upstream = await pool._http_client.request(
-                request.method,
-                url,
-                headers=headers,
-                content=request.stream(),
-                follow_redirects=False,
-            )
-        except httpx.HTTPError:
-            logger.warning("asr_gateway_http_upstream_failed backend=%s", lease.backend.name)
-            return JSONResponse(
-                {"detail": {"code": "upstream_unavailable", "message": "Selected ASR backend is unavailable"}},
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            )
-        response_headers = {
-            name: value
-            for name, value in upstream.headers.items()
-            if name.lower() not in _HOP_BY_HOP_HEADERS
-            and name.lower() not in {"content-length", "content-encoding"}
-        }
-        return Response(
-            content=upstream.content,
-            status_code=upstream.status_code,
-            headers=response_headers,
-            media_type=None,
-        )
-    finally:
-        await lease.release()
-
-
-@app.api_route(
-    "/v1/{upstream_path:path}",
-    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-)
-async def reject_unsupported_http(upstream_path: str) -> Response:
-    del upstream_path
-    return JSONResponse(
-        {
-            "detail": {
-                "code": "unsupported_gateway_path",
-                "message": (
-                    "The experimental gateway supports only "
-                    "GET /v1/transcribe/stream-info and the streaming WebSocket"
-                ),
-            }
-        },
-        status_code=status.HTTP_404_NOT_FOUND,
-    )
-
-
-@app.websocket("/v1/transcribe/stream")
-async def transcribe_stream(websocket: WebSocket) -> None:
-    await proxy_websocket(
-        websocket,
-        get_gateway_pool(),
-        path=websocket.url.path,
-        query=websocket.url.query,
-        headers=websocket.headers.items(),
-    )
-
-
-async def proxy_websocket(
-    websocket: Any,
-    pool: BackendPool,
-    *,
-    path: str = "/v1/transcribe/stream",
-    query: str = "",
-    headers: Iterable[tuple[str, str]] = (),
-    connect: Callable[..., AsyncContextManager[Any]] = websockets.connect,
-) -> None:
-    lease = await pool.reserve()
-    try:
-        await websocket.accept()
-        if lease is None:
-            await websocket.close(code=1013, reason="ASR gateway is not ready")
-            return
-
-        upstream_url = f"{lease.backend.websocket_url}{path}"
-        if query:
-            upstream_url = f"{upstream_url}?{query}"
-        async with connect(
-            upstream_url,
-            additional_headers=_forward_websocket_headers(headers),
-            open_timeout=pool.settings.upstream_open_timeout_seconds,
-            close_timeout=pool.settings.upstream_close_timeout_seconds,
-            compression=None,
-            proxy=None,
-            max_size=None,
-            max_queue=4,
-        ) as upstream:
-            await _run_websocket_proxy(websocket, upstream)
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        backend_name = lease.backend.name if lease is not None else "unreserved"
-        logger.warning("asr_gateway_websocket_upstream_failed backend=%s", backend_name)
-        with suppress(Exception):
-            await websocket.close(code=1011, reason="Upstream proxy failure")
-    finally:
-        if lease is not None:
+        except Exception:
             await lease.release()
+            raise
+        idle = asyncio.Event(); idle.set()
+        self._contexts[session_id] = _SessionContext(
+            session, lease, ProtocolSession(sample_rate=16_000), asyncio.Queue(), idle
+        )
+        return session
 
+    async def ingest(self, session: GatewaySession, pcm: bytes, *, force: bool = False) -> bool:
+        if pcm:
+            session.append_pcm(pcm)
+        return self._schedule_next(session, force=force)
 
-async def _run_websocket_proxy(client: Any, upstream: Any) -> None:
-    client_task = asyncio.create_task(_client_to_upstream(client, upstream))
-    upstream_task = asyncio.create_task(_upstream_to_client(upstream, client))
-    tasks = {client_task, upstream_task}
-    try:
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        if (
-            upstream_task in done
-            and not upstream_task.cancelled()
-            and upstream_task.exception() is None
-        ):
-            close_code, close_reason = upstream_task.result()
-            await client.close(code=close_code, reason=close_reason)
-        else:
-            for task in (upstream_task, client_task):
-                if task not in done or task.cancelled():
-                    continue
-                exception = task.exception()
-                if exception is not None:
-                    raise exception
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-    finally:
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-
-async def _client_to_upstream(client: Any, upstream: Any) -> None:
-    while True:
-        message = await client.receive()
-        message_type = message.get("type")
-        if message_type == "websocket.disconnect":
-            code = _forward_close_code(message.get("code"), fallback=1000)
-            await upstream.close(code=code)
-            return
-        if message_type != "websocket.receive":
-            continue
-        if message.get("bytes") is not None:
-            await upstream.send(message["bytes"])
-        elif message.get("text") is not None:
-            await upstream.send(message["text"])
-
-
-async def _upstream_to_client(upstream: Any, client: Any) -> tuple[int, str]:
-    while True:
+    def _schedule_next(self, session: GatewaySession, *, force: bool = False) -> bool:
+        preferred = round(self.settings.asr_gateway_default_update_ms / 1000 * session.sample_rate)
+        caps = self.adapters[session.selected_worker_id].capabilities
+        count = session.ready_samples(preferred=preferred, maximum=caps.max_input_samples, force=force)
+        if count <= 0:
+            return False
+        reservation = session.reserve(count, final=session.finish_requested)
+        ctx = self._contexts[session.session_id]
+        ctx.idle.clear()
+        bucket = min(15, max(0, count.bit_length() - 1))
+        options = session.options
+        job = InferenceJob(
+            job_id=f"{session.session_id}:{session.generation}:{reservation.job_sequence}",
+            session_id=session.session_id, generation=session.generation,
+            job_sequence=reservation.job_sequence, worker_id=session.selected_worker_id,
+            backend_session_id=session.backend_session_id,
+            start_sample=reservation.chunk.start_sample, end_sample=reservation.chunk.end_sample,
+            pcm=reservation.chunk.pcm,
+            deadline=self.scheduler.clock() + self.settings.asr_gateway_schedule_max_wait_ms / 1000,
+            batch_key=BatchKey(
+                session.selected_worker_id, caps.model_revision, session.language,
+                str(options.get("task", "transcribe")), bool(options.get("timestamps", False)),
+                str(hash(str(options.get("prompt", "")))),
+                str(hash(json.dumps(options, sort_keys=True, default=str))),
+                "pcm_s16le", bucket,
+            ),
+            final=reservation.chunk.final,
+        )
         try:
-            message = await upstream.recv()
-        except ConnectionClosed as exc:
-            close = exc.rcvd or exc.sent
-            if close is None:
-                return 1011, ""
-            return _forward_close_code(close.code, fallback=1011), close.reason or ""
-        if isinstance(message, str):
-            await client.send_text(message)
-        else:
-            await client.send_bytes(bytes(message))
+            self.scheduler.enqueue(job)
+        except Exception:
+            session.rollback(reservation.job_sequence)
+            ctx.idle.set()
+            raise
+        return True
+
+    async def wait_idle(self, session_id: str) -> None:
+        await self._contexts[session_id].idle.wait()
+
+    async def segment(self, session_id: str) -> list[dict[str, Any]]:
+        ctx = self._contexts[session_id]
+        await self.ingest(ctx.session, b"", force=True)
+        await ctx.idle.wait()
+        result = await self.adapters[ctx.session.selected_worker_id].finish_segment(session_id)
+        if result.text:
+            ctx.protocol.apply_result(ResultMode.CUMULATIVE_SNAPSHOT, text=ctx.protocol.state.confirmed_text + result.text)
+        return ctx.protocol.segment()
+
+    async def finish(self, session_id: str) -> dict[str, Any]:
+        ctx = self._contexts[session_id]
+        ctx.session.request_finish()
+        await self.ingest(ctx.session, b"", force=True)
+        await ctx.idle.wait()
+        result = await self.adapters[ctx.session.selected_worker_id].finish_session(session_id)
+        if result.text:
+            ctx.protocol.apply_result(ResultMode.CUMULATIVE_SNAPSHOT, text=ctx.protocol.state.confirmed_text + result.text)
+        event = ctx.protocol.final()
+        ctx.session.succeed()
+        await self._release_session(session_id)
+        return event
+
+    async def abort(self, session_id: str) -> None:
+        ctx = self._contexts.get(session_id)
+        if ctx is None:
+            return
+        self.scheduler.cancel_session(session_id, generation=ctx.session.generation)
+        ctx.session.abort()
+        with suppress(Exception):
+            await self.adapters[ctx.session.selected_worker_id].abort_session(session_id)
+        await self._release_session(session_id)
+
+    async def _release_session(self, session_id: str) -> None:
+        ctx = self._contexts.pop(session_id, None)
+        self.sessions.close(session_id)
+        if ctx is not None:
+            await ctx.lease.release()
+
+    async def _cleanup_job(self, job: InferenceJob) -> None:
+        ctx = self._contexts.get(job.session_id)
+        if ctx is None or ctx.session.generation != job.generation:
+            return
+        ctx.session.acknowledge(job.job_sequence, generation=job.generation)
+        if not self._schedule_next(ctx.session, force=ctx.session.finish_requested):
+            ctx.idle.set()
+        self._update_gauges()
+
+    async def _publish_result(self, result: InferenceResult) -> None:
+        ctx = self._contexts.get(result.session_id)
+        if ctx is None:
+            return
+        if result.error:
+            ctx.session.fail()
+            await ctx.events.put(ctx.protocol.error(RuntimeError(result.error)))
+            return
+        mode = self.adapters[result.worker_id].capabilities.result_mode
+        events = ctx.protocol.apply_result(
+            mode, text=result.text, confirmed_text=result.confirmed_text,
+            tail_text=result.tail_text, decoded_samples=result.end_sample - result.start_sample,
+            segment_id=result.job_sequence,
+        )
+        for event in events:
+            await ctx.events.put(event)
+
+    def event_queue(self, session_id: str) -> asyncio.Queue[dict[str, Any]]:
+        return self._contexts[session_id].events
+
+    def _update_gauges(self) -> None:
+        scheduler = self.scheduler.snapshot()
+        self.metrics.set_gauges(
+            active_sessions=self.sessions.snapshot()["active_sessions"],
+            ready_depth=scheduler["ready_depth"], queued_samples=scheduler["queued_samples"], sample_rate=16_000,
+        )
 
 
-def _forward_http_headers(headers: Iterable[tuple[str, str]]) -> dict[str, str]:
-    return {
-        name: value
-        for name, value in headers
-        if name.lower() not in _HOP_BY_HOP_HEADERS | {"host", "content-length"}
-    }
+def _authorized(value: str | None, settings: Settings) -> bool:
+    return bool(value and value == settings.api_key)
 
 
-def _forward_websocket_headers(headers: Iterable[tuple[str, str]]) -> dict[str, str]:
-    return {
-        name: value
-        for name, value in headers
-        if name.lower() not in _WEBSOCKET_HANDSHAKE_HEADERS
-    }
+def _default_runtime() -> GatewayRuntime:
+    from app.asr import create_asr_transcriber
+    from app.asr_gateway_local_adapter import LocalCoordinatorAdapter
+    from app.asr_inference import ASRInferenceCoordinator
 
-
-def _forward_close_code(value: Any, *, fallback: int) -> int:
-    if not isinstance(value, int) or value < 1000 or value > 4999:
-        return fallback
-    if value in _INVALID_FORWARD_CLOSE_CODES:
-        return fallback
-    return value
-
-
-def _validate_ready_payload(payload: dict[str, Any]) -> tuple[int, int, float, str, str]:
-    required = {
-        "status",
-        "model",
-        "backend",
-        "active_streams",
-        "queue_depth",
-        "queued_audio_seconds",
-    }
-    if not required.issubset(payload):
-        raise ValueError("readiness payload is incomplete")
-    if payload["status"] != "ready":
-        raise ValueError("readiness payload status is not ready")
-    return (
-        _bounded_nonnegative_int(payload["active_streams"], "active_streams"),
-        _bounded_nonnegative_int(payload["queue_depth"], "queue_depth"),
-        _bounded_nonnegative_float(
-            payload["queued_audio_seconds"], "queued_audio_seconds"
-        ),
-        _required_string(payload["model"], "model"),
-        _required_string(payload["backend"], "backend"),
+    settings = get_settings()
+    adapter = LocalCoordinatorAdapter(
+        lambda: ASRInferenceCoordinator(settings, lambda: create_asr_transcriber(settings)),
+        worker_id="local", model_id=settings.asr_model_id,
+        model_revision=settings.asr_model_name, gpu_id=settings.asr_device,
+        session_capacity=settings.asr_max_active_streams,
     )
+    return GatewayRuntime(settings, {"local": adapter})
 
 
-def _bounded_nonnegative_int(value: Any, field: str) -> int:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, int)
-        or value < 0
-        or value > _MAX_READINESS_COUNT
-    ):
-        raise ValueError(f"readiness {field} must be a bounded nonnegative integer")
-    return value
+def create_app(*, runtime: GatewayRuntime | None = None) -> FastAPI:
+    holder: dict[str, GatewayRuntime] = {}
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        selected = runtime or _default_runtime()
+        holder["runtime"] = selected
+        await selected.start()
+        try:
+            yield
+        finally:
+            await selected.close()
+
+    app = FastAPI(title="Semantic ASR Gateway", version="1.0", lifespan=lifespan)
+
+    def current() -> GatewayRuntime:
+        return holder["runtime"]
+
+    def require_key(x_api_key: str | None = Header(default=None, alias="X-API-Key")) -> None:
+        if not _authorized(x_api_key, current().settings):
+            raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+    @app.get("/health")
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.get("/ready")
+    async def ready():
+        value = await gateway_readiness(current().registry)
+        payload = {"status": "ready" if value else "not_ready"}
+        return payload if value else JSONResponse(status_code=503, content=payload)
+
+    @app.get("/v1/transcribe/stream-info", dependencies=[])
+    async def stream_info(x_api_key: str | None = Header(default=None, alias="X-API-Key")):
+        if not _authorized(x_api_key, current().settings):
+            raise HTTPException(status_code=401, detail="Invalid or missing API key")
+        return {"protocol_version": 2, "websocket_url": "/v1/transcribe/stream", "format": "pcm_s16le", "sample_rate": 16000, "channels": 1}
+
+    @app.get("/v1/asr/backends")
+    async def backends(x_api_key: str | None = Header(default=None, alias="X-API-Key")):
+        require_key(x_api_key)
+        return await current().registry.snapshot()
+
+    @app.get("/v1/asr/metrics")
+    async def metrics(x_api_key: str | None = Header(default=None, alias="X-API-Key")):
+        require_key(x_api_key)
+        return current().metrics.snapshot()
+
+    @app.websocket("/v1/transcribe/stream")
+    async def stream(websocket: WebSocket) -> None:
+        runtime_value = current()
+        if not _authorized(websocket.headers.get("x-api-key"), runtime_value.settings):
+            await websocket.close(code=1008)
+            return
+        await websocket.accept()
+        session_id = uuid.uuid4().hex
+        protocol: ProtocolSession | None = None
+        sender: asyncio.Task[None] | None = None
+        terminal_sent = False
+        try:
+            try:
+                message = await asyncio.wait_for(websocket.receive_json(), timeout=runtime_value.settings.asr_start_timeout_seconds)
+                command = parse_client_command(message)
+                if not isinstance(command, StartCommand):
+                    raise ValueError("first command must be start")
+                session = await runtime_value.open_session(session_id, language=command.language, options=command.options)
+                protocol = runtime_value._contexts[session_id].protocol
+            except RuntimeError as exc:
+                if "capacity" in str(exc):
+                    event = ProtocolSession(sample_rate=16000).error(exc, code="overloaded")
+                    await websocket.send_json(event); terminal_sent = True
+                    await websocket.close(code=1013); return
+                raise
+            except (ValueError, TimeoutError) as exc:
+                event = ProtocolSession(sample_rate=16000).error(exc, code="invalid_start")
+                await websocket.send_json(event); terminal_sent = True
+                await websocket.close(code=1008); return
+
+            await websocket.send_json(protocol.ready(session_id=session_id, worker_id=session.selected_worker_id))
+
+            async def send_results() -> None:
+                queue = runtime_value.event_queue(session_id)
+                while True:
+                    event = await queue.get()
+                    await websocket.send_json(event)
+                    if event["type"] in {"final", "error"}:
+                        return
+
+            sender = asyncio.create_task(send_results())
+            while True:
+                incoming = await asyncio.wait_for(websocket.receive(), timeout=runtime_value.settings.asr_idle_timeout_seconds)
+                if incoming["type"] == "websocket.disconnect":
+                    raise WebSocketDisconnect(incoming.get("code", 1000))
+                if incoming.get("bytes") is not None:
+                    try:
+                        await runtime_value.ingest(session, incoming["bytes"])
+                    except (ValueError, BufferError) as exc:
+                        await websocket.send_json(protocol.error(exc, code="invalid_audio")); terminal_sent = True
+                        await websocket.close(code=1008); return
+                    continue
+                try:
+                    control = parse_client_command(json.loads(incoming.get("text") or "{}"))
+                except (ValueError, json.JSONDecodeError) as exc:
+                    await websocket.send_json(protocol.error(exc, code="invalid_command")); terminal_sent = True
+                    await websocket.close(code=1008); return
+                if control.type == "segment":
+                    for event in await runtime_value.segment(session_id):
+                        await websocket.send_json(event)
+                elif control.type == "abort":
+                    await runtime_value.abort(session_id)
+                    await websocket.close(code=1000); return
+                elif control.type == "finish":
+                    event = await runtime_value.finish(session_id)
+                    await websocket.send_json(event); terminal_sent = True
+                    await websocket.close(code=1000); return
+                else:
+                    raise ValueError("start may only be sent once")
+        except (WebSocketDisconnect, TimeoutError):
+            return
+        except Exception as exc:
+            if protocol is not None and not protocol.terminal and not terminal_sent:
+                with suppress(Exception):
+                    await websocket.send_json(protocol.error(exc))
+        finally:
+            if sender is not None:
+                sender.cancel()
+                with suppress(asyncio.CancelledError):
+                    await sender
+            await runtime_value.abort(session_id)
+
+    return app
 
 
-def _bounded_nonnegative_float(value: Any, field: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"readiness {field} must be numeric")
-    parsed = float(value)
-    if (
-        not math.isfinite(parsed)
-        or parsed < 0
-        or parsed > _MAX_QUEUED_AUDIO_SECONDS
-    ):
-        raise ValueError(f"readiness {field} must be finite, bounded, and nonnegative")
-    return parsed
-
-
-def _required_string(value: Any, field: str) -> str:
-    if (
-        not isinstance(value, str)
-        or not value.strip()
-        or len(value) > _MAX_READINESS_STRING_LENGTH
-    ):
-        raise ValueError(f"readiness {field} must be a nonempty bounded string")
-    return value
-
-
-def _optional_string(value: Any) -> str | None:
-    return value if isinstance(value, str) else None
+app = create_app()
