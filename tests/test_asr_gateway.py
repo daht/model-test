@@ -4,15 +4,16 @@ from dataclasses import replace
 from fastapi.testclient import TestClient
 
 from app.asr_gateway import GatewayRuntime, create_app
-from app.asr_gateway_backends import DispatchMode
+from app.asr_gateway_backends import DispatchMode, ResultMode
 from app.asr_gateway_scheduler import InferenceResult
 from app.config import Settings
 from tests.test_asr_gateway_backends import capabilities
 
 
 class FakeAdapter:
-    def __init__(self, *, dynamic=False):
+    def __init__(self, *, dynamic=False, result_mode=ResultMode.CUMULATIVE_SNAPSHOT):
         caps = capabilities(worker_id="fake")
+        caps = replace(caps, result_mode=result_mode)
         self.capabilities = replace(caps, dispatch_mode=DispatchMode.DYNAMIC_MICROBATCH, max_batch_items=4, session_capacity=4) if dynamic else caps
         self.sessions = set(); self.calls = []; self.started = False
     async def warmup(self): self.started = True
@@ -109,3 +110,17 @@ def test_runtime_barrier_forms_cross_session_dynamic_batch():
         await runtime.close()
         return [len(call) for call in adapter.calls]
     assert asyncio.run(scenario()) == [3]
+
+
+def test_runtime_uses_segment_local_protocol_for_replaceable_adapter_results():
+    async def scenario():
+        adapter = FakeAdapter(result_mode=ResultMode.REPLACEABLE_SEGMENT)
+        settings = Settings(model_backend="mock", asr_backend="mock", api_key="test-key", asr_gateway_schedule_max_wait_ms=0)
+        runtime = GatewayRuntime(settings, {"fake": adapter}); await runtime.start()
+        session = await runtime.open_session("s", language="zh", options={})
+        await runtime.ingest(session, b"\x00\x00" * 4, force=True)
+        await runtime.scheduler.run_once("fake", force=True)
+        event = await runtime.event_queue("s").get()
+        await runtime.close()
+        return event
+    assert asyncio.run(scenario())["type"] == "partial"

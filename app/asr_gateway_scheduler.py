@@ -129,6 +129,19 @@ class GatewayScheduler:
         queue = self._queues[worker_id]
         if not queue:
             return []
+        cancelled = [
+            item for item in queue
+            if (item.session_id, item.generation) in self._cancelled_generations
+        ]
+        for item in cancelled:
+            queue.remove(item)
+            self._queued_samples -= item.sample_count
+            try:
+                await self.cleanup(item)
+            except Exception:
+                pass
+        if not queue:
+            return []
         adapter = self.adapters[worker_id]
         caps = adapter.capabilities
         queue.sort(key=lambda item: (item.deadline, item.enqueued_at, item.job_id))
@@ -169,7 +182,11 @@ class GatewayScheduler:
         for job, result in zip(batch, results):
             # Ownership/queue cleanup is deliberately complete before publication.
             self._queued_samples -= job.sample_count
-            await self.cleanup(job)
+            try:
+                await self.cleanup(job)
+            except Exception:
+                # A cleanup failure poisons this result; success is never visible.
+                continue
             if (job.session_id, job.generation) in self._cancelled_generations:
                 continue
             if result.generation != job.generation or result.job_sequence != job.job_sequence:

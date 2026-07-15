@@ -87,7 +87,12 @@ class GatewayRuntime:
             raise
         idle = asyncio.Event(); idle.set()
         self._contexts[session_id] = _SessionContext(
-            session, lease, ProtocolSession(sample_rate=16_000), asyncio.Queue(), idle
+            session, lease,
+            ProtocolSession(
+                sample_rate=16_000,
+                segment_local=adapter.capabilities.result_mode is ResultMode.REPLACEABLE_SEGMENT,
+            ),
+            asyncio.Queue(), idle,
         )
         return session
 
@@ -141,7 +146,7 @@ class GatewayRuntime:
         await ctx.idle.wait()
         result = await self.adapters[ctx.session.selected_worker_id].finish_segment(session_id)
         if result.text:
-            ctx.protocol.apply_result(ResultMode.CUMULATIVE_SNAPSHOT, text=ctx.protocol.state.confirmed_text + result.text)
+            self._apply_control_result(ctx, result.text)
         return ctx.protocol.segment()
 
     async def finish(self, session_id: str) -> dict[str, Any]:
@@ -151,7 +156,7 @@ class GatewayRuntime:
         await ctx.idle.wait()
         result = await self.adapters[ctx.session.selected_worker_id].finish_session(session_id)
         if result.text:
-            ctx.protocol.apply_result(ResultMode.CUMULATIVE_SNAPSHOT, text=ctx.protocol.state.confirmed_text + result.text)
+            self._apply_control_result(ctx, result.text)
         event = ctx.protocol.final()
         ctx.session.succeed()
         await self._release_session(session_id)
@@ -178,8 +183,7 @@ class GatewayRuntime:
         if ctx is None or ctx.session.generation != job.generation:
             return
         ctx.session.acknowledge(job.job_sequence, generation=job.generation)
-        if not self._schedule_next(ctx.session, force=ctx.session.finish_requested):
-            ctx.idle.set()
+        self._schedule_next(ctx.session, force=ctx.session.finish_requested)
         self._update_gauges()
 
     async def _publish_result(self, result: InferenceResult) -> None:
@@ -189,6 +193,7 @@ class GatewayRuntime:
         if result.error:
             ctx.session.fail()
             await ctx.events.put(ctx.protocol.error(RuntimeError(result.error)))
+            ctx.idle.set()
             return
         mode = self.adapters[result.worker_id].capabilities.result_mode
         events = ctx.protocol.apply_result(
@@ -198,6 +203,19 @@ class GatewayRuntime:
         )
         for event in events:
             await ctx.events.put(event)
+        if not ctx.session.in_flight and ctx.session.buffer.buffered_samples == 0:
+            ctx.idle.set()
+
+    def _apply_control_result(self, ctx: _SessionContext, text: str) -> None:
+        mode = self.adapters[ctx.session.selected_worker_id].capabilities.result_mode
+        if mode is ResultMode.REPLACEABLE_SEGMENT:
+            segment_id = ctx.protocol.state.active_segment_id or 0
+            ctx.protocol.apply_result(mode, text=text, segment_id=segment_id)
+        else:
+            ctx.protocol.apply_result(
+                ResultMode.CUMULATIVE_SNAPSHOT,
+                text=ctx.protocol.state.confirmed_text + text,
+            )
 
     def event_queue(self, session_id: str) -> asyncio.Queue[dict[str, Any]]:
         return self._contexts[session_id].events

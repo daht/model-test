@@ -111,3 +111,23 @@ def test_cleanup_completes_before_success_publication_and_stale_is_discarded():
     assert cleaned == ["ok-1", "ok-2"]
     assert published == ["ok-1"]
     assert snapshot["queued_samples"] == 0
+
+
+def test_cancellation_before_acceptance_never_submits_and_cleanup_failure_never_publishes():
+    async def scenario():
+        adapter = RecordingAdapter(capabilities()); adapter.release.set()
+        cleaned = []; published = []
+        async def cleanup(item):
+            cleaned.append(item.job_id)
+            if item.session_id == "bad": raise RuntimeError("cleanup broke")
+        async def publish(result): published.append(result.job_id)
+        scheduler = GatewayScheduler({"worker-1": adapter}, clock=FakeClock(), max_wait_seconds=0, max_ready_jobs=10, max_queued_samples=1000, cleanup=cleanup, publish=publish)
+        scheduler.enqueue(job("cancelled")); scheduler.cancel_session("cancelled", generation=1)
+        await scheduler.run_once("worker-1", force=True)
+        scheduler.enqueue(job("bad")); await scheduler.run_once("worker-1", force=True)
+        return adapter.calls, cleaned, published, scheduler.snapshot()
+    calls, cleaned, published, snapshot = asyncio.run(scenario())
+    assert calls == [[job("bad")]]
+    assert cleaned == ["cancelled-1", "bad-1"]
+    assert published == []
+    assert snapshot["queued_samples"] == 0

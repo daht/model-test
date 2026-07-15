@@ -211,6 +211,25 @@ def test_supported_asr_backend_stream_mode_pairs_pass(backend, stream_mode):
     assert (settings.asr_backend, settings.asr_stream_mode) == (backend, stream_mode)
 
 
+def test_qwen_vllm_stateful_uses_toolkit_checkpoint_not_hf_export():
+    settings = Settings(
+        _env_file=None,
+        asr_backend="qwen_vllm",
+        asr_stream_mode="stateful",
+        api_key=TEST_ONLY_LONG_API_KEY,
+    )
+    assert settings.asr_model_id == "Qwen/Qwen3-ASR-1.7B"
+
+    with pytest.raises(ValidationError, match="-hf export"):
+        Settings(
+            _env_file=None,
+            asr_backend="qwen_vllm",
+            asr_stream_mode="stateful",
+            asr_model_id="/custom/Qwen3-ASR-1.7B-hf",
+            api_key=TEST_ONLY_LONG_API_KEY,
+        )
+
+
 def test_rollover_must_exceed_model_chunk_and_transport_frame():
     with pytest.raises(ValidationError, match="rollover"):
         Settings(
