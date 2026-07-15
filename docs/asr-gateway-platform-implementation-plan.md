@@ -8,6 +8,11 @@
 
 **Tech Stack:** Python 3.12, FastAPI, asyncio, Pydantic, existing ASR transcript/VAD/coordinator code, pytest 9, deterministic asyncio barriers.
 
+**Outbound ownership clarification:** every established session uses one
+protocol lock, one ordered outbound envelope queue, and one sender task that
+alone writes events and closes the socket. Job metrics complete only after that
+sender successfully writes the job's last actual event.
+
 ---
 
 ## Execution contract

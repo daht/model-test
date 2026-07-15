@@ -5,18 +5,27 @@ import json
 import time
 import uuid
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import JSONResponse
 
 from app.asr_gateway_backends import BackendLease, BackendRegistry, ResultMode, VadMode
-from app.asr_gateway_metrics import GatewayMetrics, JobTimeline, STAGES, gateway_readiness
+from app.asr_gateway_metrics import GatewayMetrics, JobTimeline, gateway_readiness
 from app.asr_gateway_protocol import ProtocolSession, StartCommand, parse_client_command
 from app.asr_gateway_scheduler import BatchKey, GatewayScheduler, InferenceJob, InferenceResult, StaleResultError
 from app.asr_gateway_sessions import GatewaySession, SessionManager, TerminalState
 from app.config import Settings, get_settings
+
+
+@dataclass(frozen=True)
+class OutboundEvent:
+    payload: dict[str, Any] | None
+    job_id: str | None = None
+    completes_timeline: bool = False
+    terminal: bool = False
+    close_code: int | None = None
 
 
 @dataclass
@@ -24,13 +33,15 @@ class _SessionContext:
     session: GatewaySession
     lease: BackendLease
     protocol: ProtocolSession
-    events: asyncio.Queue[dict[str, Any]]
+    events: asyncio.Queue[OutboundEvent]
     idle: asyncio.Event
     vad: Any | None = None
     endpoint_pending: bool = False
     utterance_samples: int = 0
     opened_at: float = 0.0
     first_undecoded_at: float | None = None
+    protocol_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    lease_released: bool = False
 
 
 class GatewayRuntime:
@@ -233,11 +244,16 @@ class GatewayRuntime:
         ctx = self._contexts[session_id]
         await self.ingest(ctx.session, b"", force=True)
         await ctx.idle.wait()
-        result = await self.adapters[ctx.session.selected_worker_id].finish_segment(session_id)
-        if result.text:
-            self._apply_control_result(ctx, result.text)
-        ctx.utterance_samples = 0
-        return ctx.protocol.segment()
+        async with ctx.protocol_lock:
+            result = await self.adapters[ctx.session.selected_worker_id].finish_segment(session_id)
+            events = self._apply_control_result(ctx, result.text) if result.text else []
+            events.extend(ctx.protocol.segment())
+            ctx.utterance_samples = 0
+            await self._enqueue_events(ctx, events)
+            return events
+
+    async def enqueue_segment(self, session_id: str) -> None:
+        await self.segment(session_id)
 
     async def finish(self, session_id: str) -> dict[str, Any]:
         ctx = self._contexts[session_id]
@@ -250,13 +266,76 @@ class GatewayRuntime:
         ctx.session.request_finish()
         await self.ingest(ctx.session, b"", force=True)
         await ctx.idle.wait()
-        result = await self.adapters[ctx.session.selected_worker_id].finish_session(session_id)
-        if result.text:
-            self._apply_control_result(ctx, result.text)
-        event = ctx.protocol.final()
-        ctx.session.succeed()
-        await self._release_session(session_id)
-        return event
+        async with ctx.protocol_lock:
+            result = await self.adapters[ctx.session.selected_worker_id].finish_session(session_id)
+            events = self._apply_control_result(ctx, result.text) if result.text else []
+            event = ctx.protocol.final()
+            events.append(event)
+            ctx.session.succeed()
+            await ctx.lease.release()
+            ctx.lease_released = True
+            await self._enqueue_events(
+                ctx,
+                events,
+                terminal=True,
+                close_code=1000,
+            )
+            return event
+
+    async def enqueue_finish(self, session_id: str) -> None:
+        await self.finish(session_id)
+
+    async def enqueue_ready(self, session_id: str) -> None:
+        ctx = self._contexts[session_id]
+        async with ctx.protocol_lock:
+            await self._enqueue_events(
+                ctx,
+                [
+                    ctx.protocol.ready(
+                        session_id=session_id,
+                        worker_id=ctx.session.selected_worker_id,
+                    )
+                ],
+            )
+
+    async def enqueue_error(
+        self,
+        session_id: str,
+        exc: BaseException,
+        *,
+        code: str = "backend_error",
+        close_code: int = 1011,
+    ) -> None:
+        ctx = self._contexts[session_id]
+        async with ctx.protocol_lock:
+            if ctx.protocol.terminal:
+                return
+            ctx.session.fail()
+            await self._enqueue_events(
+                ctx,
+                [ctx.protocol.error(exc, code=code)],
+                terminal=True,
+                close_code=close_code,
+            )
+
+    async def enqueue_close(self, session_id: str, *, close_code: int = 1000) -> None:
+        ctx = self._contexts[session_id]
+        await ctx.events.put(
+            OutboundEvent(None, terminal=True, close_code=close_code)
+        )
+
+    async def enqueue_abort(self, session_id: str) -> None:
+        ctx = self._contexts[session_id]
+        self.scheduler.cancel_session(session_id, generation=ctx.session.generation)
+        await self.scheduler.wait_session_safe(
+            session_id, generation=ctx.session.generation
+        )
+        self.metrics.cancellations += 1
+        ctx.session.abort()
+        if ctx.vad is not None:
+            ctx.vad.reset()
+        await self.adapters[ctx.session.selected_worker_id].abort_session(session_id)
+        await self.enqueue_close(session_id, close_code=1000)
 
     async def abort(self, session_id: str) -> None:
         ctx = self._contexts.get(session_id)
@@ -276,7 +355,9 @@ class GatewayRuntime:
         ctx = self._contexts.pop(session_id, None)
         self.sessions.close(session_id)
         if ctx is not None:
-            await ctx.lease.release()
+            if not ctx.lease_released:
+                await ctx.lease.release()
+                ctx.lease_released = True
             if not any(
                 item.session.selected_worker_id == ctx.session.selected_worker_id
                 for item in self._contexts.values()
@@ -336,16 +417,43 @@ class GatewayRuntime:
             timeline.mark(stage, now)
             self._timelines[job.job_id] = (timeline, len(jobs), capacity)
 
-    def _complete_timeline(self, job_id: str) -> None:
+    def _mark_result_applied(self, job_id: str) -> None:
+        record = self._timelines.get(job_id)
+        if record is None:
+            return
+        timeline, _, _ = record
+        now = self.scheduler.clock()
+        if "result_applied" not in timeline.stages:
+            timeline.mark("result_applied", now)
+
+    def mark_event_sent(self, job_id: str) -> None:
         record = self._timelines.pop(job_id, None)
         if record is None:
             return
         timeline, batch_size, capacity = record
-        now = self.scheduler.clock()
-        for stage in STAGES:
-            if stage not in timeline.stages:
-                timeline.mark(stage, now)
+        timeline.mark("event_sent", self.scheduler.clock())
         self.metrics.complete(timeline, batch_size=batch_size, batch_capacity=capacity)
+
+    async def _enqueue_events(
+        self,
+        ctx: _SessionContext,
+        events: list[dict[str, Any]],
+        *,
+        job_id: str | None = None,
+        terminal: bool = False,
+        close_code: int | None = None,
+    ) -> None:
+        for index, event in enumerate(events):
+            last = index == len(events) - 1
+            await ctx.events.put(
+                OutboundEvent(
+                    event,
+                    job_id=job_id,
+                    completes_timeline=bool(job_id and last),
+                    terminal=terminal and last,
+                    close_code=close_code if terminal and last else None,
+                )
+            )
 
     async def _publish_result(self, result: InferenceResult) -> None:
         try:
@@ -355,27 +463,46 @@ class GatewayRuntime:
             if ctx is None:
                 return
             self.metrics.conflicts += 1
-            ctx.session.fail()
-            if not ctx.protocol.terminal:
-                await ctx.events.put(ctx.protocol.error(exc, code="result_conflict"))
-            ctx.idle.set()
-            self._complete_timeline(result.job_id)
+            async with ctx.protocol_lock:
+                ctx.session.fail()
+                if not ctx.protocol.terminal:
+                    event = ctx.protocol.error(exc, code="result_conflict")
+                    self._mark_result_applied(result.job_id)
+                    await self._enqueue_events(
+                        ctx,
+                        [event],
+                        job_id=result.job_id,
+                        terminal=True,
+                        close_code=1011,
+                    )
+                ctx.idle.set()
 
     async def _apply_result(self, result: InferenceResult) -> None:
         ctx = self._contexts.get(result.session_id)
         if ctx is None:
             return
+        async with ctx.protocol_lock:
+            await self._apply_result_locked(ctx, result)
+
+    async def _apply_result_locked(
+        self,
+        ctx: _SessionContext,
+        result: InferenceResult,
+    ) -> None:
         now = self.scheduler.clock()
         record = self._timelines.get(result.job_id)
         received_at = record[0].stages.get("audio_received", now) if record else now
         if now - received_at > self.settings.asr_max_connection_lag_seconds:
             self.metrics.failures += 1
             ctx.session.fail()
-            await ctx.events.put(
-                ctx.protocol.error(TimeoutError("connection lag exceeded"), code="audio_lag")
+            event = ctx.protocol.error(
+                TimeoutError("connection lag exceeded"), code="audio_lag"
+            )
+            self._mark_result_applied(result.job_id)
+            await self._enqueue_events(
+                ctx, [event], job_id=result.job_id, terminal=True, close_code=1011
             )
             ctx.idle.set()
-            self._complete_timeline(result.job_id)
             return
         if (
             ctx.first_undecoded_at is not None
@@ -383,17 +510,23 @@ class GatewayRuntime:
         ):
             self.metrics.failures += 1
             ctx.session.fail()
-            await ctx.events.put(
-                ctx.protocol.error(TimeoutError("undecoded audio age exceeded"), code="audio_lag")
+            event = ctx.protocol.error(
+                TimeoutError("undecoded audio age exceeded"), code="audio_lag"
+            )
+            self._mark_result_applied(result.job_id)
+            await self._enqueue_events(
+                ctx, [event], job_id=result.job_id, terminal=True, close_code=1011
             )
             ctx.idle.set()
-            self._complete_timeline(result.job_id)
             return
         if result.error:
             ctx.session.fail()
-            await ctx.events.put(ctx.protocol.error(RuntimeError(result.error)))
+            event = ctx.protocol.error(RuntimeError(result.error))
+            self._mark_result_applied(result.job_id)
+            await self._enqueue_events(
+                ctx, [event], job_id=result.job_id, terminal=True, close_code=1011
+            )
             ctx.idle.set()
-            self._complete_timeline(result.job_id)
             return
         mode = self.adapters[result.worker_id].capabilities.result_mode
         text = result.text
@@ -408,18 +541,16 @@ class GatewayRuntime:
             tail_text=result.tail_text, decoded_samples=result.end_sample - result.start_sample,
             segment_id=result.job_sequence,
         )
-        for event in events:
-            await ctx.events.put(event)
         ctx.utterance_samples += result.end_sample - result.start_sample
         caps = self.adapters[result.worker_id].capabilities
         continuation_ready = False
         if ctx.endpoint_pending or ctx.utterance_samples >= caps.max_input_samples:
             control = await self.adapters[result.worker_id].finish_segment(result.session_id)
             if control.text:
-                self._apply_control_result(ctx, control.text)
-            for event in ctx.protocol.segment():
-                await ctx.events.put(event)
+                events.extend(self._apply_control_result(ctx, control.text))
+            events.extend(ctx.protocol.segment())
             ctx.utterance_samples = 0
+            continuation_ready = ctx.session.buffer.buffered_samples > 0
             if ctx.endpoint_pending and ctx.vad is not None:
                 ctx.endpoint_pending = False
                 decision = ctx.vad.endpoint_finalized()
@@ -441,20 +572,28 @@ class GatewayRuntime:
         ):
             ctx.idle.set()
             ctx.first_undecoded_at = None
-        self._complete_timeline(result.job_id)
+        self._mark_result_applied(result.job_id)
+        if events:
+            await self._enqueue_events(ctx, events, job_id=result.job_id)
+        else:
+            # No egress occurred, so this job is intentionally not completed.
+            self._timelines.pop(result.job_id, None)
 
-    def _apply_control_result(self, ctx: _SessionContext, text: str) -> None:
+    def _apply_control_result(
+        self,
+        ctx: _SessionContext,
+        text: str,
+    ) -> list[dict[str, Any]]:
         mode = self.adapters[ctx.session.selected_worker_id].capabilities.result_mode
         if mode is ResultMode.REPLACEABLE_SEGMENT:
             segment_id = ctx.protocol.state.active_segment_id or 0
-            ctx.protocol.apply_result(mode, text=text, segment_id=segment_id)
-        else:
-            ctx.protocol.apply_result(
+            return ctx.protocol.apply_result(mode, text=text, segment_id=segment_id)
+        return ctx.protocol.apply_result(
                 ResultMode.CUMULATIVE_SNAPSHOT,
                 text=ctx.protocol.state.confirmed_text + text,
             )
 
-    def event_queue(self, session_id: str) -> asyncio.Queue[dict[str, Any]]:
+    def event_queue(self, session_id: str) -> asyncio.Queue[OutboundEvent]:
         return self._contexts[session_id].events
 
     def _update_gauges(self) -> None:
@@ -480,8 +619,31 @@ def _default_runtime() -> GatewayRuntime:
         worker_id="local", model_id=settings.asr_model_id,
         model_revision=settings.asr_model_name, gpu_id=settings.asr_device,
         session_capacity=settings.asr_max_active_streams,
+        preferred_chunk_samples=round(
+            settings.asr_stream_chunk_seconds * 16_000
+        ),
+        max_input_samples=round(
+            settings.asr_max_utterance_seconds * 16_000
+        ),
     )
     return GatewayRuntime(settings, {"local": adapter})
+
+
+async def send_outbound_events(
+    runtime: GatewayRuntime,
+    ctx: _SessionContext,
+    websocket: WebSocket,
+) -> None:
+    while True:
+        envelope = await ctx.events.get()
+        if envelope.payload is not None:
+            await websocket.send_json(envelope.payload)
+        if envelope.completes_timeline and envelope.job_id is not None:
+            runtime.mark_event_sent(envelope.job_id)
+        if envelope.terminal:
+            await websocket.close(code=envelope.close_code or 1000)
+            await runtime._release_session(ctx.session.session_id)
+            return
 
 
 def create_app(*, runtime: GatewayRuntime | None = None) -> FastAPI:
@@ -541,8 +703,8 @@ def create_app(*, runtime: GatewayRuntime | None = None) -> FastAPI:
         await websocket.accept()
         session_id = uuid.uuid4().hex
         protocol: ProtocolSession | None = None
+        ctx: _SessionContext | None = None
         sender: asyncio.Task[None] | None = None
-        terminal_sent = False
         try:
             try:
                 message = await asyncio.wait_for(websocket.receive_json(), timeout=runtime_value.settings.asr_start_timeout_seconds)
@@ -550,29 +712,23 @@ def create_app(*, runtime: GatewayRuntime | None = None) -> FastAPI:
                 if not isinstance(command, StartCommand):
                     raise ValueError("first command must be start")
                 session = await runtime_value.open_session(session_id, language=command.language, options=command.options)
-                protocol = runtime_value._contexts[session_id].protocol
+                ctx = runtime_value._contexts[session_id]
+                protocol = ctx.protocol
             except RuntimeError as exc:
                 if "capacity" in str(exc):
                     event = ProtocolSession(sample_rate=16000).error(exc, code="overloaded")
-                    await websocket.send_json(event); terminal_sent = True
+                    await websocket.send_json(event)
                     await websocket.close(code=1013); return
                 raise
             except (ValueError, TimeoutError) as exc:
                 event = ProtocolSession(sample_rate=16000).error(exc, code="invalid_start")
-                await websocket.send_json(event); terminal_sent = True
+                await websocket.send_json(event)
                 await websocket.close(code=1008); return
 
-            await websocket.send_json(protocol.ready(session_id=session_id, worker_id=session.selected_worker_id))
-
-            async def send_results() -> None:
-                queue = runtime_value.event_queue(session_id)
-                while True:
-                    event = await queue.get()
-                    await websocket.send_json(event)
-                    if event["type"] in {"final", "error"}:
-                        return
-
-            sender = asyncio.create_task(send_results())
+            sender = asyncio.create_task(
+                send_outbound_events(runtime_value, ctx, websocket)
+            )
+            await runtime_value.enqueue_ready(session_id)
             while True:
                 try:
                     incoming = await asyncio.wait_for(
@@ -580,16 +736,18 @@ def create_app(*, runtime: GatewayRuntime | None = None) -> FastAPI:
                         timeout=runtime_value.settings.asr_idle_timeout_seconds,
                     )
                 except TimeoutError as exc:
-                    await websocket.send_json(protocol.error(exc, code="idle_timeout"))
-                    terminal_sent = True
-                    await websocket.close(code=1011)
+                    await runtime_value.enqueue_error(
+                        session_id, exc, code="idle_timeout", close_code=1011
+                    )
+                    await sender
                     return
                 try:
                     runtime_value.check_deadlines(session_id)
                 except TimeoutError as exc:
-                    await websocket.send_json(protocol.error(exc, code="session_timeout"))
-                    terminal_sent = True
-                    await websocket.close(code=1011)
+                    await runtime_value.enqueue_error(
+                        session_id, exc, code="session_timeout", close_code=1011
+                    )
+                    await sender
                     return
                 if incoming["type"] == "websocket.disconnect":
                     raise WebSocketDisconnect(incoming.get("code", 1000))
@@ -597,38 +755,46 @@ def create_app(*, runtime: GatewayRuntime | None = None) -> FastAPI:
                     try:
                         await runtime_value.ingest(session, incoming["bytes"])
                     except (ValueError, BufferError) as exc:
-                        await websocket.send_json(protocol.error(exc, code="invalid_audio")); terminal_sent = True
-                        await websocket.close(code=1008); return
+                        await runtime_value.enqueue_error(
+                            session_id, exc, code="invalid_audio", close_code=1008
+                        )
+                        await sender; return
                     except TimeoutError as exc:
-                        await websocket.send_json(protocol.error(exc, code="audio_lag")); terminal_sent = True
-                        await websocket.close(code=1011); return
+                        await runtime_value.enqueue_error(
+                            session_id, exc, code="audio_lag", close_code=1011
+                        )
+                        await sender; return
                     except RuntimeError as exc:
-                        await websocket.send_json(protocol.error(exc, code="audio_limit")); terminal_sent = True
-                        await websocket.close(code=1008); return
+                        await runtime_value.enqueue_error(
+                            session_id, exc, code="audio_limit", close_code=1008
+                        )
+                        await sender; return
                     continue
                 try:
                     control = parse_client_command(json.loads(incoming.get("text") or "{}"))
                 except (ValueError, json.JSONDecodeError) as exc:
-                    await websocket.send_json(protocol.error(exc, code="invalid_command")); terminal_sent = True
-                    await websocket.close(code=1008); return
+                    await runtime_value.enqueue_error(
+                        session_id, exc, code="invalid_command", close_code=1008
+                    )
+                    await sender; return
                 if control.type == "segment":
-                    for event in await runtime_value.segment(session_id):
-                        await websocket.send_json(event)
+                    await runtime_value.enqueue_segment(session_id)
                 elif control.type == "abort":
-                    await runtime_value.abort(session_id)
-                    await websocket.close(code=1000); return
+                    await runtime_value.enqueue_abort(session_id)
+                    await sender; return
                 elif control.type == "finish":
-                    event = await runtime_value.finish(session_id)
-                    await websocket.send_json(event); terminal_sent = True
-                    await websocket.close(code=1000); return
+                    await runtime_value.enqueue_finish(session_id)
+                    await sender; return
                 else:
                     raise ValueError("start may only be sent once")
         except (WebSocketDisconnect, TimeoutError):
             return
         except Exception as exc:
-            if protocol is not None and not protocol.terminal and not terminal_sent:
+            if ctx is not None and protocol is not None and not protocol.terminal:
                 with suppress(Exception):
-                    await websocket.send_json(protocol.error(exc))
+                    await runtime_value.enqueue_error(session_id, exc)
+                    if sender is not None:
+                        await sender
         finally:
             if sender is not None:
                 sender.cancel()

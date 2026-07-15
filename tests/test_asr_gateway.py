@@ -4,10 +4,11 @@ from dataclasses import replace
 import pytest
 from fastapi.testclient import TestClient
 
-from app.asr_gateway import GatewayRuntime, create_app
+from app.asr_gateway import GatewayRuntime, OutboundEvent, _default_runtime, create_app, send_outbound_events
 from app.asr_gateway_backends import DispatchMode, ResultMode, VadMode
 from app.asr_gateway_scheduler import InferenceResult
 from app.config import Settings
+from scripts import stream_asr_client
 from tests.test_asr_gateway_backends import capabilities
 
 
@@ -58,11 +59,14 @@ def test_websocket_auth_start_audio_segment_finish_and_close_1000():
             ws.send_bytes(b"\x00\x00" * 16)
             assert ws.receive_json()["type"] == "partial"
             ws.send_json({"type":"segment"})
-            assert ws.receive_json()["type"] == "sentence_final"
-            assert ws.receive_json()["type"] == "partial"
+            segment_events = [ws.receive_json() for _ in range(3)]
+            assert [event["type"] for event in segment_events] == [
+                "partial", "sentence_final", "partial"
+            ]
             ws.send_json({"type":"finish"})
-            event = ws.receive_json()
-            assert event["type"] == "final"
+            finish_events = [ws.receive_json() for _ in range(2)]
+            assert [event["type"] for event in finish_events] == ["partial", "final"]
+            assert [event["sequence"] for event in segment_events + finish_events] == [3, 4, 5, 6, 7]
         assert adapter.sessions == set()
 
 
@@ -138,7 +142,7 @@ def test_runtime_uses_segment_local_protocol_for_replaceable_adapter_results():
         event = await runtime.event_queue("s").get()
         await runtime.close()
         return event
-    assert asyncio.run(scenario())["type"] == "partial"
+    assert asyncio.run(scenario()).payload["type"] == "partial"
 
 
 def test_runtime_rejects_unsupported_language_before_backend_session_open():
@@ -245,7 +249,7 @@ def test_runtime_submit_failure_clears_worker_readiness_and_fails_session():
         await runtime.abort("s"); await runtime.close()
         return event, snapshot
     event, snapshot = asyncio.run(scenario())
-    assert event["type"] == "error"
+    assert event.payload["type"] == "error"
     assert snapshot["ready"] is False
 
 
@@ -257,12 +261,16 @@ def test_runtime_records_all_job_timeline_stages_and_counters():
         session = await runtime.open_session("s", language="zh", options={})
         await runtime.ingest(session, b"\x00\x00" * 4, force=True)
         await runtime.scheduler.run_once("fake", force=True)
+        before = runtime.metrics.snapshot()["completed_jobs"]
+        envelope = await runtime.event_queue("s").get()
+        runtime.mark_event_sent(envelope.job_id)
         snapshot = runtime.metrics.snapshot()
         await runtime.abort("s")
         cancelled = runtime.metrics.snapshot()
         await runtime.close()
-        return snapshot, cancelled
-    snapshot, cancelled = asyncio.run(scenario())
+        return before, snapshot, cancelled
+    before, snapshot, cancelled = asyncio.run(scenario())
+    assert before == 0
     assert snapshot["completed_jobs"] == 1
     assert set(snapshot["latency"]) == {"chunk_wait_seconds", "batch_wait_seconds", "worker_wait_seconds", "inference_seconds", "egress_seconds"}
     assert cancelled["cancellations"] == 1
@@ -309,3 +317,111 @@ def test_drain_stops_new_routes_and_waits_for_sticky_session_release():
         await runtime.close()
         return snapshot
     assert asyncio.run(scenario())["workers"] == {}
+
+
+def test_single_outbound_owner_preserves_continuous_terminal_sequence():
+    async def scenario():
+        adapter = FakeAdapter()
+        settings = Settings(model_backend="mock", asr_backend="mock", asr_stream_mode="stateful", api_key="test-key", asr_gateway_default_backend="fake", asr_gateway_schedule_max_wait_ms=0)
+        runtime = GatewayRuntime(settings, {"fake": adapter}); await runtime.start()
+        session = await runtime.open_session("s", language="zh", options={})
+        await runtime.enqueue_ready("s")
+        await runtime.ingest(session, b"\x00\x00" * 4, force=True)
+        await runtime.scheduler.run_once("fake", force=True)
+        await runtime.enqueue_segment("s")
+        await runtime.enqueue_finish("s")
+        envelopes = []
+        while not runtime.event_queue("s").empty(): envelopes.append(await runtime.event_queue("s").get())
+        await runtime.abort("s"); await runtime.close()
+        return envelopes
+    envelopes = asyncio.run(scenario())
+    payloads = [envelope.payload for envelope in envelopes]
+    tracker = stream_asr_client.SequenceTracker()
+    for expected, payload in enumerate(payloads, start=1):
+        assert payload["sequence"] == expected
+        assert tracker.observe(payload) is None
+    assert payloads[-1]["type"] == "final"
+    assert envelopes[-1].terminal is True
+
+
+def test_sender_backpressure_keeps_partial_before_final_and_metrics_uncompleted():
+    class WebSocket:
+        def __init__(self):
+            self.entered = asyncio.Event(); self.release = asyncio.Event(); self.sent = []; self.closed = []
+        async def send_json(self, payload):
+            self.sent.append(payload); self.entered.set(); await self.release.wait()
+        async def close(self, code): self.closed.append(code)
+
+    async def scenario():
+        adapter = FakeAdapter()
+        settings = Settings(model_backend="mock", asr_backend="mock", asr_stream_mode="stateful", api_key="test-key", asr_gateway_default_backend="fake", asr_gateway_schedule_max_wait_ms=0)
+        runtime = GatewayRuntime(settings, {"fake": adapter}); await runtime.start()
+        session = await runtime.open_session("s", language="zh", options={})
+        await runtime.ingest(session, b"\x00\x00" * 4, force=True)
+        await runtime.scheduler.run_once("fake", force=True)
+        ctx = runtime._contexts["s"]
+        async with ctx.protocol_lock:
+            final = ctx.protocol.final()
+            await ctx.events.put(OutboundEvent(final, terminal=True, close_code=1000))
+        websocket = WebSocket()
+        sender = asyncio.create_task(send_outbound_events(runtime, ctx, websocket))
+        await websocket.entered.wait()
+        before = runtime.metrics.snapshot()["completed_jobs"]
+        websocket.release.set(); await sender
+        after = runtime.metrics.snapshot()["completed_jobs"]
+        await runtime.abort("s"); await runtime.close()
+        return websocket.sent, websocket.closed, before, after
+    sent, closed, before, after = asyncio.run(scenario())
+    assert [event["type"] for event in sent] == ["partial", "final"]
+    assert closed == [1000]
+    assert before == 0 and after == 1
+
+
+def test_sender_failure_does_not_claim_event_sent_or_complete_job():
+    class BrokenWebSocket:
+        async def send_json(self, payload): raise RuntimeError("disconnected")
+        async def close(self, code): raise AssertionError("close must not follow failed send")
+
+    async def scenario():
+        adapter = FakeAdapter()
+        settings = Settings(model_backend="mock", asr_backend="mock", asr_stream_mode="stateful", api_key="test-key", asr_gateway_default_backend="fake", asr_gateway_schedule_max_wait_ms=0)
+        runtime = GatewayRuntime(settings, {"fake": adapter}); await runtime.start()
+        session = await runtime.open_session("s", language="zh", options={})
+        await runtime.ingest(session, b"\x00\x00" * 4, force=True)
+        await runtime.scheduler.run_once("fake", force=True)
+        with pytest.raises(RuntimeError, match="disconnected"):
+            await send_outbound_events(runtime, runtime._contexts["s"], BrokenWebSocket())
+        completed = runtime.metrics.snapshot()["completed_jobs"]
+        await runtime.abort("s"); await runtime.close()
+        return completed
+    assert asyncio.run(scenario()) == 0
+
+
+def test_default_runtime_uses_configured_chunk_and_maximum_boundaries(monkeypatch):
+    settings = Settings(
+        model_backend="mock", asr_backend="mock", asr_stream_mode="stateful",
+        api_key="test-key", asr_stream_chunk_seconds=2.0,
+        asr_max_utterance_seconds=20.0,
+    )
+    monkeypatch.setattr("app.asr_gateway.get_settings", lambda: settings)
+    runtime = _default_runtime()
+    caps = runtime.adapters["local"].capabilities
+    assert caps.preferred_chunk_samples == 32_000
+    assert caps.max_input_samples == 320_000
+
+
+def test_twenty_second_boundary_rolls_state_before_one_sample_remainder():
+    async def scenario():
+        adapter = FakeAdapter(); adapter.capabilities = replace(adapter.capabilities, preferred_chunk_samples=32_000, max_input_samples=320_000, max_batch_samples=320_000)
+        order = []; original = adapter.submit
+        async def submit(jobs): order.append(("submit", jobs[0].sample_count)); return await original(jobs)
+        async def segment(session_id): order.append(("rollover", session_id)); return type("R", (), {"text":"", "tail_text":""})()
+        adapter.submit = submit; adapter.finish_segment = segment
+        settings = Settings(model_backend="mock", asr_backend="mock", asr_stream_mode="stateful", api_key="test-key", asr_gateway_default_backend="fake", asr_gateway_schedule_max_wait_ms=0, asr_gateway_max_session_buffer_seconds=21, asr_gateway_max_queued_audio_seconds=22)
+        runtime = GatewayRuntime(settings, {"fake":adapter}); await runtime.start()
+        session = await runtime.open_session("s", language="zh", options={})
+        await runtime.ingest(session, b"\x00\x00" * 320_001, force=True)
+        await runtime.scheduler.run_once("fake", force=True); await runtime.scheduler.run_once("fake", force=True)
+        await runtime.abort("s"); await runtime.close()
+        return order
+    assert asyncio.run(scenario()) == [("submit",320_000), ("rollover","s"), ("submit",1)]

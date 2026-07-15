@@ -22,6 +22,7 @@ class LocalCoordinatorAdapter:
         model_revision: str,
         gpu_id: str,
         session_capacity: int = 2,
+        preferred_chunk_samples: int = 24_000,
         max_input_samples: int = 480_000,
         vad_mode: VadMode = VadMode.GATEWAY,
     ) -> None:
@@ -35,7 +36,7 @@ class LocalCoordinatorAdapter:
             languages=("auto", "zh", "ja", "en"), tasks=("transcribe",),
             streaming_mode=StreamingMode.STATEFUL, dispatch_mode=DispatchMode.SINGLE,
             vad_mode=vad_mode, result_mode=ResultMode.REPLACEABLE_SEGMENT,
-            preferred_chunk_samples=24_000, max_input_samples=max_input_samples,
+            preferred_chunk_samples=preferred_chunk_samples, max_input_samples=max_input_samples,
             max_batch_items=1, max_batch_samples=max_input_samples, max_in_flight=1,
             session_capacity=session_capacity, retry_safe=False, warmed=False,
             backend_id="local",

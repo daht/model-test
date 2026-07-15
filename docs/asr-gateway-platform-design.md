@@ -74,6 +74,12 @@ metrics.
 
 The receive loop validates and appends audio without waiting for each inference
 call. A separate result path publishes events in order. All queues are bounded.
+Each live session has exactly one ordered outbound queue and one sender task.
+Protocol mutation is serialized by the session lock; inference, segment,
+finish, final, and terminal error paths enqueue envelopes through that same
+queue. Only the sender calls `send_json` or closes the established socket, so a
+pending partial cannot be overtaken by control output and no event follows a
+terminal final or error.
 
 ## 2. Session Manager
 
@@ -241,6 +247,10 @@ accepted sample ownership.
 Every job records monotonic times for audio_received, chunk_ready,
 scheduler_enqueued, scheduler_dispatched, worker_accepted, inference_started,
 inference_completed, result_applied, and event_sent.
+`result_applied` is recorded only after locked protocol-state application.
+`event_sent` is recorded by the outbound owner only after the last real event
+for that job is successfully written; disconnected or queued-but-unsent events
+do not count as completed jobs.
 
 Metrics include active sessions, buffered and queued audio, ready depth, batch
 size and fill ratio, batch wait, worker wait, inference latency, decoded audio,
