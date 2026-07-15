@@ -519,10 +519,13 @@ class ASRInferenceCoordinator:
             job = self._jobs.get()
             self._release_queue_slot(job)
             job_succeeded = False
+            job_error: BaseException | None = None
+            started_error: BaseException | None = None
             try:
                 if job.action == "shutdown":
                     job.started.set_result(None)
-                    job.result.set_result(None)
+                    result = None
+                    job_succeeded = True
                     return
 
                 if self._job_expired_before_start(job):
@@ -576,17 +579,11 @@ class ASRInferenceCoordinator:
                 )
                 job_succeeded = True
             except Exception as exc:
-                if not job.started.done():
-                    job.started.set_result(None)
-                if not job.result.done():
-                    self._release_session_reservation(job)
-                    job.result.set_exception(exc)
+                job_error = exc
             except BaseException:
                 worker_error = ASRNotReady("ASR owner worker stopped unexpectedly")
-                if not job.started.done():
-                    job.started.set_exception(worker_error)
-                if not job.result.done():
-                    job.result.set_exception(worker_error)
+                job_error = worker_error
+                started_error = worker_error
                 raise
             finally:
                 cleanup_error: BaseException | None = None
@@ -606,7 +603,15 @@ class ASRInferenceCoordinator:
                     if not job.result.done():
                         job.result.set_exception(worker_error)
                     raise cleanup_error
-                if job_succeeded and not job.result.done():
+                if job_error is not None:
+                    if not job.started.done():
+                        if started_error is not None:
+                            job.started.set_exception(started_error)
+                        else:
+                            job.started.set_result(None)
+                    if not job.result.done():
+                        job.result.set_exception(job_error)
+                elif job_succeeded and not job.result.done():
                     job.result.set_result(result)
 
     def _job_expired_before_start(self, job: _Job) -> bool:

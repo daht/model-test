@@ -199,11 +199,22 @@ def test_failed_stream_create_releases_capacity_reservation(create_method, job_a
     async def scenario():
         coordinator, _records, _holder = make_coordinator(
             asr_max_active_streams=1,
+            asr_stream_inference_timeout_seconds=1.0,
         )
         await coordinator.start()
         create = getattr(coordinator, create_method)
         original_execute = coordinator._execute_job
         fail_next_create = True
+        submitted_job = {}
+        original_new_job = coordinator._new_job
+
+        def capture_job(*args, **kwargs):
+            job = original_new_job(*args, **kwargs)
+            if job.action == job_action and "job" not in submitted_job:
+                submitted_job["job"] = job
+            return job
+
+        coordinator._new_job = capture_job
 
         def fail_first_create(transcriber, sessions, job):
             nonlocal fail_next_create
@@ -213,15 +224,41 @@ def test_failed_stream_create_releases_capacity_reservation(create_method, job_a
             return original_execute(transcriber, sessions, job)
 
         coordinator._execute_job = fail_first_create
+        cleanup_started = threading.Event()
+        release_cleanup = threading.Event()
+        original_cleanup = coordinator._cleanup_poisoned_session
+
+        def block_failed_create_cleanup(sessions, session_id):
+            if session_id == submitted_job["job"].session_id:
+                cleanup_started.set()
+                assert release_cleanup.wait(1)
+            original_cleanup(sessions, session_id)
+
+        coordinator._cleanup_poisoned_session = block_failed_create_cleanup
+        failed_create = asyncio.create_task(create(None))
+        assert await asyncio.to_thread(cleanup_started.wait, 1)
+        try:
+            result_published_during_cleanup = submitted_job["job"].result.done()
+            reservation_held_during_cleanup = (
+                submitted_job["job"].session_id
+                in coordinator._stream_reservations
+            )
+        finally:
+            release_cleanup.set()
+
         with pytest.raises(RuntimeError, match="fake create failure"):
-            await create(None)
+            await failed_create
 
         session_id = await create(None)
         assert coordinator.snapshot().active_streams == 1
         await coordinator.abort_stream(session_id)
         await coordinator.stop()
+        return result_published_during_cleanup, reservation_held_during_cleanup
 
-    asyncio.run(scenario())
+    result_published, reservation_held = asyncio.run(scenario())
+
+    assert result_published is False
+    assert reservation_held is True
 
 
 @pytest.mark.parametrize("create_method", ["create_stream", "create_chunked_stream"])
