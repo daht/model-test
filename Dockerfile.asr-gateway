@@ -1,0 +1,18 @@
+# syntax=docker/dockerfile:1.7
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+COPY requirements-asr-gateway.txt ./
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m pip install --upgrade pip \
+    && python -m pip install -r requirements-asr-gateway.txt
+
+COPY app ./app
+
+EXPOSE 8000
+
+CMD ["python", "-m", "uvicorn", "app.asr_gateway:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

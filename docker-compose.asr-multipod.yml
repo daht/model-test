@@ -1,7 +1,4 @@
 x-asr-backend: &asr-backend
-  build:
-    context: .
-    dockerfile: Dockerfile.asr
   image: qwen-asr-api:latest
   command:
     - python
@@ -42,15 +39,22 @@ x-asr-backend: &asr-backend
 services:
   qwen-asr-backend-1:
     <<: *asr-backend
+    build:
+      context: .
+      dockerfile: Dockerfile.asr
 
   qwen-asr-backend-2:
     <<: *asr-backend
+    pull_policy: never
+    depends_on:
+      qwen-asr-backend-1:
+        condition: service_healthy
 
   asr-gateway:
     build:
       context: .
-      dockerfile: Dockerfile.asr
-    image: qwen-asr-api:latest
+      dockerfile: Dockerfile.asr-gateway
+    image: qwen-asr-gateway:latest
     command:
       - python
       - -m

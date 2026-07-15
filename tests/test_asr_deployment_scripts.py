@@ -237,6 +237,20 @@ def test_asr_runtime_and_silero_asset_supply_chain_are_fully_pinned():
     assert "MIT License" in license_text
 
 
+def test_asr_image_uses_the_pinned_torch_and_cuda_runtime_base():
+    dockerfile = Path("Dockerfile.asr").read_text()
+
+    assert "FROM pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime" in dockerfile
+
+
+def test_asr_dependency_install_uses_a_reusable_buildkit_pip_cache():
+    dockerfile = Path("Dockerfile.asr").read_text()
+
+    assert "# syntax=docker/dockerfile:1.7" in dockerfile
+    assert "RUN --mount=type=cache,target=/root/.cache/pip" in dockerfile
+    assert "PIP_NO_CACHE_DIR" not in dockerfile
+
+
 def test_asr_image_executes_official_qwen_streaming_contract_check():
     dockerfile = Path("Dockerfile.asr").read_text()
     contract = Path("scripts/check_qwen_streaming_contract.py").read_text()

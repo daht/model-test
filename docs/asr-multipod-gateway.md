@@ -60,24 +60,37 @@ Render and inspect the topology before starting it:
 
 ```bash
 cd /opt/model-test
-docker compose --env-file .env -f docker-compose.asr-multipod.yml config >/tmp/asr-multipod.rendered.yml
-docker compose --env-file .env -f docker-compose.asr-multipod.yml build
+COMPOSE='docker compose --env-file .env -f docker-compose.asr-multipod.yml'
+$COMPOSE config >/tmp/asr-multipod.rendered.yml
+$COMPOSE build qwen-asr-backend-1 asr-gateway
 ```
+
+Backend 1 is the only service that builds `qwen-asr-api:latest`. Backend 2 uses
+that local image with pulling disabled, so a missing local image fails visibly
+instead of fetching an unapproved image. The gateway is built separately as
+the CPU-only `qwen-asr-gateway:latest` image.
 
 First perform a one-backend memory feasibility check:
 
 ```bash
-docker compose --env-file .env -f docker-compose.asr-multipod.yml up -d qwen-asr-backend-1
-docker compose --env-file .env -f docker-compose.asr-multipod.yml exec qwen-asr-backend-1 \
+$COMPOSE up -d --no-build qwen-asr-backend-1
+$COMPOSE exec qwen-asr-backend-1 \
+  python -c "import torch, vllm, transformers; print('torch', torch.__version__); print('torch_cuda', torch.version.cuda); print('vllm', vllm.__version__); print('transformers', transformers.__version__); print('gpu', torch.cuda.get_device_name(0))"
+$COMPOSE exec qwen-asr-backend-1 \
   python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/ready').read().decode())"
 nvidia-smi
-docker compose --env-file .env -f docker-compose.asr-multipod.yml down
+$COMPOSE down
 ```
+
+Confirm the output names Torch `2.9.1`, Torch CUDA `12.8`, vLLM `0.14.0`, and
+Transformers `4.57.6`, identifies the intended GPU, and reports backend 1 ready
+before allowing backend 2 to start. These checks do not expose the API
+credential and are not a substitute for the real warmup and VRAM gates.
 
 Then start the full experiment:
 
 ```bash
-docker compose --env-file .env -f docker-compose.asr-multipod.yml up -d --build
+$COMPOSE up -d --no-build
 curl -fsS http://127.0.0.1:8002/health
 curl -fsS http://127.0.0.1:8002/ready
 curl -fsS http://127.0.0.1:8002/v1/transcribe/stream-info
@@ -90,8 +103,8 @@ closed.
 To rebuild and recreate after a code or environment change:
 
 ```bash
-docker compose --env-file .env -f docker-compose.asr-multipod.yml build
-docker compose --env-file .env -f docker-compose.asr-multipod.yml up -d --force-recreate
+$COMPOSE build qwen-asr-backend-1 asr-gateway
+$COMPOSE up -d --force-recreate --no-build
 curl -fsS http://127.0.0.1:8002/ready
 ```
 

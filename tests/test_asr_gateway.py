@@ -547,6 +547,47 @@ def test_client_disconnect_releases_accounting_once():
     assert sum(item["local_load"] for item in snapshot["backends"]) == 0
 
 
+def test_gateway_image_is_slim_cpu_only_and_dependency_free():
+    dockerfile_path = Path("Dockerfile.asr-gateway")
+
+    assert dockerfile_path.is_file()
+    dockerfile = dockerfile_path.read_text()
+    assert "FROM python:3.11-slim" in dockerfile
+    assert "# syntax=docker/dockerfile:1.7" in dockerfile
+    assert "RUN --mount=type=cache,target=/root/.cache/pip" in dockerfile
+    assert "requirements-asr-gateway.txt" in dockerfile
+    assert "COPY app ./app" in dockerfile
+    assert "app.asr_gateway:app" in dockerfile
+    for forbidden in (
+        "torch",
+        "vllm",
+        "qwen-asr",
+        "cuda",
+        "transformers",
+        "accelerate",
+        "silero",
+        "onnx",
+        "ffmpeg",
+        "libsndfile",
+        "model",
+        "audio",
+    ):
+        assert forbidden not in dockerfile.lower()
+
+
+def test_gateway_requirements_are_exactly_the_pinned_http_stack():
+    requirements_path = Path("requirements-asr-gateway.txt")
+
+    assert requirements_path.is_file()
+    requirements = requirements_path.read_text().splitlines()
+    assert requirements == [
+        "fastapi==0.139.0",
+        "uvicorn[standard]==0.38.0",
+        "httpx==0.28.1",
+        "websockets==16.0",
+    ]
+
+
 def test_multipod_compose_topology_is_explicit_and_gpu_gateway_free():
     compose = yaml.safe_load(Path("docker-compose.asr-multipod.yml").read_text())
     services = compose["services"]
@@ -561,7 +602,24 @@ def test_multipod_compose_topology_is_explicit_and_gpu_gateway_free():
         assert any(volume.endswith("/models:ro") for volume in service["volumes"])
         assert service["gpus"] == "all"
 
+    backend_1 = services["qwen-asr-backend-1"]
+    backend_2 = services["qwen-asr-backend-2"]
+    assert backend_1["build"] == {"context": ".", "dockerfile": "Dockerfile.asr"}
+    assert backend_1["image"] == "qwen-asr-api:latest"
+    assert "build" not in backend_2
+    assert backend_2["image"] == "qwen-asr-api:latest"
+    assert backend_2["pull_policy"] == "never"
+    assert backend_2["depends_on"] == {
+        "qwen-asr-backend-1": {"condition": "service_healthy"}
+    }
+    assert sum("build" in services[name] for name in services) == 2
+
     gateway = services["asr-gateway"]
+    assert gateway["build"] == {
+        "context": ".",
+        "dockerfile": "Dockerfile.asr-gateway",
+    }
+    assert gateway["image"] == "qwen-asr-gateway:latest"
     assert gateway["ports"] == ["8002:8000"]
     assert "gpus" not in gateway
     assert "env_file" not in gateway
