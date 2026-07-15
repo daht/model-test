@@ -1,4 +1,5 @@
 import asyncio
+import math
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -92,6 +93,62 @@ def test_unready_and_unreachable_backends_are_excluded_and_readiness_fails_close
     assert "unreachable" not in snapshot["backends"][1]["detail"]
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {key: value for key, value in _ready_payload().items() if key != "active_streams"},
+        {**_ready_payload(), "queue_depth": -1},
+        {**_ready_payload(), "queued_audio_seconds": float("nan")},
+        {**_ready_payload(), "active_streams": "1e10000"},
+        {**_ready_payload(), "queue_depth": 10**100},
+        {**_ready_payload(), "queued_audio_seconds": float("inf")},
+        {**_ready_payload(), "model": ""},
+        {**_ready_payload(), "backend": None},
+    ],
+    ids=(
+        "missing-field",
+        "negative",
+        "nan",
+        "overflow",
+        "unbounded-integer",
+        "infinity",
+        "empty-model",
+        "invalid-backend",
+    ),
+)
+def test_malformed_ready_probe_fails_closed_and_clears_stale_state(payload):
+    asr_1_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal asr_1_calls
+        if request.url.host == "asr-2":
+            return httpx.Response(503, json={"status": "not_ready"})
+        asr_1_calls += 1
+        response_payload = _ready_payload(active_streams=4) if asr_1_calls == 1 else payload
+        return httpx.Response(200, json=response_payload)
+
+    async def scenario():
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        pool = asr_gateway.BackendPool(
+            _settings(minimum_ready_backends=1), http_client=client
+        )
+        await pool.refresh()
+        before = await pool.snapshot()
+        await pool.refresh()
+        after = await pool.snapshot()
+        await client.aclose()
+        return before, after
+
+    before, after = asyncio.run(scenario())
+
+    assert before["status"] == "ready"
+    assert after["status"] == "not_ready"
+    assert after["ready_backend_count"] == 0
+    assert after["backends"][0]["remote_active_streams"] == 0
+    assert after["backends"][0]["queue_depth"] == 0
+    assert after["backends"][0]["queued_audio_seconds"] == 0.0
+
+
 def test_scheduler_excludes_explicitly_unready_backend():
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.url.host == "asr-1":
@@ -136,7 +193,7 @@ def test_gateway_ready_endpoint_fails_closed_below_minimum():
     assert response.json()["status"] == "not_ready"
 
 
-def test_http_stream_info_and_authenticated_body_are_forwarded_transparently():
+def test_http_contract_forwards_only_stream_info_and_rejects_other_v1_paths():
     seen = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -157,7 +214,7 @@ def test_http_stream_info_and_authenticated_body_are_forwarded_transparently():
                     "websocket_url": "/v1/transcribe/stream",
                 },
             )
-        return httpx.Response(201, content=b"proxied-response", headers={"x-upstream": "yes"})
+        raise AssertionError("unsupported HTTP path reached an upstream")
 
     async def setup():
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -182,17 +239,26 @@ def test_http_stream_info_and_authenticated_body_are_forwarded_transparently():
 
     assert info.status_code == 200
     assert info.json()["protocol_version"] == 2
-    assert posted.status_code == 201
-    assert posted.content == b"proxied-response"
-    assert posted.headers["x-upstream"] == "yes"
+    assert posted.status_code == 404
+    assert posted.json()["detail"]["code"] == "unsupported_gateway_path"
     assert seen[0]["query"] == b"detail=1"
-    assert seen[1] == {
-        "method": "POST",
-        "path": "/v1/transcribe",
-        "query": b"",
-        "authorization": "Bearer unit-test-token",
-        "body": b"language=zh",
-    }
+    assert len(seen) == 1
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize(
+    "setting_name",
+    [
+        "probe_interval_seconds",
+        "probe_timeout_seconds",
+        "upstream_open_timeout_seconds",
+        "upstream_close_timeout_seconds",
+    ],
+)
+def test_gateway_settings_reject_nonfinite_timeouts_and_intervals(setting_name, value):
+    assert not math.isfinite(value)
+    with pytest.raises(ValueError, match="finite and positive"):
+        _settings(**{setting_name: value})
 
 
 class _ClientWebSocket:
@@ -218,6 +284,15 @@ class _ClientWebSocket:
 
     async def close(self, code=1000, reason=None):
         self.closes.append((code, reason))
+
+
+class _FailingAcceptClient(_ClientWebSocket):
+    def __init__(self, error):
+        super().__init__()
+        self.error = error
+
+    async def accept(self):
+        raise self.error
 
 
 class _UpstreamWebSocket:
@@ -366,6 +441,110 @@ def test_websocket_proxy_failure_and_cancellation_release_accounting_once():
     assert sum(item["local_load"] for item in during_cancel["backends"]) == 1
     assert sum(item["local_load"] for item in after_cancel["backends"]) == 0
     assert all(item["ready"] for item in after_cancel["backends"])
+
+
+@pytest.mark.parametrize(
+    ("error", "propagates"),
+    [(RuntimeError("accept failed"), False), (asyncio.CancelledError(), True)],
+)
+def test_websocket_accept_failure_or_cancellation_releases_reservation(error, propagates):
+    async def scenario():
+        pool = asr_gateway.BackendPool(_settings())
+        for name in ("asr-1", "asr-2"):
+            await pool.set_probe_result(name, _ready_payload())
+        client = _FailingAcceptClient(error)
+
+        if propagates:
+            with pytest.raises(type(error)):
+                await asr_gateway.proxy_websocket(client, pool)
+        else:
+            await asr_gateway.proxy_websocket(client, pool)
+        return await pool.snapshot()
+
+    snapshot = asyncio.run(scenario())
+
+    assert sum(item["local_load"] for item in snapshot["backends"]) == 0
+
+
+def test_simultaneous_upstream_terminal_close_wins_over_client_forwarding_failure():
+    class Barrier:
+        def __init__(self):
+            self.arrivals = 0
+            self.release = asyncio.Event()
+
+        async def wait(self):
+            self.arrivals += 1
+            if self.arrivals == 2:
+                self.release.set()
+            await self.release.wait()
+
+    class RacingClient(_ClientWebSocket):
+        async def receive(self):
+            await barrier.wait()
+            raise RuntimeError("client receive failed")
+
+    class RacingUpstream(_UpstreamWebSocket):
+        async def recv(self):
+            await barrier.wait()
+            raise _closed(1013, "retry elsewhere")
+
+    async def scenario():
+        nonlocal barrier
+        barrier = Barrier()
+        client = RacingClient()
+        upstream = RacingUpstream()
+        await asr_gateway._run_websocket_proxy(client, upstream)
+        return client
+
+    barrier = None
+    client = asyncio.run(scenario())
+
+    assert client.closes == [(1013, "retry elsewhere")]
+
+
+def test_upstream_connect_failure_releases_accounting_once():
+    async def scenario():
+        pool = asr_gateway.BackendPool(_settings())
+        for name in ("asr-1", "asr-2"):
+            await pool.set_probe_result(name, _ready_payload())
+        client = _ClientWebSocket()
+
+        @asynccontextmanager
+        async def connect(*_args, **_kwargs):
+            raise OSError("connect failed")
+            yield
+
+        await asr_gateway.proxy_websocket(client, pool, connect=connect)
+        return client, await pool.snapshot()
+
+    client, snapshot = asyncio.run(scenario())
+
+    assert client.closes == [(1011, "Upstream proxy failure")]
+    assert sum(item["local_load"] for item in snapshot["backends"]) == 0
+
+
+def test_client_disconnect_releases_accounting_once():
+    async def scenario():
+        pool = asr_gateway.BackendPool(_settings())
+        for name in ("asr-1", "asr-2"):
+            await pool.set_probe_result(name, _ready_payload())
+        client = _ClientWebSocket(
+            [{"type": "websocket.disconnect", "code": 1000}]
+        )
+        upstream = _UpstreamWebSocket()
+
+        @asynccontextmanager
+        async def connect(*_args, **_kwargs):
+            async with upstream as connection:
+                yield connection
+
+        await asr_gateway.proxy_websocket(client, pool, connect=connect)
+        return upstream, await pool.snapshot()
+
+    upstream, snapshot = asyncio.run(scenario())
+
+    assert upstream.closed is True
+    assert sum(item["local_load"] for item in snapshot["backends"]) == 0
 
 
 def test_multipod_compose_topology_is_explicit_and_gpu_gateway_free():

@@ -18,8 +18,9 @@ or `Qwen/Qwen3-ASR-1.7B` contract. It also does not add stateful batching.
 - Text frames, binary frames, query parameters, application headers, and the
   upstream terminal close code are proxied without interpreting ASR events.
 - `/health` reports gateway liveness. `/ready` reports aggregate readiness and
-  per-backend load. `/v1/transcribe/stream-info` and other `/v1` HTTP requests
-  are sent to one ready backend.
+  per-backend load. The only supported HTTP API forwarding route is
+  `GET /v1/transcribe/stream-info`; other `/v1` HTTP requests are rejected. The
+  gateway data plane is `/v1/transcribe/stream` WebSocket traffic.
 - The gateway never loads a model and has no GPU assignment.
 
 Do not send a client around the gateway directly to a backend. Direct traffic
@@ -113,14 +114,32 @@ keeps evidence outside the repository:
 N=16
 RUN_DIR="/tmp/asr-multipod-${N}-$(date +%Y%m%dT%H%M%S)"
 mkdir -m 700 "$RUN_DIR"
+READY_DIR="$RUN_DIR/ready"
+START_GATE="$RUN_DIR/start"
+mkdir -m 700 "$READY_DIR"
+pids=()
 for i in $(seq 1 "$N"); do
-  python3 scripts/stream_asr_client.py "$ASR_AUDIO" \
-    --url ws://127.0.0.1:8002/v1/transcribe/stream \
-    --language zh --chunk-ms 200 --realtime --verify-protocol \
-    >"$RUN_DIR/client-${i}.log" 2>&1 &
+  (
+    touch "$READY_DIR/$i"
+    while [[ ! -e "$START_GATE" ]]; do sleep 0.01; done
+    exec python3 scripts/stream_asr_client.py "$ASR_AUDIO" \
+      --url ws://127.0.0.1:8002/v1/transcribe/stream \
+      --language zh --chunk-ms 200 --realtime --verify-protocol \
+      >"$RUN_DIR/client-${i}.log" 2>&1
+  ) &
+  pids+=("$!")
 done
-wait
+while [[ $(find "$READY_DIR" -type f | wc -l) -lt "$N" ]]; do sleep 0.01; done
+touch "$START_GATE"
+run_status=0
+for pid in "${pids[@]}"; do
+  wait "$pid" || run_status=1
+done
+((run_status == 0))
 ```
+
+Every client registers in `READY_DIR` before the start file is created, so the
+measured run does not depend on how quickly the launch loop creates processes.
 
 Collect backend evidence separately during every run:
 

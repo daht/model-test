@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -35,6 +36,9 @@ _WEBSOCKET_HANDSHAKE_HEADERS = _HOP_BY_HOP_HEADERS | {
     "sec-websocket-version",
 }
 _INVALID_FORWARD_CLOSE_CODES = {1005, 1006, 1015}
+_MAX_READINESS_COUNT = 1_000_000_000
+_MAX_QUEUED_AUDIO_SECONDS = 1_000_000_000.0
+_MAX_READINESS_STRING_LENGTH = 256
 
 
 @dataclass(frozen=True)
@@ -78,8 +82,10 @@ class GatewaySettings:
             self.upstream_open_timeout_seconds,
             self.upstream_close_timeout_seconds,
         ):
-            if value <= 0:
-                raise ValueError("ASR gateway timeouts and intervals must be positive")
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(
+                    "ASR gateway timeouts and intervals must be finite and positive"
+                )
 
     @classmethod
     def from_environment(cls) -> "GatewaySettings":
@@ -187,7 +193,7 @@ class BackendPool:
                 )
                 return
             await self.set_probe_result(backend.name, payload)
-        except (httpx.HTTPError, ValueError, TypeError) as exc:
+        except (httpx.HTTPError, OverflowError, ValueError, TypeError) as exc:
             await self.set_probe_result(
                 backend.name,
                 {},
@@ -203,16 +209,30 @@ class BackendPool:
         ready: bool | None = None,
         detail: str | None = None,
     ) -> None:
+        is_ready = payload.get("status") == "ready" if ready is None else ready
+        if is_ready:
+            (
+                remote_active_streams,
+                queue_depth,
+                queued_audio_seconds,
+                model,
+                backend,
+            ) = _validate_ready_payload(payload)
+        else:
+            remote_active_streams = 0
+            queue_depth = 0
+            queued_audio_seconds = 0.0
+            model = None
+            backend = None
+
         async with self._lock:
             state = self._state(backend_name)
-            state.ready = payload.get("status") == "ready" if ready is None else ready
-            state.remote_active_streams = _nonnegative_int(payload.get("active_streams", 0))
-            state.queue_depth = _nonnegative_int(payload.get("queue_depth", 0))
-            state.queued_audio_seconds = _nonnegative_float(
-                payload.get("queued_audio_seconds", 0.0)
-            )
-            state.model = _optional_string(payload.get("model"))
-            state.backend = _optional_string(payload.get("backend"))
+            state.ready = is_ready
+            state.remote_active_streams = remote_active_streams
+            state.queue_depth = queue_depth
+            state.queued_audio_seconds = queued_audio_seconds
+            state.model = model
+            state.backend = backend
             state.detail = detail if detail is not None else _optional_string(payload.get("detail"))
 
     async def reserve(self) -> BackendLease | None:
@@ -359,11 +379,8 @@ async def ready() -> Response:
     return JSONResponse(snapshot, status_code=code)
 
 
-@app.api_route(
-    "/v1/{upstream_path:path}",
-    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-)
-async def proxy_http(request: Request, upstream_path: str) -> Response:
+@app.get("/v1/transcribe/stream-info")
+async def proxy_stream_info(request: Request) -> Response:
     pool = get_gateway_pool()
     lease = await pool.reserve()
     if lease is None:
@@ -373,7 +390,7 @@ async def proxy_http(request: Request, upstream_path: str) -> Response:
         )
     try:
         query = request.url.query
-        url = f"{lease.backend.http_url}/v1/{upstream_path}"
+        url = f"{lease.backend.http_url}/v1/transcribe/stream-info"
         if query:
             url = f"{url}?{query}"
         headers = _forward_http_headers(request.headers.items())
@@ -407,6 +424,26 @@ async def proxy_http(request: Request, upstream_path: str) -> Response:
         await lease.release()
 
 
+@app.api_route(
+    "/v1/{upstream_path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
+async def reject_unsupported_http(upstream_path: str) -> Response:
+    del upstream_path
+    return JSONResponse(
+        {
+            "detail": {
+                "code": "unsupported_gateway_path",
+                "message": (
+                    "The experimental gateway supports only "
+                    "GET /v1/transcribe/stream-info and the streaming WebSocket"
+                ),
+            }
+        },
+        status_code=status.HTTP_404_NOT_FOUND,
+    )
+
+
 @app.websocket("/v1/transcribe/stream")
 async def transcribe_stream(websocket: WebSocket) -> None:
     await proxy_websocket(
@@ -428,15 +465,15 @@ async def proxy_websocket(
     connect: Callable[..., AsyncContextManager[Any]] = websockets.connect,
 ) -> None:
     lease = await pool.reserve()
-    await websocket.accept()
-    if lease is None:
-        await websocket.close(code=1013, reason="ASR gateway is not ready")
-        return
-
-    upstream_url = f"{lease.backend.websocket_url}{path}"
-    if query:
-        upstream_url = f"{upstream_url}?{query}"
     try:
+        await websocket.accept()
+        if lease is None:
+            await websocket.close(code=1013, reason="ASR gateway is not ready")
+            return
+
+        upstream_url = f"{lease.backend.websocket_url}{path}"
+        if query:
+            upstream_url = f"{upstream_url}?{query}"
         async with connect(
             upstream_url,
             additional_headers=_forward_websocket_headers(headers),
@@ -451,11 +488,13 @@ async def proxy_websocket(
     except asyncio.CancelledError:
         raise
     except Exception:
-        logger.warning("asr_gateway_websocket_upstream_failed backend=%s", lease.backend.name)
+        backend_name = lease.backend.name if lease is not None else "unreserved"
+        logger.warning("asr_gateway_websocket_upstream_failed backend=%s", backend_name)
         with suppress(Exception):
             await websocket.close(code=1011, reason="Upstream proxy failure")
     finally:
-        await lease.release()
+        if lease is not None:
+            await lease.release()
 
 
 async def _run_websocket_proxy(client: Any, upstream: Any) -> None:
@@ -464,13 +503,20 @@ async def _run_websocket_proxy(client: Any, upstream: Any) -> None:
     tasks = {client_task, upstream_task}
     try:
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for task in done:
-            exception = task.exception()
-            if exception is not None:
-                raise exception
-        if upstream_task in done:
+        if (
+            upstream_task in done
+            and not upstream_task.cancelled()
+            and upstream_task.exception() is None
+        ):
             close_code, close_reason = upstream_task.result()
             await client.close(code=close_code, reason=close_reason)
+        else:
+            for task in (upstream_task, client_task):
+                if task not in done or task.cancelled():
+                    continue
+                exception = task.exception()
+                if exception is not None:
+                    raise exception
         for task in pending:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
@@ -536,18 +582,62 @@ def _forward_close_code(value: Any, *, fallback: int) -> int:
     return value
 
 
-def _nonnegative_int(value: Any) -> int:
-    try:
-        return max(0, int(value))
-    except (TypeError, ValueError):
-        return 0
+def _validate_ready_payload(payload: dict[str, Any]) -> tuple[int, int, float, str, str]:
+    required = {
+        "status",
+        "model",
+        "backend",
+        "active_streams",
+        "queue_depth",
+        "queued_audio_seconds",
+    }
+    if not required.issubset(payload):
+        raise ValueError("readiness payload is incomplete")
+    if payload["status"] != "ready":
+        raise ValueError("readiness payload status is not ready")
+    return (
+        _bounded_nonnegative_int(payload["active_streams"], "active_streams"),
+        _bounded_nonnegative_int(payload["queue_depth"], "queue_depth"),
+        _bounded_nonnegative_float(
+            payload["queued_audio_seconds"], "queued_audio_seconds"
+        ),
+        _required_string(payload["model"], "model"),
+        _required_string(payload["backend"], "backend"),
+    )
 
 
-def _nonnegative_float(value: Any) -> float:
-    try:
-        return max(0.0, float(value))
-    except (TypeError, ValueError):
-        return 0.0
+def _bounded_nonnegative_int(value: Any, field: str) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        or value > _MAX_READINESS_COUNT
+    ):
+        raise ValueError(f"readiness {field} must be a bounded nonnegative integer")
+    return value
+
+
+def _bounded_nonnegative_float(value: Any, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"readiness {field} must be numeric")
+    parsed = float(value)
+    if (
+        not math.isfinite(parsed)
+        or parsed < 0
+        or parsed > _MAX_QUEUED_AUDIO_SECONDS
+    ):
+        raise ValueError(f"readiness {field} must be finite, bounded, and nonnegative")
+    return parsed
+
+
+def _required_string(value: Any, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or len(value) > _MAX_READINESS_STRING_LENGTH
+    ):
+        raise ValueError(f"readiness {field} must be a nonempty bounded string")
+    return value
 
 
 def _optional_string(value: Any) -> str | None:
