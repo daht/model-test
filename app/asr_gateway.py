@@ -614,17 +614,17 @@ def _default_runtime() -> GatewayRuntime:
     from app.asr_inference import ASRInferenceCoordinator
 
     settings = get_settings()
+    max_frame_samples = settings.asr_max_frame_bytes // 2
     adapter = LocalCoordinatorAdapter(
         lambda: ASRInferenceCoordinator(settings, lambda: create_asr_transcriber(settings)),
         worker_id="local", model_id=settings.asr_model_id,
         model_revision=settings.asr_model_name, gpu_id=settings.asr_device,
         session_capacity=settings.asr_max_active_streams,
-        preferred_chunk_samples=round(
-            settings.asr_stream_chunk_seconds * 16_000
+        preferred_chunk_samples=min(
+            round(settings.asr_stream_chunk_seconds * 16_000),
+            max_frame_samples,
         ),
-        max_input_samples=round(
-            settings.asr_max_utterance_seconds * 16_000
-        ),
+        max_input_samples=max_frame_samples,
     )
     return GatewayRuntime(settings, {"local": adapter})
 

@@ -290,7 +290,8 @@ def test_shipped_clients_use_upgrade_auth_authenticated_info_and_finish_command(
     smoke = script("smoke_asr.sh")
     assert 'additional_headers={"X-API-Key": args.api_key}' in client
     assert 'fetch_stream_info(stream_info_url, args.api_key)' in client
-    assert 'json.dumps({"type": "finish"})' in client
+    assert 'json.dumps(finish_message(args.protocol))' in client
+    assert 'return {"type": "end" if protocol == "legacy" else "finish"}' in client
     assert '"api_key": args.api_key' not in client
     assert 'curl -fsS -H "X-API-Key: ${API_KEY}"' in smoke
     assert 'f"X-API-Key: {os.environ[\'API_KEY\']}\\r\\n' in smoke

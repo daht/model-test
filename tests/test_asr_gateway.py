@@ -397,17 +397,18 @@ def test_sender_failure_does_not_claim_event_sent_or_complete_job():
     assert asyncio.run(scenario()) == 0
 
 
-def test_default_runtime_uses_configured_chunk_and_maximum_boundaries(monkeypatch):
+def test_default_local_runtime_caps_jobs_to_stateful_frame_contract(monkeypatch):
     settings = Settings(
         model_backend="mock", asr_backend="mock", asr_stream_mode="stateful",
         api_key="test-key", asr_stream_chunk_seconds=2.0,
-        asr_max_utterance_seconds=20.0,
+        asr_max_utterance_seconds=20.0, asr_max_frame_bytes=16_000,
     )
     monkeypatch.setattr("app.asr_gateway.get_settings", lambda: settings)
     runtime = _default_runtime()
     caps = runtime.adapters["local"].capabilities
-    assert caps.preferred_chunk_samples == 32_000
-    assert caps.max_input_samples == 320_000
+    assert caps.preferred_chunk_samples == 8_000
+    assert caps.max_input_samples == 8_000
+    assert caps.max_input_samples * 2 <= settings.asr_max_frame_bytes
 
 
 def test_twenty_second_boundary_rolls_state_before_one_sample_remainder():
