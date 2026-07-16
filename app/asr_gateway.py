@@ -192,7 +192,9 @@ class GatewayRuntime:
             session.append_pcm(pcm)
             if ctx.first_undecoded_at is None:
                 ctx.first_undecoded_at = self.scheduler.clock()
-        return self._schedule_next(session, force=force)
+        scheduled = self._schedule_next(session, force=force)
+        self._update_gauges()
+        return scheduled
 
     def check_deadlines(self, session_id: str) -> None:
         ctx = self._contexts[session_id]
@@ -642,9 +644,23 @@ class GatewayRuntime:
 
     def _update_gauges(self) -> None:
         scheduler = self.scheduler.snapshot()
+        accounting = [
+            ctx.session.sample_accounting for ctx in self._contexts.values()
+        ]
+        buffered = sum(item["buffered"] for item in accounting)
+        reserved = sum(item["reserved"] for item in accounting)
+        max_held = max(
+            (item["buffered"] + item["reserved"] for item in accounting),
+            default=0,
+        )
         self.metrics.set_gauges(
             active_sessions=self.sessions.snapshot()["active_sessions"],
-            ready_depth=scheduler["ready_depth"], queued_samples=scheduler["queued_samples"], sample_rate=16_000,
+            ready_depth=scheduler["ready_depth"],
+            queued_samples=scheduler["queued_samples"],
+            session_buffered_samples=buffered,
+            session_reserved_samples=reserved,
+            max_session_held_samples=max_held,
+            sample_rate=16_000,
         )
 
 

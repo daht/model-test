@@ -52,7 +52,16 @@ class GatewayMetrics:
             raise ValueError("max_completed must be positive")
         self._completed: deque[tuple[JobTimeline, int, int]] = deque(maxlen=max_completed)
         self._completed_total = 0
-        self._gauges = {"active_sessions": 0, "ready_depth": 0, "queued_audio_seconds": 0.0}
+        self._session_buffer_high_water_samples = 0
+        self._gauges = {
+            "active_sessions": 0,
+            "ready_depth": 0,
+            "queued_audio_seconds": 0.0,
+            "session_buffered_audio_seconds": 0.0,
+            "session_reserved_audio_seconds": 0.0,
+            "max_session_held_audio_seconds": 0.0,
+            "session_buffer_high_water_seconds": 0.0,
+        }
         self.cancellations = 0
         self.conflicts = 0
         self.failures = 0
@@ -64,11 +73,37 @@ class GatewayMetrics:
         self._completed.append((timeline, batch_size, batch_capacity))
         self._completed_total += 1
 
-    def set_gauges(self, *, active_sessions: int, ready_depth: int, queued_samples: int, sample_rate: int) -> None:
+    def set_gauges(
+        self,
+        *,
+        active_sessions: int,
+        ready_depth: int,
+        queued_samples: int,
+        session_buffered_samples: int,
+        session_reserved_samples: int,
+        max_session_held_samples: int,
+        sample_rate: int,
+    ) -> None:
+        self._session_buffer_high_water_samples = max(
+            self._session_buffer_high_water_samples,
+            max(0, max_session_held_samples),
+        )
         self._gauges = {
             "active_sessions": max(0, active_sessions),
             "ready_depth": max(0, ready_depth),
             "queued_audio_seconds": max(0, queued_samples) / sample_rate,
+            "session_buffered_audio_seconds": (
+                max(0, session_buffered_samples) / sample_rate
+            ),
+            "session_reserved_audio_seconds": (
+                max(0, session_reserved_samples) / sample_rate
+            ),
+            "max_session_held_audio_seconds": (
+                max(0, max_session_held_samples) / sample_rate
+            ),
+            "session_buffer_high_water_seconds": (
+                self._session_buffer_high_water_samples / sample_rate
+            ),
         }
 
     def snapshot(self) -> dict[str, Any]:

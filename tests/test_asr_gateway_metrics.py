@@ -12,7 +12,15 @@ def test_job_timeline_and_bounded_aggregates_are_sanitized():
     stages = ["audio_received", "chunk_ready", "scheduler_enqueued", "scheduler_dispatched", "worker_accepted", "inference_started", "inference_completed", "result_applied", "event_sent"]
     for index, stage in enumerate(stages): timeline.mark(stage, float(index))
     metrics.complete(timeline, batch_size=2, batch_capacity=4)
-    metrics.set_gauges(active_sessions=3, ready_depth=2, queued_samples=8000, sample_rate=16000)
+    metrics.set_gauges(
+        active_sessions=3,
+        ready_depth=2,
+        queued_samples=8000,
+        session_buffered_samples=32_000,
+        session_reserved_samples=32_000,
+        max_session_held_samples=64_000,
+        sample_rate=16_000,
+    )
     snapshot = metrics.snapshot()
     assert snapshot["latency"]["chunk_wait_seconds"] == 1
     assert snapshot["latency"]["batch_wait_seconds"] == 1
@@ -23,8 +31,26 @@ def test_job_timeline_and_bounded_aggregates_are_sanitized():
     assert snapshot["aggregate_rtf"] == 1
     assert snapshot["batch_fill_ratio"] == .5
     assert snapshot["active_sessions"] == 3
+    assert snapshot["session_buffered_audio_seconds"] == 2
+    assert snapshot["session_reserved_audio_seconds"] == 2
+    assert snapshot["max_session_held_audio_seconds"] == 4
+    assert snapshot["session_buffer_high_water_seconds"] == 4
+    metrics.set_gauges(
+        active_sessions=0,
+        ready_depth=0,
+        queued_samples=0,
+        session_buffered_samples=0,
+        session_reserved_samples=0,
+        max_session_held_samples=0,
+        sample_rate=16_000,
+    )
+    reset = metrics.snapshot()
+    assert reset["session_buffered_audio_seconds"] == 0
+    assert reset["session_reserved_audio_seconds"] == 0
+    assert reset["max_session_held_audio_seconds"] == 0
+    assert reset["session_buffer_high_water_seconds"] == 4
     forbidden = ("pcm", "authorization", "api_key", "transcript", "text")
-    assert not any(word in str(snapshot).lower() for word in forbidden)
+    assert not any(word in str(reset).lower() for word in forbidden)
 
 
 def test_completed_jobs_is_lifetime_total_not_bounded_window_size():

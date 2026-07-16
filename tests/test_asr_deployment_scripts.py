@@ -106,6 +106,11 @@ def test_a10_faster_whisper_example_is_fp16_large_v3_batch_four_transcribe_only(
         "ASR_FASTER_WHISPER_PARTIAL_BEAM_SIZE=1",
         "ASR_FASTER_WHISPER_FINAL_BEAM_SIZE=5",
         "ASR_FASTER_WHISPER_TASK=transcribe",
+        "ASR_GATEWAY_SCHEDULE_MAX_WAIT_MS=200",
+        "ASR_GATEWAY_MAX_SESSION_BUFFER_SECONDS=6.0",
+        "ASR_GATEWAY_DEFAULT_UPDATE_MS=2000",
+        "ASR_MAX_CONNECTION_LAG_SECONDS=4.0",
+        "ASR_MAX_UNDECODED_AGE_SECONDS=8.0",
     }
 
     assert required.issubset(set(example.splitlines()))
@@ -124,6 +129,9 @@ def test_runbook_has_faster_whisper_model_manifest_validation_and_qwen_rollback(
     assert "Compose intentionally loads the repository root `.env`" in runbook
     assert 'ASR_RELEASE_ENV_FILE="$PWD/.env"' in runbook
     assert 'ASR_RELEASE_ENV_FILE="$PWD/.env.faster-whisper"' not in runbook
+    assert "200 ms bounded coalescing latency" in runbook
+    assert "six seconds of jitter headroom, not an accepted lag target" in runbook
+    assert "session_buffer_high_water_seconds" in runbook
 
 
 def test_release_gate_accepts_faster_whisper_contract_and_runs_gateway_warmup():
@@ -135,6 +143,8 @@ def test_release_gate_accepts_faster_whisper_contract_and_runs_gateway_warmup():
     assert '"ASR_FASTER_WHISPER_PARTIAL_BEAM_SIZE": "1"' in verifier
     assert '"ASR_FASTER_WHISPER_FINAL_BEAM_SIZE": "5"' in verifier
     assert '"ASR_FASTER_WHISPER_TASK": "transcribe"' in verifier
+    assert '"ASR_GATEWAY_SCHEDULE_MAX_WAIT_MS": "200"' in verifier
+    assert '"ASR_GATEWAY_MAX_SESSION_BUFFER_SECONDS": "6.0"' in verifier
     assert "from app.asr_gateway import _default_runtime" in verifier
     assert "create_vad_endpoint_detector" in verifier
 

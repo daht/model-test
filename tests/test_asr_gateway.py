@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -10,6 +11,27 @@ from app.asr_gateway_scheduler import InferenceResult
 from app.config import Settings
 from scripts import stream_asr_client
 from tests.test_asr_gateway_backends import capabilities
+
+
+def read_env_example(path: str) -> dict[str, str]:
+    values = {}
+    for raw_line in Path(path).read_text().splitlines():
+        line = raw_line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            name, value = line.split("=", 1)
+            values[name] = value
+    return values
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
 
 
 class FakeAdapter:
@@ -129,6 +151,63 @@ def test_runtime_barrier_forms_cross_session_dynamic_batch():
         await runtime.close()
         return [len(call) for call in adapter.calls]
     assert asyncio.run(scenario()) == [3]
+
+
+def test_faster_whisper_candidate_coalesces_offset_sessions_before_buffer_pressure():
+    async def scenario():
+        values = read_env_example("cloud/A10.faster-whisper.env.example")
+        clock = FakeClock()
+        adapter = FakeAdapter(dynamic=True)
+        adapter.capabilities = replace(
+            adapter.capabilities,
+            streaming_mode=StreamingMode.ROLLING,
+        )
+        settings = Settings(
+            _env_file=None,
+            model_backend="mock",
+            asr_backend="mock",
+            asr_stream_mode="rolling",
+            api_key="test-key",
+            asr_gateway_default_backend="fake",
+            asr_gateway_max_active_sessions=2,
+            asr_gateway_schedule_max_wait_ms=int(
+                values["ASR_GATEWAY_SCHEDULE_MAX_WAIT_MS"]
+            ),
+            asr_gateway_max_session_buffer_seconds=float(
+                values["ASR_GATEWAY_MAX_SESSION_BUFFER_SECONDS"]
+            ),
+            asr_gateway_max_queued_audio_seconds=16,
+            asr_gateway_default_update_ms=2000,
+        )
+        runtime = GatewayRuntime(settings, {"fake": adapter}, clock=clock)
+        await adapter.warmup()
+        await runtime.registry.register(adapter.capabilities)
+        await runtime.registry.mark_ready("fake", True)
+        first = await runtime.open_session("first", language="zh", options={})
+        second = await runtime.open_session("second", language="zh", options={})
+        frame = b"\x01\x00" * 32_000
+
+        for _ in range(3):
+            await runtime.ingest(first, frame, force=True)
+            assert await runtime.scheduler.run_once("fake") == []
+            clock.advance(0.1)
+            assert await runtime.scheduler.run_once("fake") == []
+            await runtime.ingest(second, frame, force=True)
+            assert await runtime.scheduler.run_once("fake") == []
+            clock.advance(0.101)
+            results = await runtime.scheduler.run_once("fake")
+            assert len(results) == 2
+
+        snapshots = [first.sample_accounting, second.sample_accounting]
+        await runtime.close()
+        return [len(call) for call in adapter.calls], snapshots
+
+    calls, snapshots = asyncio.run(scenario())
+
+    assert calls == [2, 2, 2]
+    assert all(
+        item["buffered"] == item["reserved"] == 0 for item in snapshots
+    )
 
 
 def test_runtime_uses_segment_local_protocol_for_replaceable_adapter_results():
@@ -332,6 +411,65 @@ def test_runtime_records_all_job_timeline_stages_and_counters():
     assert snapshot["completed_jobs"] == 1
     assert set(snapshot["latency"]) == {"chunk_wait_seconds", "batch_wait_seconds", "worker_wait_seconds", "inference_seconds", "egress_seconds"}
     assert cancelled["cancellations"] == 1
+
+
+def test_runtime_buffer_gauges_track_held_reservation_and_cleanup():
+    class HeldAdapter(FakeAdapter):
+        def __init__(self):
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def submit(self, jobs):
+            self.calls.append(list(jobs))
+            self.entered.set()
+            await self.release.wait()
+            return [
+                InferenceResult.from_job(job, text=f"heard-{job.sample_count}")
+                for job in jobs
+            ]
+
+    async def scenario():
+        adapter = HeldAdapter()
+        settings = Settings(
+            _env_file=None,
+            model_backend="mock",
+            asr_backend="mock",
+            asr_stream_mode="stateful",
+            api_key="test-key",
+            asr_gateway_default_backend="fake",
+            asr_gateway_schedule_max_wait_ms=0,
+            asr_gateway_default_update_ms=2000,
+        )
+        runtime = GatewayRuntime(settings, {"fake": adapter})
+        await adapter.warmup()
+        await runtime.registry.register(adapter.capabilities)
+        await runtime.registry.mark_ready("fake", True)
+        session = await runtime.open_session("s", language="zh", options={})
+        await runtime.ingest(session, b"\x01\x00" * 32_000, force=True)
+        submission = asyncio.create_task(
+            runtime.scheduler.run_once("fake", force=True)
+        )
+        await adapter.entered.wait()
+        held = runtime.metrics.snapshot()
+        adapter.release.set()
+        await submission
+        cleared = runtime.metrics.snapshot()
+        accounting = session.sample_accounting
+        await runtime.close()
+        return held, cleared, accounting
+
+    held, cleared, accounting = asyncio.run(scenario())
+
+    assert held["session_buffered_audio_seconds"] == 0
+    assert held["session_reserved_audio_seconds"] == 2
+    assert held["max_session_held_audio_seconds"] == 2
+    assert held["session_buffer_high_water_seconds"] == 2
+    assert cleared["session_buffered_audio_seconds"] == 0
+    assert cleared["session_reserved_audio_seconds"] == 0
+    assert cleared["max_session_held_audio_seconds"] == 0
+    assert cleared["session_buffer_high_water_seconds"] == 2
+    assert accounting["buffered"] == accounting["reserved"] == 0
 
 
 def test_error_terminal_releases_lease_updates_gauges_and_logs(caplog):

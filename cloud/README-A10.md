@@ -8,6 +8,13 @@ cross-session batches of four. It performs transcription only. The initial
 `ASR_MAX_ACTIVE_STREAMS=14` in the dedicated example is a test starting point,
 not a validated A10 capacity claim.
 
+The candidate uses 200 ms bounded coalescing latency so compatible public
+WebSocket streams that arrive slightly offset can share a dynamic batch. Its
+`ASR_GATEWAY_MAX_SESSION_BUFFER_SECONDS=6.0` setting provides six seconds of jitter headroom, not an accepted lag target. Keep
+`ASR_MAX_CONNECTION_LAG_SECONDS=4.0` and
+`ASR_MAX_UNDECODED_AGE_SECONDS=8.0` unchanged so sustained lag still fails
+explicitly.
+
 On a trusted staging host, choose and record an immutable revision from
 `Systran/faster-whisper-large-v3`, then download exactly that revision:
 
@@ -58,7 +65,10 @@ docker compose logs --tail 200 qwen-asr-api
 
 Verify `/ready`, strict Chinese/Japanese speech, and a 1/4/8/12/14/16 stream
 sweep while recording p50/p95 completion overhead, errors, batch fill, GPU
-utilization, and peak VRAM. Promotion additionally requires an approved
+utilization, peak VRAM, and `session_buffer_high_water_seconds`. Also record
+the current buffered and reserved seconds after each stage and require them to
+return to zero. Capacity is not accepted until the first failing concurrency
+stage is known. Promotion additionally requires an approved
 multilingual CER/WER corpus for Chinese, Yue, English, Japanese, and Korean.
 The repository's mock tests establish scheduling and protocol behavior only.
 
