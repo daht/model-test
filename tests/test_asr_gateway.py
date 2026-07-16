@@ -383,11 +383,13 @@ def test_runtime_submit_failure_clears_worker_readiness_and_fails_session():
         await runtime.scheduler.run_once("fake", force=True)
         event = await runtime.event_queue("s").get()
         snapshot = await runtime.registry.snapshot()
+        backend_sessions = set(adapter.sessions)
         await runtime.abort("s"); await runtime.close()
-        return event, snapshot
-    event, snapshot = asyncio.run(scenario())
+        return event, snapshot, backend_sessions
+    event, snapshot, backend_sessions = asyncio.run(scenario())
     assert event.payload["type"] == "error"
     assert snapshot["ready"] is False
+    assert backend_sessions == set()
 
 
 def test_runtime_records_all_job_timeline_stages_and_counters():
@@ -518,6 +520,76 @@ def test_error_terminal_releases_lease_updates_gauges_and_logs(caplog):
     assert metrics["failures"] == 1
     assert "session_id=s code=invalid_audio exception_type=BufferError" in caplog.text
     assert "private details" not in caplog.text
+
+
+def test_error_terminal_waits_for_accepted_job_and_aborts_backend_session():
+    class WebSocket:
+        async def send_json(self, payload):
+            return None
+
+        async def close(self, code):
+            return None
+
+    class HeldAdapter(FakeAdapter):
+        def __init__(self):
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def submit(self, jobs):
+            self.calls.append(list(jobs))
+            self.entered.set()
+            await self.release.wait()
+            return [
+                InferenceResult.from_job(job, text=f"heard-{job.sample_count}")
+                for job in jobs
+            ]
+
+    async def scenario():
+        adapter = HeldAdapter()
+        settings = Settings(
+            _env_file=None,
+            model_backend="mock",
+            asr_backend="mock",
+            asr_stream_mode="stateful",
+            api_key="test-key",
+            asr_gateway_default_backend="fake",
+            asr_gateway_schedule_max_wait_ms=0,
+        )
+        runtime = GatewayRuntime(settings, {"fake": adapter})
+        await adapter.warmup()
+        await runtime.registry.register(adapter.capabilities)
+        await runtime.registry.mark_ready("fake", True)
+        session = await runtime.open_session("s", language="zh", options={})
+        await runtime.ingest(session, b"\x01\x00" * 4, force=True)
+        dispatch = asyncio.create_task(
+            runtime.scheduler.run_once("fake", force=True)
+        )
+        await adapter.entered.wait()
+
+        failure = asyncio.create_task(
+            runtime.enqueue_error("s", BufferError("private details"))
+        )
+        done, _ = await asyncio.wait({failure}, timeout=0)
+        assert failure not in done
+
+        adapter.release.set()
+        await dispatch
+        await failure
+        ctx = runtime._contexts["s"]
+        await send_outbound_events(runtime, ctx, WebSocket())
+        metrics = runtime.metrics.snapshot()
+        backend_sessions = set(adapter.sessions)
+        contexts = set(runtime._contexts)
+        await runtime.close()
+        return metrics, backend_sessions, contexts
+
+    metrics, backend_sessions, contexts = asyncio.run(scenario())
+
+    assert metrics["failures"] == 1
+    assert metrics["conflicts"] == 0
+    assert backend_sessions == set()
+    assert contexts == set()
 
 
 def test_runtime_enforces_audio_session_and_undecoded_deadlines_with_fake_clock():

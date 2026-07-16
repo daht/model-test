@@ -340,6 +340,9 @@ class GatewayRuntime:
         close_code: int = 1011,
     ) -> None:
         ctx = self._contexts[session_id]
+        generation = ctx.session.generation
+        self.scheduler.cancel_session(session_id, generation=generation)
+        await self.scheduler.wait_session_safe(session_id, generation=generation)
         async with ctx.protocol_lock:
             if ctx.protocol.terminal:
                 return
@@ -350,7 +353,7 @@ class GatewayRuntime:
                 code,
                 type(exc).__name__,
             )
-            ctx.session.fail()
+            await self._fail_session(ctx)
             await self._enqueue_events(
                 ctx,
                 [ctx.protocol.error(exc, code=code)],
@@ -390,6 +393,13 @@ class GatewayRuntime:
         with suppress(Exception):
             await self.adapters[ctx.session.selected_worker_id].abort_session(session_id)
         await self._release_session(session_id)
+
+    async def _fail_session(self, ctx: _SessionContext) -> None:
+        ctx.session.fail()
+        with suppress(Exception):
+            await self.adapters[ctx.session.selected_worker_id].abort_session(
+                ctx.session.session_id
+            )
 
     async def _release_session(self, session_id: str) -> None:
         ctx = self._contexts.pop(session_id, None)
@@ -510,7 +520,7 @@ class GatewayRuntime:
                 return
             self.metrics.conflicts += 1
             async with ctx.protocol_lock:
-                ctx.session.fail()
+                await self._fail_session(ctx)
                 if not ctx.protocol.terminal:
                     event = ctx.protocol.error(exc, code="result_conflict")
                     self._mark_result_applied(result.job_id)
@@ -540,7 +550,7 @@ class GatewayRuntime:
         received_at = record[0].stages.get("audio_received", now) if record else now
         if now - received_at > self.settings.asr_max_connection_lag_seconds:
             self.metrics.failures += 1
-            ctx.session.fail()
+            await self._fail_session(ctx)
             event = ctx.protocol.error(
                 TimeoutError("connection lag exceeded"), code="audio_lag"
             )
@@ -555,7 +565,7 @@ class GatewayRuntime:
             and now - ctx.first_undecoded_at > self.settings.asr_max_undecoded_age_seconds
         ):
             self.metrics.failures += 1
-            ctx.session.fail()
+            await self._fail_session(ctx)
             event = ctx.protocol.error(
                 TimeoutError("undecoded audio age exceeded"), code="audio_lag"
             )
@@ -566,7 +576,7 @@ class GatewayRuntime:
             ctx.idle.set()
             return
         if result.error:
-            ctx.session.fail()
+            await self._fail_session(ctx)
             event = ctx.protocol.error(RuntimeError(result.error))
             self._mark_result_applied(result.job_id)
             await self._enqueue_events(
