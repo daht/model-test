@@ -312,6 +312,9 @@ def test_asr_api_docs_match_websocket_auth_completion_and_audio_error_contract()
     start_message = streaming.split(
         "the authenticated upgrade must be JSON:", 1
     )[1].split("Server ready response:", 1)[0]
+    error_contract = streaming.split("Every version 2 event", 1)[1].split(
+        "The server limits active streams", 1
+    )[0]
     asr_websocket_docs = streaming + python_example + browser_example
 
     assert "Authenticate the WebSocket upgrade with `X-API-Key`" in streaming
@@ -320,6 +323,30 @@ def test_asr_api_docs_match_websocket_auth_completion_and_audio_error_contract()
     assert '"type": "finish"' in streaming
     assert '"type": "end"' not in asr_websocket_docs
     assert "`invalid_audio` and closes the connection with code 1008" in streaming
+    assert (
+        "Gateway error codes emitted by the current Compose service are "
+        "`invalid_start`, `invalid_audio`, `audio_limit`, `invalid_command`, "
+        "`idle_timeout`, `session_timeout`, `audio_lag`, `backend_error`, "
+        "`result_conflict`, and `overloaded`"
+    ) in error_contract
+    assert (
+        "`invalid_start`, `invalid_audio`, `audio_limit`, and `invalid_command` "
+        "close with 1008"
+    ) in error_contract
+    assert (
+        "`idle_timeout`, `session_timeout`, `audio_lag`, `backend_error`, and "
+        "`result_conflict` close with 1011"
+    ) in error_contract
+    assert "`overloaded` closes with 1013" in error_contract
+    assert "1003" not in error_contract
+    for unsupported_gateway_code in (
+        "invalid_language",
+        "frame_too_large",
+        "server_busy",
+        "realtime_lag_exceeded",
+        "inference_timeout",
+    ):
+        assert unsupported_gateway_code not in error_contract
     assert 'new WebSocket("wss://asr-api.example.com' not in browser_example
     for browser_auth_option in (
         "trusted authentication proxy",

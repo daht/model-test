@@ -352,7 +352,7 @@ Server final response:
 
 `final` is sent only after `finish` and contains the remaining uncommitted text. It does not repeat text already delivered by `sentence_final`. The completed transcript is all `sentence_final` messages in order plus the `final` text.
 
-Every version 2 event, including `ready` and `error`, has a strictly increasing `sequence`. Stable error codes include `invalid_start`, `invalid_language`, `invalid_audio`, `frame_too_large`, `server_busy`, `realtime_lag_exceeded`, `session_timeout`, and `inference_timeout`. Invalid PCM returns `invalid_audio` and closes the connection with code 1008. Other protocol errors close with 1003, policy/time limits with 1008, oversized frames with 1009, model/state failures with 1011, and overload with 1013.
+Every version 2 event, including `ready` and `error`, has a strictly increasing `sequence`. Gateway error codes emitted by the current Compose service are `invalid_start`, `invalid_audio`, `audio_limit`, `invalid_command`, `idle_timeout`, `session_timeout`, `audio_lag`, `backend_error`, `result_conflict`, and `overloaded`. Invalid PCM returns `invalid_audio` and closes the connection with code 1008. `invalid_start`, `invalid_audio`, `audio_limit`, and `invalid_command` close with 1008. `idle_timeout`, `session_timeout`, `audio_lag`, `backend_error`, and `result_conflict` close with 1011. `overloaded` closes with 1013. An invalid or missing upgrade key is rejected with 1008 before the WebSocket is accepted and therefore has no error event. A successful `finish` or `abort` closes with 1000.
 
 The server limits active streams, queue jobs, queued audio seconds, per-connection lag, frame bytes, idle time, session time, and cumulative audio duration. It never accepts unbounded real-time backlog.
 
