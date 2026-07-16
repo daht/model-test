@@ -301,6 +301,47 @@ def test_runtime_enforces_audio_session_and_undecoded_deadlines_with_fake_clock(
     asyncio.run(scenario())
 
 
+def test_continuous_successful_decode_progress_refreshes_undecoded_age():
+    async def scenario():
+        clock = type(
+            "Clock", (), {"value": 0.0, "__call__": lambda self: self.value}
+        )()
+        adapter = FakeAdapter()
+        adapter.capabilities = replace(
+            adapter.capabilities,
+            preferred_chunk_samples=4,
+            max_input_samples=4,
+            max_batch_samples=4,
+        )
+        settings = Settings(
+            model_backend="mock",
+            asr_backend="mock",
+            asr_stream_mode="stateful",
+            api_key="test-key",
+            asr_gateway_default_backend="fake",
+            asr_gateway_schedule_max_wait_ms=0,
+            asr_max_undecoded_age_seconds=0.005,
+        )
+        runtime = GatewayRuntime(settings, {"fake": adapter}, clock=clock)
+        await runtime.start()
+        session = await runtime.open_session("s", language="zh", options={})
+        await runtime.ingest(session, b"\x00\x00" * 12, force=True)
+        await runtime.scheduler.run_once("fake", force=True)
+        clock.value = 0.004
+        await runtime.scheduler.run_once("fake", force=True)
+        clock.value = 0.008
+        await runtime.scheduler.run_once("fake", force=True)
+        events = []
+        queue = runtime.event_queue("s")
+        while not queue.empty():
+            events.append(queue.get_nowait().payload)
+        await runtime.abort("s")
+        await runtime.close()
+        return [event["type"] for event in events], len(adapter.calls)
+
+    assert asyncio.run(scenario()) == (["partial"], 3)
+
+
 def test_drain_stops_new_routes_and_waits_for_sticky_session_release():
     async def scenario():
         adapter = FakeAdapter()

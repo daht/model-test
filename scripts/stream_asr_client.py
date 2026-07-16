@@ -364,7 +364,14 @@ async def cleanup_ffmpeg(
             await process.wait()
             return
     try:
-        await asyncio.wait_for(process.wait(), timeout=timeout)
+        stdout = process.stdout
+        if stdout is None:
+            await asyncio.wait_for(process.wait(), timeout=timeout)
+        else:
+            await asyncio.wait_for(
+                asyncio.gather(process.wait(), stdout.read(-1)),
+                timeout=timeout,
+            )
     except TimeoutError as exc:
         raise StreamClientError("ffmpeg could not be reaped") from exc
 
@@ -387,6 +394,7 @@ async def run_stream_tasks(
         )
     )
     tasks = {sender, receiver}
+    primary_error: BaseException | None = None
     try:
         done, _pending = await asyncio.wait(
             tasks, return_when=asyncio.FIRST_COMPLETED
@@ -401,12 +409,19 @@ async def run_stream_tasks(
             await receiver
         else:
             await sender
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
         for task in tasks:
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        await cleanup_ffmpeg(process)
+        try:
+            await cleanup_ffmpeg(process)
+        except BaseException:
+            if primary_error is None:
+                raise
 
 
 async def stream_audio(args: argparse.Namespace) -> None:

@@ -520,6 +520,88 @@ def test_server_close_cancels_sender_and_reaps_ffmpeg_without_task_leak():
     assert process.killed is True
 
 
+def test_ffmpeg_cleanup_failure_does_not_hide_primary_stream_error(monkeypatch):
+    class BlockingStdout:
+        async def read(self, _size):
+            await asyncio.Event().wait()
+
+    class Process:
+        stdout = BlockingStdout()
+        returncode = None
+
+    class ClosedWebSocket:
+        async def send(self, _payload):
+            return None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+    async def broken_cleanup(_process):
+        raise stream_asr_client.StreamClientError("ffmpeg could not be reaped")
+
+    async def scenario():
+        monkeypatch.setattr(stream_asr_client, "cleanup_ffmpeg", broken_cleanup)
+        args = argparse.Namespace(
+            chunk_ms=200,
+            realtime=False,
+            print_mode="events",
+        )
+        with pytest.raises(
+            stream_asr_client.StreamClientError,
+            match="server closed before final",
+        ):
+            await stream_asr_client.run_stream_tasks(
+                ClosedWebSocket(),
+                Process(),
+                args,
+                chunk_size=6400,
+                sequence_tracker=stream_asr_client.SequenceTracker(),
+            )
+
+    asyncio.run(scenario())
+
+
+def test_cleanup_drains_ffmpeg_stdout_after_kill_before_waiting():
+    class Stdout:
+        def __init__(self, process):
+            self.process = process
+
+        async def read(self, _size):
+            await self.process.killed.wait()
+            self.process.drained.set()
+            return b""
+
+    class Process:
+        def __init__(self):
+            self.returncode = None
+            self.killed = asyncio.Event()
+            self.drained = asyncio.Event()
+            self.stdout = Stdout(self)
+
+        def terminate(self):
+            return None
+
+        def kill(self):
+            self.returncode = -9
+            self.killed.set()
+
+        async def wait(self):
+            await self.drained.wait()
+            return self.returncode
+
+    async def scenario():
+        process = Process()
+        await stream_asr_client.cleanup_ffmpeg(process, timeout=0.01)
+        return process
+
+    process = asyncio.run(scenario())
+    assert process.killed.is_set()
+    assert process.drained.is_set()
+
+
 def test_business_error_exits_cleanly_without_traceback(monkeypatch, capsys):
     async def fail(_args):
         raise stream_asr_client.StreamClientError("server closed before final")

@@ -168,19 +168,21 @@ class GatewayRuntime:
             self.settings.asr_max_audio_seconds * session.sample_rate
         ):
             raise RuntimeError("audio duration limit exceeded")
-        if pcm and ctx.first_undecoded_at is None:
-            ctx.first_undecoded_at = self.scheduler.clock()
         if pcm and ctx.vad is not None:
             session.accept_vad_input(pcm)
             decision = ctx.vad.add_audio(pcm)
             if decision.audio_to_model:
                 session.append_pcm(decision.audio_to_model, count_accepted=False)
+                if ctx.first_undecoded_at is None:
+                    ctx.first_undecoded_at = self.scheduler.clock()
             if decision.discarded_samples:
                 session.record_discarded(decision.discarded_samples)
             ctx.endpoint_pending = ctx.endpoint_pending or decision.endpoint
             force = force or decision.endpoint
         elif pcm:
             session.append_pcm(pcm)
+            if ctx.first_undecoded_at is None:
+                ctx.first_undecoded_at = self.scheduler.clock()
         return self._schedule_next(session, force=force)
 
     def check_deadlines(self, session_id: str) -> None:
@@ -399,6 +401,11 @@ class GatewayRuntime:
             self.metrics.conflicts += 1
             raise StaleResultError("job no longer owns the session reservation")
         ctx.session.acknowledge(job.job_sequence, generation=job.generation)
+        accounting = ctx.session.sample_accounting
+        if accounting["buffered"] or accounting["reserved"]:
+            ctx.first_undecoded_at = self.scheduler.clock()
+        else:
+            ctx.first_undecoded_at = None
         self._update_gauges()
 
     async def _reject_job(self, job: InferenceJob) -> None:
