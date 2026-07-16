@@ -297,7 +297,9 @@ if [[ -z "${CONTAINER_ID}" || "${CONTAINER_ID}" == *$'\n'* ]]; then
   echo "Expected exactly one running container for service: ${SERVICE}" >&2
   exit 2
 fi
-if ! nvidia-smi --id="${GPU_INDEX}" -L >/dev/null 2>&1; then
+if ! nvidia-smi --id="${GPU_INDEX}" \
+  --query-gpu=index \
+  --format=csv,noheader,nounits >/dev/null 2>&1; then
   echo "GPU index ${GPU_INDEX} is unavailable" >&2
   exit 2
 fi
