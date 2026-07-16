@@ -217,7 +217,7 @@ def test_gateway_owned_vad_conserves_input_and_commits_endpoint():
 
 def test_exact_maximum_rolls_backend_state_before_remainder_submit():
     async def scenario():
-        adapter = FakeAdapter(); adapter.capabilities = replace(adapter.capabilities, preferred_chunk_samples=6, max_input_samples=6, max_batch_samples=6)
+        adapter = FakeAdapter(); adapter.capabilities = replace(adapter.capabilities, preferred_chunk_samples=6, max_input_samples=6, max_segment_samples=6, max_batch_samples=6)
         order = []
         original_submit = adapter.submit
         async def submit(jobs): order.append(("submit", jobs[0].sample_count)); return await original_submit(jobs)
@@ -408,12 +408,100 @@ def test_default_local_runtime_caps_jobs_to_stateful_frame_contract(monkeypatch)
     caps = runtime.adapters["local"].capabilities
     assert caps.preferred_chunk_samples == 8_000
     assert caps.max_input_samples == 8_000
+    assert caps.max_segment_samples == 320_000
     assert caps.max_input_samples * 2 <= settings.asr_max_frame_bytes
+
+
+def test_backend_frame_jobs_do_not_roll_state_before_segment_boundary():
+    async def scenario():
+        adapter = FakeAdapter()
+        adapter.capabilities = replace(
+            adapter.capabilities,
+            preferred_chunk_samples=4,
+            max_input_samples=4,
+            max_batch_samples=4,
+            max_segment_samples=12,
+        )
+        rollovers = []
+
+        async def finish_segment(session_id):
+            rollovers.append(session_id)
+            return type("R", (), {"text": "", "tail_text": ""})()
+
+        adapter.finish_segment = finish_segment
+        settings = Settings(
+            model_backend="mock",
+            asr_backend="mock",
+            asr_stream_mode="stateful",
+            api_key="test-key",
+            asr_gateway_default_backend="fake",
+            asr_gateway_schedule_max_wait_ms=0,
+        )
+        runtime = GatewayRuntime(settings, {"fake": adapter})
+        await runtime.start()
+        session = await runtime.open_session("s", language="zh", options={})
+        await runtime.ingest(session, b"\x00\x00" * 8, force=True)
+        await runtime.scheduler.run_once("fake", force=True)
+        await runtime.scheduler.run_once("fake", force=True)
+        await runtime.abort("s")
+        await runtime.close()
+        return rollovers, [call[0].sample_count for call in adapter.calls]
+
+    assert asyncio.run(scenario()) == ([], [4, 4])
+
+
+def test_replaceable_backend_keeps_its_segment_identity_across_frame_jobs():
+    async def scenario():
+        adapter = FakeAdapter(result_mode=ResultMode.REPLACEABLE_SEGMENT)
+        adapter.capabilities = replace(
+            adapter.capabilities,
+            preferred_chunk_samples=4,
+            max_input_samples=4,
+            max_batch_samples=4,
+            max_segment_samples=12,
+        )
+        snapshots = iter(("first", "first second"))
+
+        async def submit(jobs):
+            adapter.calls.append(list(jobs))
+            return [
+                InferenceResult.from_job(
+                    jobs[0], text=next(snapshots), segment_id=7
+                )
+            ]
+
+        adapter.submit = submit
+        settings = Settings(
+            model_backend="mock",
+            asr_backend="mock",
+            asr_stream_mode="stateful",
+            api_key="test-key",
+            asr_gateway_default_backend="fake",
+            asr_gateway_schedule_max_wait_ms=0,
+        )
+        runtime = GatewayRuntime(settings, {"fake": adapter})
+        await runtime.start()
+        session = await runtime.open_session("s", language="zh", options={})
+        await runtime.ingest(session, b"\x00\x00" * 8, force=True)
+        await runtime.scheduler.run_once("fake", force=True)
+        await runtime.scheduler.run_once("fake", force=True)
+        events = []
+        queue = runtime.event_queue("s")
+        while not queue.empty():
+            events.append(queue.get_nowait().payload)
+        await runtime.abort("s")
+        await runtime.close()
+        return [(event["type"], event["text"]) for event in events]
+
+    assert asyncio.run(scenario()) == [
+        ("partial", "first"),
+        ("partial", "first second"),
+    ]
 
 
 def test_twenty_second_boundary_rolls_state_before_one_sample_remainder():
     async def scenario():
-        adapter = FakeAdapter(); adapter.capabilities = replace(adapter.capabilities, preferred_chunk_samples=32_000, max_input_samples=320_000, max_batch_samples=320_000)
+        adapter = FakeAdapter(); adapter.capabilities = replace(adapter.capabilities, preferred_chunk_samples=32_000, max_input_samples=32_000, max_segment_samples=320_000, max_batch_samples=32_000)
         order = []; original = adapter.submit
         async def submit(jobs): order.append(("submit", jobs[0].sample_count)); return await original(jobs)
         async def segment(session_id): order.append(("rollover", session_id)); return type("R", (), {"text":"", "tail_text":""})()
@@ -422,7 +510,62 @@ def test_twenty_second_boundary_rolls_state_before_one_sample_remainder():
         runtime = GatewayRuntime(settings, {"fake":adapter}); await runtime.start()
         session = await runtime.open_session("s", language="zh", options={})
         await runtime.ingest(session, b"\x00\x00" * 320_001, force=True)
-        await runtime.scheduler.run_once("fake", force=True); await runtime.scheduler.run_once("fake", force=True)
+        for _ in range(11):
+            await runtime.scheduler.run_once("fake", force=True)
         await runtime.abort("s"); await runtime.close()
         return order
-    assert asyncio.run(scenario()) == [("submit",320_000), ("rollover","s"), ("submit",1)]
+    assert asyncio.run(scenario()) == [
+        *(("submit", 32_000),) * 10,
+        ("rollover", "s"),
+        ("submit", 1),
+    ]
+
+
+def test_segment_boundary_splits_a_backend_frame_before_its_remainder():
+    async def scenario():
+        adapter = FakeAdapter()
+        adapter.capabilities = replace(
+            adapter.capabilities,
+            preferred_chunk_samples=4,
+            max_input_samples=4,
+            max_segment_samples=10,
+            max_batch_samples=4,
+        )
+        order = []
+        original_submit = adapter.submit
+
+        async def submit(jobs):
+            order.append(("submit", jobs[0].sample_count))
+            return await original_submit(jobs)
+
+        async def segment(session_id):
+            order.append(("rollover", session_id))
+            return type("R", (), {"text": "", "tail_text": ""})()
+
+        adapter.submit = submit
+        adapter.finish_segment = segment
+        settings = Settings(
+            model_backend="mock",
+            asr_backend="mock",
+            asr_stream_mode="stateful",
+            api_key="test-key",
+            asr_gateway_default_backend="fake",
+            asr_gateway_schedule_max_wait_ms=0,
+        )
+        runtime = GatewayRuntime(settings, {"fake": adapter})
+        await runtime.start()
+        session = await runtime.open_session("s", language="zh", options={})
+        await runtime.ingest(session, b"\x00\x00" * 12, force=True)
+        for _ in range(4):
+            await runtime.scheduler.run_once("fake", force=True)
+        await runtime.abort("s")
+        await runtime.close()
+        return order
+
+    assert asyncio.run(scenario()) == [
+        ("submit", 4),
+        ("submit", 4),
+        ("submit", 2),
+        ("rollover", "s"),
+        ("submit", 2),
+    ]

@@ -28,6 +28,7 @@ def capabilities(worker_id="worker-1", **overrides):
         result_mode=ResultMode.CUMULATIVE_SNAPSHOT,
         preferred_chunk_samples=24_000,
         max_input_samples=480_000,
+        max_segment_samples=480_000,
         max_batch_items=1,
         max_batch_samples=480_000,
         max_in_flight=1,

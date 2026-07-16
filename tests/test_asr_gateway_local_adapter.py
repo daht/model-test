@@ -57,6 +57,7 @@ def test_adapter_lifecycle_serial_submit_and_snapshot():
     assert adapter.capabilities.result_mode is ResultMode.REPLACEABLE_SEGMENT
     assert backend == "backend-1"
     assert results[0].text == "hello" and results[0].end_sample == 2
+    assert results[0].segment_id == 1
     assert segment.text == "sentence" and final.text == "final"
     assert calls[0] == ("start",) and calls[-1] == ("stop",)
     assert snapshot["ready"] is True

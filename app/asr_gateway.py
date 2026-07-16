@@ -197,11 +197,17 @@ class GatewayRuntime:
     def _schedule_next(self, session: GatewaySession, *, force: bool = False) -> bool:
         preferred = round(self.settings.asr_gateway_default_update_ms / 1000 * session.sample_rate)
         caps = self.adapters[session.selected_worker_id].capabilities
-        count = session.ready_samples(preferred=preferred, maximum=caps.max_input_samples, force=force)
+        ctx = self._contexts[session.session_id]
+        segment_remaining = caps.max_segment_samples - ctx.utterance_samples
+        maximum = min(caps.max_input_samples, segment_remaining)
+        count = session.ready_samples(
+            preferred=preferred,
+            maximum=maximum,
+            force=force,
+        )
         if count <= 0:
             return False
         reservation = session.reserve(count, final=session.finish_requested)
-        ctx = self._contexts[session.session_id]
         ctx.idle.clear()
         bucket = min(15, max(0, count.bit_length() - 1))
         options = session.options
@@ -539,12 +545,12 @@ class GatewayRuntime:
         events = ctx.protocol.apply_result(
             mode, text=text, confirmed_text=result.confirmed_text,
             tail_text=result.tail_text, decoded_samples=result.end_sample - result.start_sample,
-            segment_id=result.job_sequence,
+            segment_id=result.segment_id,
         )
         ctx.utterance_samples += result.end_sample - result.start_sample
         caps = self.adapters[result.worker_id].capabilities
         continuation_ready = False
-        if ctx.endpoint_pending or ctx.utterance_samples >= caps.max_input_samples:
+        if ctx.endpoint_pending or ctx.utterance_samples >= caps.max_segment_samples:
             control = await self.adapters[result.worker_id].finish_segment(result.session_id)
             if control.text:
                 events.extend(self._apply_control_result(ctx, control.text))
@@ -625,6 +631,9 @@ def _default_runtime() -> GatewayRuntime:
             max_frame_samples,
         ),
         max_input_samples=max_frame_samples,
+        max_segment_samples=round(
+            settings.asr_max_utterance_seconds * 16_000
+        ),
     )
     return GatewayRuntime(settings, {"local": adapter})
 

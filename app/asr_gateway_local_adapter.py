@@ -24,6 +24,7 @@ class LocalCoordinatorAdapter:
         session_capacity: int = 2,
         preferred_chunk_samples: int = 24_000,
         max_input_samples: int = 480_000,
+        max_segment_samples: int = 480_000,
         vad_mode: VadMode = VadMode.GATEWAY,
     ) -> None:
         self._factory = coordinator_factory
@@ -36,7 +37,9 @@ class LocalCoordinatorAdapter:
             languages=("auto", "zh", "ja", "en"), tasks=("transcribe",),
             streaming_mode=StreamingMode.STATEFUL, dispatch_mode=DispatchMode.SINGLE,
             vad_mode=vad_mode, result_mode=ResultMode.REPLACEABLE_SEGMENT,
-            preferred_chunk_samples=preferred_chunk_samples, max_input_samples=max_input_samples,
+            preferred_chunk_samples=preferred_chunk_samples,
+            max_input_samples=max_input_samples,
+            max_segment_samples=max_segment_samples,
             max_batch_items=1, max_batch_samples=max_input_samples, max_in_flight=1,
             session_capacity=session_capacity, retry_safe=False, warmed=False,
             backend_id="local",
@@ -73,6 +76,7 @@ class LocalCoordinatorAdapter:
             return [InferenceResult.from_job(
                 job, text=result.segment_text,
                 confirmed_text="", tail_text=result.segment_text,
+                segment_id=result.segment_id,
                 final=bool(result.segment_finished),
             )]
         except Exception as exc:

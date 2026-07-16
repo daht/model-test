@@ -57,6 +57,7 @@ class BackendCapabilities:
     result_mode: ResultMode
     preferred_chunk_samples: int
     max_input_samples: int
+    max_segment_samples: int
     max_batch_items: int
     max_batch_samples: int
     max_in_flight: int
@@ -75,6 +76,7 @@ class BackendCapabilities:
             raise ValueError("backend_id must not be blank")
         for name in (
             "protocol_version", "preferred_chunk_samples", "max_input_samples",
+            "max_segment_samples",
             "max_batch_items", "max_batch_samples", "max_in_flight",
             "session_capacity", "sample_rate",
         ):
@@ -90,6 +92,8 @@ class BackendCapabilities:
             raise ValueError("vad_mode cannot enable gateway and worker ownership")
         if self.preferred_chunk_samples > self.max_input_samples:
             raise ValueError("preferred_chunk_samples exceeds max_input_samples")
+        if self.max_input_samples > self.max_segment_samples:
+            raise ValueError("max_input_samples exceeds max_segment_samples")
 
     @property
     def immutable_identity(self) -> tuple[str, str, str, str]:

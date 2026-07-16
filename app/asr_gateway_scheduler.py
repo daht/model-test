@@ -57,6 +57,7 @@ class InferenceResult:
     worker_id: str
     start_sample: int
     end_sample: int
+    segment_id: int = 0
     text: str = ""
     confirmed_text: str = ""
     tail_text: str = ""
