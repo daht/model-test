@@ -21,13 +21,14 @@ RUN mkdir -p /opt/asr-assets \
       --output /opt/asr-assets/silero_vad.onnx \
     && echo "${SILERO_VAD_SHA256}  /opt/asr-assets/silero_vad.onnx" | sha256sum -c -
 
-COPY requirements.txt requirements-asr-vllm.txt ./
+COPY requirements.txt requirements-asr-vllm.txt requirements-asr-faster-whisper.txt ./
 RUN --mount=type=cache,target=/root/.cache/pip \
     python -m pip install --upgrade pip \
     && python -m pip install \
       --index-url "${PIP_INDEX_URL}" \
       --trusted-host "${PIP_TRUSTED_HOST}" \
-      -r requirements-asr-vllm.txt
+      -r requirements-asr-vllm.txt \
+      -r requirements-asr-faster-whisper.txt
 
 COPY scripts/check_qwen_streaming_contract.py /tmp/check_qwen_streaming_contract.py
 RUN python /tmp/check_qwen_streaming_contract.py \

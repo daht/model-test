@@ -83,7 +83,7 @@ def test_live_dry_run_includes_release_and_strict_language_chunk_matrix():
 
     assert result.returncode == 0
     assert "docker compose" in result.stdout
-    assert "real Qwen warmup" in result.stdout
+    assert "selected real ASR and VAD warmup" in result.stdout
     assert "scripts/smoke_asr.sh" in result.stdout
     assert "--language zh --chunk-ms 200" in result.stdout
     assert "--language zh --chunk-ms 500" in result.stdout

@@ -60,18 +60,31 @@ export ASR_RELEASE_MANIFEST="$PWD/models/Qwen3-ASR-1.7B.manifest.json"
 scripts/verify_asr_release.sh release
 ```
 
-The `.env` must configure `qwen_vllm`, stateful streaming, required model
-manifest verification, eager loading, disabled file transcription, one Uvicorn
-worker, a read-only `/models` mount, and a non-placeholder production API key.
-The configured container paths must match the two host asset paths above.
+For faster-whisper, use the matching environment and artifact paths instead:
+
+```bash
+export ASR_RELEASE_ENV_FILE="$PWD/.env.faster-whisper"
+export ASR_RELEASE_MODEL_DIR="$PWD/models/faster-whisper-large-v3"
+export ASR_RELEASE_MANIFEST="$PWD/models/faster-whisper-large-v3.manifest.json"
+scripts/verify_asr_release.sh release
+```
+
+The environment must configure either `qwen_vllm` with `stateful` streaming or
+`faster_whisper` with `rolling` streaming. The faster-whisper release contract
+additionally fixes FP16, batch four, partial beam one, final beam five, and
+`transcribe`. Both paths require model manifest verification, eager loading,
+disabled file transcription, one Uvicorn worker, a read-only `/models` mount,
+and a non-placeholder production API key. The configured container paths must
+match the two host asset paths above.
 
 Release mode validates the exact model set against the operator-approved
 manifest, renders and checks Docker Compose configuration, builds
-`qwen-asr-api:latest`, reruns the pinned Qwen/vLLM contract and Silero checksum
-inside that image, checks host and container GPU access, and starts a disposable
-Compose container for real Qwen model, manifest, VAD, and streaming warmup. The
-container uses `--rm`; a failure in Docker build/runtime, GPU access, Qwen load,
-Silero verification, or warmup fails the release.
+`qwen-asr-api:latest`, reruns the pinned Qwen/vLLM and faster-whisper package
+contracts plus the Silero checksum inside that image, checks host and container
+GPU access, and starts a disposable Compose container for the selected real
+model, manifest, VAD, and backend warmup. The container uses `--rm`; a failure
+in Docker build/runtime, GPU access, model load, Silero verification, or warmup
+fails the release.
 
 ### One-command cloud deployment
 
@@ -126,7 +139,7 @@ deployment against the deployed service. It includes release and commit mode,
 so use the same fresh validation checkout, `.env`, approved model, Docker host,
 and GPU host described above.
 
-`live` includes R08 and therefore starts a disposable full Qwen model. Do not
+`live` includes R08 and therefore starts a disposable full selected ASR model. Do not
 run it while another model-owning ASR container is loaded on the same GPU. On a
 single A10, use the maintenance workflow above. Its post-cutover command is the
 receipt-bound layer:
@@ -203,12 +216,12 @@ first-partial p95, or multi-service headroom from this gate.
 | C06 | No forbidden tracked path, binary staged delta, or staged file above the size limit exists. |
 | R01 | Checkout is clean before and after the commit gates. |
 | R02 | Docker, Compose, daemon, NVIDIA GPU, `.env`, model, and manifest are available. |
-| R03 | Rendered ASR Compose configuration matches the production stateful contract. |
+| R03 | Rendered ASR Compose configuration matches the selected backend contract. |
 | R04 | Every host model artifact, size, and SHA256 matches the approved manifest. |
 | R05 | The ASR image builds with pinned runtime and Silero build checks. |
 | R06 | Runtime contract and Silero checksum pass inside the built image. |
 | R07 | Both host and disposable image can access the selected NVIDIA runtime. |
-| R08 | Disposable real-Qwen startup completes manifest, VAD, load, and streaming warmup. |
+| R08 | Disposable selected-ASR startup completes manifest, VAD, load, and backend warmup. |
 | L01 | Deployed health, readiness, stream-info, and synthetic WebSocket lifecycle pass. |
 | L02 | All four zh/ja and 200/500 ms strict speech cases pass. |
 | L03 | Concurrent zh and ja streams both pass. |

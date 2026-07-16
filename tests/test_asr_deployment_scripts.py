@@ -82,6 +82,60 @@ def test_production_examples_fail_closed_on_secrets_and_model_provenance():
     assert "unverified target-host download" in runbook
 
 
+def test_faster_whisper_runtime_is_pinned_and_installed_in_asr_image():
+    requirements = Path("requirements-asr-faster-whisper.txt").read_text()
+    dockerfile = Path("Dockerfile.asr").read_text()
+
+    assert "faster-whisper==1.2.1" in requirements
+    assert "ctranslate2==4.8.1" in requirements
+    assert "COPY requirements.txt requirements-asr-vllm.txt requirements-asr-faster-whisper.txt ./" in dockerfile
+    assert "-r requirements-asr-faster-whisper.txt" in dockerfile
+
+
+def test_a10_faster_whisper_example_is_fp16_large_v3_batch_four_transcribe_only():
+    example = Path("cloud/A10.faster-whisper.env.example").read_text()
+
+    required = {
+        "ASR_BACKEND=faster_whisper",
+        "ASR_STREAM_MODE=rolling",
+        "ASR_MODEL_NAME=large-v3",
+        "ASR_MODEL_ID=/models/faster-whisper-large-v3",
+        "ASR_MODEL_MANIFEST_PATH=/models/faster-whisper-large-v3.manifest.json",
+        "ASR_FASTER_WHISPER_COMPUTE_TYPE=float16",
+        "ASR_FASTER_WHISPER_BATCH_SIZE=4",
+        "ASR_FASTER_WHISPER_PARTIAL_BEAM_SIZE=1",
+        "ASR_FASTER_WHISPER_FINAL_BEAM_SIZE=5",
+        "ASR_FASTER_WHISPER_TASK=transcribe",
+    }
+
+    assert required.issubset(set(example.splitlines()))
+    assert "API_KEY=\n" in example
+
+
+def test_runbook_has_faster_whisper_model_manifest_validation_and_qwen_rollback():
+    runbook = Path("cloud/README-A10.md").read_text()
+
+    assert "Systran/faster-whisper-large-v3" in runbook
+    assert "APPROVED_FASTER_WHISPER_REVISION" in runbook
+    assert "cloud/A10.faster-whisper.env.example" in runbook
+    assert "ASR_BACKEND=qwen_vllm" in runbook
+    assert "ASR_STREAM_MODE=stateful" in runbook
+    assert "faster_whisper -> qwen_vllm" in runbook
+
+
+def test_release_gate_accepts_faster_whisper_contract_and_runs_gateway_warmup():
+    verifier = script("verify_asr_release.sh")
+
+    assert '"faster_whisper": "rolling"' in verifier
+    assert '"ASR_FASTER_WHISPER_COMPUTE_TYPE": "float16"' in verifier
+    assert '"ASR_FASTER_WHISPER_BATCH_SIZE": "4"' in verifier
+    assert '"ASR_FASTER_WHISPER_PARTIAL_BEAM_SIZE": "1"' in verifier
+    assert '"ASR_FASTER_WHISPER_FINAL_BEAM_SIZE": "5"' in verifier
+    assert '"ASR_FASTER_WHISPER_TASK": "transcribe"' in verifier
+    assert "from app.asr_gateway import _default_runtime" in verifier
+    assert "create_vad_endpoint_detector" in verifier
+
+
 def _read_websocket_frame(stream):
     first, second = stream.read(2)
     length = second & 0x7F

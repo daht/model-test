@@ -27,6 +27,11 @@ enabled only for adapters that implement and advertise it. The pinned
 `qwen-asr==0.0.6` / `vllm==0.14.0` stateful path uses
 `Qwen/Qwen3-ASR-1.7B`, not the `-hf` Transformers export.
 
+The alternative `faster_whisper` path uses CTranslate2 `large-v3` with rolling
+replaceable partials and real cross-session dynamic batching. The evaluated A10
+profile is FP16, batch four, partial beam one, final beam five, and transcription
+only. See `cloud/A10.faster-whisper.env.example` and `cloud/README-A10.md`.
+
 Model replacement follows drain-and-switch: warm and register the replacement,
 route new sessions to it, drain the old worker for a bounded interval, abort any
 remaining sessions explicitly, then unload it. A10 throughput, accuracy,
@@ -51,8 +56,9 @@ validation requires their worst-case buffered audio to fit within
 stops admission immediately and waits at most `ASR_SHUTDOWN_GRACE_SECONDS` for
 an already-running model call.
 
-The ASR image pins `qwen-asr[vllm]==0.0.6`, `vllm==0.14.0`, and
-`onnxruntime==1.23.2`. It downloads Silero VAD v6.2.1 only during image build,
+The ASR image pins `qwen-asr[vllm]==0.0.6`, `vllm==0.14.0`,
+`faster-whisper==1.2.1`, `ctranslate2==4.8.1`, and `onnxruntime==1.23.2`. It
+downloads Silero VAD v6.2.1 only during image build,
 verifies SHA256 `1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3`,
 and includes the upstream MIT license. Runtime startup never downloads VAD assets.
 
@@ -68,6 +74,7 @@ and includes the upstream MIT license. Runtime startup never downloads VAD asset
 - `Dockerfile`: GPU-capable image based on NVIDIA CUDA runtime.
 - `Dockerfile.asr`: Qwen3-ASR image with optional qwen-asr vLLM dependencies.
 - `requirements-asr-vllm.txt`: optional dependency set for stateful Qwen3-ASR vLLM streaming.
+- `requirements-asr-faster-whisper.txt`: pinned CTranslate2 large-v3 runtime.
 - `docker-compose.yml`: local or cloud VM deployment.
 - `nginx.conf.example`: reverse proxy starter config.
 - `scripts/bootstrap_ubuntu_gpu.sh`: Ubuntu GPU server bootstrap script.

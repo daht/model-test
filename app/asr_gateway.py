@@ -163,7 +163,11 @@ class GatewayRuntime:
 
     def _required_streaming_mode(self):
         from app.asr_gateway_backends import StreamingMode
-        return StreamingMode.STATEFUL if self.settings.asr_stream_mode == "stateful" else StreamingMode.CHUNKED
+        return {
+            "stateful": StreamingMode.STATEFUL,
+            "chunked": StreamingMode.CHUNKED,
+            "rolling": StreamingMode.ROLLING,
+        }[self.settings.asr_stream_mode]
 
     async def ingest(self, session: GatewaySession, pcm: bytes, *, force: bool = False) -> bool:
         ctx = self._contexts[session.session_id]
@@ -214,7 +218,12 @@ class GatewayRuntime:
         )
         if count <= 0:
             return False
-        reservation = session.reserve(count, final=session.finish_requested)
+        final_decode = bool(
+            session.finish_requested
+            or ctx.endpoint_pending
+            or count == segment_remaining
+        )
+        reservation = session.reserve(count, final=final_decode)
         ctx.idle.clear()
         bucket = min(15, max(0, count.bit_length() - 1))
         options = session.options
@@ -230,7 +239,8 @@ class GatewayRuntime:
                 session.selected_worker_id, caps.model_revision, session.language,
                 str(options.get("task", "transcribe")), bool(options.get("timestamps", False)),
                 str(hash(str(options.get("prompt", "")))),
-                str(hash(json.dumps(options, sort_keys=True, default=str))),
+                ("final:" if reservation.chunk.final else "partial:")
+                + str(hash(json.dumps(options, sort_keys=True, default=str))),
                 "pcm_s16le", bucket,
             ),
             final=reservation.chunk.final,
@@ -643,11 +653,36 @@ def _authorized(value: str | None, settings: Settings) -> bool:
 
 
 def _default_runtime() -> GatewayRuntime:
+    settings = get_settings()
+    if settings.asr_backend == "faster_whisper":
+        from app.asr_faster_whisper import FasterWhisperAdapter, FasterWhisperEngine
+
+        max_segment_samples = round(
+            settings.asr_max_utterance_seconds * 16_000
+        )
+        adapter = FasterWhisperAdapter(
+            lambda: FasterWhisperEngine(
+                settings.asr_model_id,
+                device=settings.asr_device,
+                compute_type=settings.asr_faster_whisper_compute_type,
+            ),
+            worker_id="local",
+            model_id=settings.asr_model_id,
+            model_revision=settings.asr_model_name,
+            gpu_id=settings.asr_device,
+            session_capacity=settings.asr_max_active_streams,
+            batch_size=settings.asr_faster_whisper_batch_size,
+            partial_beam_size=settings.asr_faster_whisper_partial_beam_size,
+            final_beam_size=settings.asr_faster_whisper_final_beam_size,
+            max_segment_samples=max_segment_samples,
+            model_manifest_path=settings.asr_model_manifest_path,
+        )
+        return GatewayRuntime(settings, {"local": adapter})
+
     from app.asr import create_asr_transcriber
     from app.asr_gateway_local_adapter import LocalCoordinatorAdapter
     from app.asr_inference import ASRInferenceCoordinator
 
-    settings = get_settings()
     max_frame_samples = settings.asr_max_frame_bytes // 2
     adapter = LocalCoordinatorAdapter(
         lambda: ASRInferenceCoordinator(settings, lambda: create_asr_transcriber(settings)),

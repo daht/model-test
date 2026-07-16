@@ -193,6 +193,63 @@ def test_explicit_mock_backend_accepts_dummy_api_key():
     assert settings.api_key == "test-key"
 
 
+def test_faster_whisper_large_v3_configuration_contract():
+    settings = Settings(
+        _env_file=None,
+        asr_backend="faster_whisper",
+        asr_stream_mode="rolling",
+        asr_model_name="large-v3",
+        asr_model_id="/models/faster-whisper-large-v3",
+        asr_faster_whisper_compute_type="float16",
+        asr_faster_whisper_batch_size=4,
+        asr_faster_whisper_partial_beam_size=1,
+        asr_faster_whisper_final_beam_size=5,
+        asr_faster_whisper_task="transcribe",
+        api_key=TEST_ONLY_LONG_API_KEY,
+    )
+
+    assert settings.asr_backend == "faster_whisper"
+    assert settings.asr_stream_mode == "rolling"
+    assert settings.asr_faster_whisper_batch_size == 4
+    assert settings.asr_faster_whisper_partial_beam_size == 1
+    assert settings.asr_faster_whisper_final_beam_size == 5
+    assert settings.asr_faster_whisper_task == "transcribe"
+
+
+@pytest.mark.parametrize(
+    "overrides,match",
+    [
+        ({"asr_stream_mode": "stateful"}, "rolling"),
+        ({"asr_faster_whisper_batch_size": 0}, "greater than 0"),
+        ({"asr_faster_whisper_partial_beam_size": 0}, "greater than 0"),
+        ({"asr_faster_whisper_final_beam_size": 0}, "greater than 0"),
+    ],
+)
+def test_faster_whisper_rejects_invalid_stream_and_decode_settings(overrides, match):
+    values = {
+        "_env_file": None,
+        "asr_backend": "faster_whisper",
+        "asr_stream_mode": "rolling",
+        "asr_model_id": "/models/faster-whisper-large-v3",
+        "api_key": TEST_ONLY_LONG_API_KEY,
+    }
+    values.update(overrides)
+
+    with pytest.raises(ValidationError, match=match):
+        Settings(**values)
+
+
+def test_faster_whisper_is_a_production_backend_for_api_key_validation(monkeypatch):
+    monkeypatch.delenv("API_KEY", raising=False)
+
+    with pytest.raises(ValidationError, match="API key"):
+        Settings(
+            _env_file=None,
+            asr_backend="faster_whisper",
+            asr_stream_mode="rolling",
+        )
+
+
 @pytest.mark.parametrize(
     ("backend", "stream_mode"),
     [

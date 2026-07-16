@@ -33,7 +33,7 @@ Options:
 
 Release environment:
   ASR_RELEASE_ENV_FILE       Must identify the repository .env file. Default: .env
-  ASR_RELEASE_MODEL_DIR      Host path to the approved Qwen model directory.
+  ASR_RELEASE_MODEL_DIR      Host path to the approved ASR model directory.
   ASR_RELEASE_MANIFEST       Host path to the operator-approved model manifest.
 
 Deployed-live environment:
@@ -66,12 +66,12 @@ list_release_gates() {
   cat <<'EOF'
 R01 release checkout: commit gates run from a clean checkout or clean CI workspace
 R02 release prerequisites: Docker Compose, Docker daemon, NVIDIA runtime, .env, model, and manifest exist
-R03 Compose config: rendered qwen-asr-api config is production stateful, authenticated, and model-mounted
+R03 Compose config: rendered qwen-asr-api config matches its selected production backend contract
 R04 model provenance: exact host artifact set matches the operator-approved manifest
 R05 ASR image build: Dockerfile.asr completes its pinned dependency and Silero checksum build gates
-R06 image runtime: pinned Qwen/vLLM contract and Silero checksum pass inside the built image
+R06 image runtime: pinned Qwen and faster-whisper contracts plus Silero checksum pass inside the image
 R07 container GPU runtime: host and built image can access the NVIDIA GPU
-R08 real Qwen warmup: one-shot container loads the approved model, VAD, and streaming decode path
+R08 real ASR warmup: one-shot container loads the selected approved model, VAD, and decode path
 EOF
 }
 
@@ -138,12 +138,12 @@ print_release_plan() {
   cat <<'EOF'
 R01 require clean git checkout
 R02 require docker compose, Docker daemon, nvidia-smi, .env, approved model, and manifest
-R03 docker compose --env-file .env config --format json; validate qwen-asr-api settings
+R03 docker compose --env-file .env config --format json; validate selected ASR backend settings
 R04 python -m app.asr_artifacts verify --model-dir <model> --manifest <manifest>
 R05 docker compose --env-file .env build qwen-asr-api
 R06 docker run qwen-asr-api:latest pinned runtime contract and Silero checksum checks
 R07 nvidia-smi -L; docker run --rm --gpus all qwen-asr-api:latest nvidia-smi -L
-R08 docker compose run --rm qwen-asr-api real Qwen warmup
+R08 docker compose run --rm qwen-asr-api selected real ASR and VAD warmup
 EOF
 }
 
@@ -572,13 +572,27 @@ except (KeyError, TypeError) as exc:
 environment = service.get("environment") or {}
 if isinstance(environment, list):
     environment = dict(item.split("=", 1) for item in environment if "=" in item)
+backend = str(environment.get("ASR_BACKEND", "")).lower()
+stream_contracts = {
+    "qwen_vllm": "stateful",
+    "faster_whisper": "rolling",
+}
+if backend not in stream_contracts:
+    raise SystemExit(f"Compose ASR_BACKEND is unsupported for release: {backend or '<missing>'}")
 required = {
-    "ASR_BACKEND": "qwen_vllm",
-    "ASR_STREAM_MODE": "stateful",
+    "ASR_STREAM_MODE": stream_contracts[backend],
     "ASR_REQUIRE_MODEL_MANIFEST": "true",
     "ASR_EAGER_LOAD": "true",
     "ASR_FILE_TRANSCRIBE_ENABLED": "false",
 }
+if backend == "faster_whisper":
+    required.update({
+        "ASR_FASTER_WHISPER_COMPUTE_TYPE": "float16",
+        "ASR_FASTER_WHISPER_BATCH_SIZE": "4",
+        "ASR_FASTER_WHISPER_PARTIAL_BEAM_SIZE": "1",
+        "ASR_FASTER_WHISPER_FINAL_BEAM_SIZE": "5",
+        "ASR_FASTER_WHISPER_TASK": "transcribe",
+    })
 for name, expected in required.items():
     actual = str(environment.get(name, "")).lower()
     if actual != expected:
@@ -671,12 +685,14 @@ run_release_gates() {
   docker compose --env-file "${env_file}" build qwen-asr-api
   docker image inspect qwen-asr-api:latest >/dev/null
 
-  gate R06 "Pinned Qwen runtime contract inside image"
+  gate R06 "Pinned ASR runtime contracts inside image"
   docker run --rm \
     --entrypoint python \
     --volume "${ROOT_DIR}/scripts/check_qwen_streaming_contract.py:/tmp/check_qwen_streaming_contract.py:ro" \
     qwen-asr-api:latest \
     /tmp/check_qwen_streaming_contract.py
+  docker run --rm --entrypoint python qwen-asr-api:latest -c \
+    'import importlib.metadata as m; assert m.version("faster-whisper") == "1.2.1"; assert m.version("ctranslate2") == "4.8.1"'
   docker run --rm --entrypoint python qwen-asr-api:latest -c \
     'import hashlib, pathlib; p=pathlib.Path("/opt/asr-assets/silero_vad.onnx"); expected="1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"; actual=hashlib.sha256(p.read_bytes()).hexdigest(); assert actual == expected, actual'
 
@@ -684,10 +700,24 @@ run_release_gates() {
   nvidia-smi -L
   docker run --rm --gpus all --entrypoint nvidia-smi qwen-asr-api:latest -L
 
-  gate R08 "One-shot real Qwen, manifest, VAD, and streaming warmup"
+  gate R08 "One-shot selected ASR, manifest, VAD, and streaming warmup"
   docker compose --env-file "${env_file}" run --rm --no-deps \
     --entrypoint python qwen-asr-api -c \
-    'from app.asr import create_asr_transcriber; from app.config import Settings; settings=Settings(); transcriber=create_asr_transcriber(settings); transcriber.warmup(); assert getattr(transcriber, "streaming_warmup_complete", False)'
+    'import asyncio
+from app.asr_gateway import _default_runtime
+from app.asr_vad import create_vad_endpoint_detector
+from app.config import Settings
+async def verify():
+    settings = Settings()
+    create_vad_endpoint_detector(settings)
+    runtime = _default_runtime()
+    await runtime.start()
+    try:
+        snapshot = await runtime.adapters["local"].snapshot()
+        assert snapshot["ready"] and snapshot["accepting"]
+    finally:
+        await runtime.close()
+asyncio.run(verify())'
 }
 
 audio_duration() {

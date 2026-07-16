@@ -5,7 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.asr_gateway import GatewayRuntime, OutboundEvent, _default_runtime, create_app, send_outbound_events
-from app.asr_gateway_backends import DispatchMode, ResultMode, VadMode
+from app.asr_gateway_backends import DispatchMode, ResultMode, StreamingMode, VadMode
 from app.asr_gateway_scheduler import InferenceResult
 from app.config import Settings
 from scripts import stream_asr_client
@@ -557,6 +557,112 @@ def test_default_local_runtime_caps_jobs_to_stateful_frame_contract(monkeypatch)
     assert caps.max_input_samples == 8_000
     assert caps.max_segment_samples == 320_000
     assert caps.max_input_samples * 2 <= settings.asr_max_frame_bytes
+
+
+def test_default_runtime_selects_faster_whisper_without_removing_qwen_rollback(monkeypatch):
+    from app.asr_faster_whisper import FasterWhisperAdapter
+    from app.asr_gateway_local_adapter import LocalCoordinatorAdapter
+
+    faster_settings = Settings(
+        _env_file=None,
+        model_backend="mock",
+        asr_backend="faster_whisper",
+        asr_stream_mode="rolling",
+        asr_model_name="large-v3",
+        asr_model_id="/models/faster-whisper-large-v3",
+        api_key="unit-test-only-not-a-production-secret-000000",
+        asr_faster_whisper_batch_size=4,
+    )
+    monkeypatch.setattr("app.asr_gateway.get_settings", lambda: faster_settings)
+    faster_runtime = _default_runtime()
+
+    assert isinstance(faster_runtime.adapters["local"], FasterWhisperAdapter)
+    assert faster_runtime.adapters["local"].capabilities.max_batch_items == 4
+
+    qwen_settings = Settings(
+        _env_file=None,
+        model_backend="mock",
+        asr_backend="qwen_vllm",
+        asr_stream_mode="stateful",
+        asr_model_id="Qwen/Qwen3-ASR-1.7B",
+        api_key="unit-test-only-not-a-production-secret-000000",
+    )
+    monkeypatch.setattr("app.asr_gateway.get_settings", lambda: qwen_settings)
+    qwen_runtime = _default_runtime()
+
+    assert isinstance(qwen_runtime.adapters["local"], LocalCoordinatorAdapter)
+
+
+def test_rolling_route_and_endpoint_jobs_use_final_decode_batch_identity():
+    async def scenario():
+        adapter = FakeAdapter(dynamic=True, result_mode=ResultMode.REPLACEABLE_SEGMENT)
+        adapter.capabilities = replace(
+            adapter.capabilities,
+            streaming_mode=StreamingMode.ROLLING,
+            vad_mode=VadMode.NONE,
+            preferred_chunk_samples=4,
+            max_input_samples=16,
+            max_segment_samples=16,
+            max_batch_samples=64,
+        )
+        settings = Settings(
+            _env_file=None,
+            model_backend="mock",
+            asr_backend="mock",
+            asr_stream_mode="rolling",
+            api_key="test-key",
+            asr_gateway_default_backend="fake",
+            asr_gateway_schedule_max_wait_ms=0,
+        )
+        runtime = GatewayRuntime(settings, {"fake": adapter})
+        await runtime.start()
+        session = await runtime.open_session("s", language="zh", options={})
+        runtime._contexts["s"].endpoint_pending = True
+        await runtime.ingest(session, b"\x01\x00" * 4, force=True)
+        queued = runtime.scheduler._queues["fake"][0]
+        await runtime.abort("s")
+        await runtime.close()
+        return runtime._required_streaming_mode(), queued
+
+    mode, queued = asyncio.run(scenario())
+
+    assert mode is StreamingMode.ROLLING
+    assert queued.final is True
+    assert queued.batch_key.decoding_identity.startswith("final:")
+
+
+def test_exact_maximum_job_is_final_for_batched_beam_five_rollover():
+    async def scenario():
+        adapter = FakeAdapter(dynamic=True, result_mode=ResultMode.REPLACEABLE_SEGMENT)
+        adapter.capabilities = replace(
+            adapter.capabilities,
+            preferred_chunk_samples=4,
+            max_input_samples=4,
+            max_segment_samples=4,
+            max_batch_samples=16,
+        )
+        settings = Settings(
+            _env_file=None,
+            model_backend="mock",
+            asr_backend="mock",
+            asr_stream_mode="stateful",
+            api_key="test-key",
+            asr_gateway_default_backend="fake",
+            asr_gateway_schedule_max_wait_ms=0,
+        )
+        runtime = GatewayRuntime(settings, {"fake": adapter})
+        await runtime.start()
+        session = await runtime.open_session("s", language="zh", options={})
+        await runtime.ingest(session, b"\x01\x00" * 4, force=True)
+        queued = runtime.scheduler._queues["fake"][0]
+        await runtime.abort("s")
+        await runtime.close()
+        return queued
+
+    queued = asyncio.run(scenario())
+
+    assert queued.final is True
+    assert queued.batch_key.decoding_identity.startswith("final:")
 
 
 def test_backend_frame_jobs_do_not_roll_state_before_segment_boundary():

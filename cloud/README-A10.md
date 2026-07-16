@@ -1,5 +1,65 @@
 # HY-MT1.5-1.8B on NVIDIA A10
 
+## faster-whisper large-v3 evaluation deployment
+
+The selectable `faster_whisper` path uses one CTranslate2 `large-v3` model
+owner, FP16, rolling partial beam one, utterance-final beam five, and dynamic
+cross-session batches of four. It performs transcription only. The initial
+`ASR_MAX_ACTIVE_STREAMS=14` in the dedicated example is a test starting point,
+not a validated A10 capacity claim.
+
+On a trusted staging host, choose and record an immutable revision from
+`Systran/faster-whisper-large-v3`, then download exactly that revision:
+
+```bash
+export APPROVED_FASTER_WHISPER_REVISION='<immutable-hugging-face-commit-sha>'
+hf download Systran/faster-whisper-large-v3 \
+  --revision "${APPROVED_FASTER_WHISPER_REVISION}" \
+  --local-dir models/faster-whisper-large-v3
+python3 -m app.asr_artifacts create \
+  --model-dir models/faster-whisper-large-v3 \
+  --output models/faster-whisper-large-v3.manifest.json \
+  --source Systran/faster-whisper-large-v3 \
+  --revision "${APPROVED_FASTER_WHISPER_REVISION}"
+```
+
+Do not create the approval manifest from an unverified target-host download.
+Transfer the model directory and manifest through the authenticated release
+channel. Prepare the faster-whisper environment without copying a runtime key
+onto a command line:
+
+```bash
+cp cloud/A10.faster-whisper.env.example .env.faster-whisper
+chmod 600 .env.faster-whisper
+editor .env.faster-whisper
+docker compose --env-file .env.faster-whisper build qwen-asr-api
+docker compose --env-file .env.faster-whisper up -d --force-recreate --no-deps qwen-asr-api
+docker compose --env-file .env.faster-whisper ps qwen-asr-api
+docker compose --env-file .env.faster-whisper logs --tail 200 qwen-asr-api
+```
+
+Before cutover, run the backend-aware release gate against the same environment
+and approved artifacts:
+
+```bash
+export ASR_RELEASE_ENV_FILE="$PWD/.env.faster-whisper"
+export ASR_RELEASE_MODEL_DIR="$PWD/models/faster-whisper-large-v3"
+export ASR_RELEASE_MANIFEST="$PWD/models/faster-whisper-large-v3.manifest.json"
+scripts/verify_asr_release.sh release
+```
+
+Verify `/ready`, strict Chinese/Japanese speech, and a 1/4/8/12/14/16 stream
+sweep while recording p50/p95 completion overhead, errors, batch fill, GPU
+utilization, and peak VRAM. Promotion additionally requires an approved
+multilingual CER/WER corpus for Chinese, Yue, English, Japanese, and Korean.
+The repository's mock tests establish scheduling and protocol behavior only.
+
+Keep the previous Qwen environment and image until the evaluation passes. The
+atomic rollback direction is `faster_whisper -> qwen_vllm`: restore the prior
+environment with `ASR_BACKEND=qwen_vllm`, `ASR_STREAM_MODE=stateful`, the Qwen
+model ID and matching manifest, recreate only `qwen-asr-api`, then require
+`/ready` and strict speech verification before reopening admission.
+
 ## Semantic Gateway topology
 
 Deploy one ASR process, one Uvicorn worker, and one model owner on each A10.

@@ -31,8 +31,8 @@ class Settings(BaseSettings):
     asr_model_id: str = "/models/Qwen3-ASR-1.7B-hf"
     asr_require_model_manifest: bool = False
     asr_model_manifest_path: str | None = None
-    asr_backend: Literal["qwen", "qwen_vllm", "mock"] = "qwen"
-    asr_stream_mode: Literal["chunked", "stateful"] = "chunked"
+    asr_backend: Literal["qwen", "qwen_vllm", "faster_whisper", "mock"] = "qwen"
+    asr_stream_mode: Literal["chunked", "stateful", "rolling"] = "chunked"
     api_key: str = Field(default="change-me", description="Required X-API-Key value")
     device: str = "auto"
     torch_dtype: Literal["auto", "float16", "bfloat16", "float32"] = "float16"
@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     asr_vllm_gpu_memory_utilization: float = Field(default=0.8, gt=0, lt=1)
     asr_vllm_max_model_len: int = Field(default=65536, ge=512, le=65536)
     asr_vllm_max_new_tokens: int = Field(default=32, gt=0)
+    asr_faster_whisper_compute_type: Literal["float16", "int8_float16", "int8"] = "float16"
+    asr_faster_whisper_batch_size: int = Field(default=4, gt=0, le=32)
+    asr_faster_whisper_partial_beam_size: int = Field(default=1, gt=0, le=20)
+    asr_faster_whisper_final_beam_size: int = Field(default=5, gt=0, le=20)
+    asr_faster_whisper_task: Literal["transcribe"] = "transcribe"
     asr_stream_unfixed_chunk_num: int = Field(default=2, ge=0)
     asr_stream_unfixed_token_num: int = Field(default=5, ge=0)
     asr_stream_rollover_seconds: float = Field(default=120.0, gt=0, le=3600)
@@ -133,7 +138,7 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def bound_websocket_buffered_audio(self) -> "Settings":
-        if self.asr_backend in {"qwen", "qwen_vllm"}:
+        if self.asr_backend in {"qwen", "qwen_vllm", "faster_whisper"}:
             normalized_api_key = self.api_key.strip()
             if (
                 len(normalized_api_key) < PRODUCTION_API_KEY_MIN_LENGTH
@@ -159,6 +164,8 @@ class Settings(BaseSettings):
             )
         if self.asr_backend == "qwen" and self.asr_stream_mode == "stateful":
             raise ValueError("asr_backend=qwen does not support stateful streaming")
+        if self.asr_backend == "faster_whisper" and self.asr_stream_mode != "rolling":
+            raise ValueError("asr_backend=faster_whisper requires rolling streaming")
         if self.asr_vad_onset_threshold <= self.asr_vad_offset_threshold:
             raise ValueError(
                 "asr_vad_onset_threshold must exceed asr_vad_offset_threshold"
