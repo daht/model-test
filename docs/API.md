@@ -34,7 +34,9 @@ HTTP APIs require this header:
 X-API-Key: <your-api-key>
 ```
 
-WebSocket streaming sends the API key in the first JSON message.
+ASR WebSocket streaming authenticates the HTTP upgrade with `X-API-Key`; do
+not put credentials in the ASR `start` JSON. The TTS WebSocket protocol retains
+its separate authentication and completion semantics documented below.
 
 Production `qwen` and `qwen_vllm` configuration fails closed unless `API_KEY`
 is at least 32 characters and is not a known placeholder. Generate it with
@@ -228,7 +230,7 @@ chunk size:  100ms to 500ms recommended
 endpointing: pinned Silero VAD v6.2.1 on CPU with onset/offset hysteresis
 speech/silence: 250ms minimum speech, 800ms minimum trailing silence, 160ms hangover
 pre-roll: 200ms rolling audio plus every onset-candidate frame
-immutable commits: VAD endpoint, explicit segment, 30s utterance boundary, or end only
+immutable commits: VAD endpoint, explicit segment, 30s utterance boundary, or end-of-input only
 ```
 
 Production stateful qwen vLLM mode:
@@ -348,9 +350,9 @@ Server final response:
 }
 ```
 
-`final` is sent only after `end` and contains the remaining uncommitted text. It does not repeat text already delivered by `sentence_final`. The completed transcript is all `sentence_final` messages in order plus the `final` text.
+`final` is sent only after `finish` and contains the remaining uncommitted text. It does not repeat text already delivered by `sentence_final`. The completed transcript is all `sentence_final` messages in order plus the `final` text.
 
-Every version 2 event, including `ready` and `error`, has a strictly increasing `sequence`. Stable error codes include `invalid_start`, `invalid_language`, `invalid_audio_frame`, `frame_too_large`, `server_busy`, `realtime_lag_exceeded`, `session_timeout`, and `inference_timeout`. Protocol errors close with 1003, policy/time limits with 1008, oversized frames with 1009, model/state failures with 1011, and overload with 1013.
+Every version 2 event, including `ready` and `error`, has a strictly increasing `sequence`. Stable error codes include `invalid_start`, `invalid_language`, `invalid_audio`, `frame_too_large`, `server_busy`, `realtime_lag_exceeded`, `session_timeout`, and `inference_timeout`. Invalid PCM returns `invalid_audio` and closes the connection with code 1008. Other protocol errors close with 1003, policy/time limits with 1008, oversized frames with 1009, model/state failures with 1011, and overload with 1013.
 
 The server limits active streams, queue jobs, queued audio seconds, per-connection lag, frame bytes, idle time, session time, and cumulative audio duration. It never accepts unbounded real-time backlog.
 
@@ -618,27 +620,12 @@ console.log(data.text);
 
 ### ASR WebSocket
 
-```javascript
-const ws = new WebSocket("wss://asr-api.example.com/v1/transcribe/stream");
-
-ws.onopen = () => {
-  ws.send(JSON.stringify({
-    type: "start",
-    api_key: "<your-api-key>",
-    language: "zh",
-    sample_rate: 16000,
-    format: "pcm_s16le"
-  }));
-};
-
-ws.onmessage = (event) => {
-  const message = JSON.parse(event.data);
-  console.log(message.type, message.text || message.message || "");
-};
-
-// After sending binary PCM chunks:
-// ws.send(JSON.stringify({ type: "end" }));
-```
+The browser `WebSocket` API cannot directly set the custom `X-API-Key` header
+on the HTTP upgrade, so a direct browser connection cannot use the ASR endpoint
+as documented. Browser deployments need a trusted authentication proxy, a
+WebSocket subprotocol, or a short-lived token mechanism. The trusted boundary
+must validate that browser credential and have it translated to `X-API-Key` for
+the upstream ASR upgrade. Do not put credentials in the ASR `start` JSON.
 
 Browser microphone audio is usually Float32 PCM at the device sample rate. Convert it to `16kHz mono pcm_s16le` before sending.
 

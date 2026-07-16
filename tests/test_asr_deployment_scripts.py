@@ -296,3 +296,35 @@ def test_shipped_clients_use_upgrade_auth_authenticated_info_and_finish_command(
     assert 'f"X-API-Key: {os.environ[\'API_KEY\']}\\r\\n' in smoke
     assert 'json.dumps({"type": "finish"})' in smoke
     assert '"type": "end"' not in smoke
+
+
+def test_asr_api_docs_match_websocket_auth_completion_and_audio_error_contract():
+    docs = Path("docs/API.md").read_text()
+    streaming = docs.split("## ASR WebSocket Streaming", 1)[1].split(
+        "## TTS Synthesis", 1
+    )[0]
+    python_example = docs.split("### ASR WebSocket", 1)[1].split(
+        "## JavaScript Examples", 1
+    )[0]
+    browser_example = docs.split("## JavaScript Examples", 1)[1].split(
+        "### TTS HTTP", 1
+    )[0]
+    start_message = streaming.split(
+        "the authenticated upgrade must be JSON:", 1
+    )[1].split("Server ready response:", 1)[0]
+    asr_websocket_docs = streaming + python_example + browser_example
+
+    assert "Authenticate the WebSocket upgrade with `X-API-Key`" in streaming
+    assert "api_key" not in start_message
+    assert '"api_key"' not in asr_websocket_docs
+    assert '"type": "finish"' in streaming
+    assert '"type": "end"' not in asr_websocket_docs
+    assert "`invalid_audio` and closes the connection with code 1008" in streaming
+    assert 'new WebSocket("wss://asr-api.example.com' not in browser_example
+    for browser_auth_option in (
+        "trusted authentication proxy",
+        "WebSocket subprotocol",
+        "short-lived token",
+        "translated to `X-API-Key`",
+    ):
+        assert browser_auth_option in browser_example
