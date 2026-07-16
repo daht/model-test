@@ -402,6 +402,57 @@ def test_cli_help_explains_strict_credential_source(capsys):
     assert "API_KEY environment variable" in help_text
 
 
+def test_legacy_stream_info_selects_payload_key_and_end_command():
+    stream_info = {
+        "protocol_version": 2,
+        "start_message": {
+            "type": "start",
+            "api_key": "<your-api-key>",
+            "language": "zh",
+        },
+        "end_message": {"type": "end"},
+    }
+
+    assert stream_asr_client.detect_protocol(stream_info) == "legacy"
+    assert stream_asr_client.build_start_message(
+        protocol="legacy",
+        api_key="runtime-key",
+        language="zh",
+        sample_rate=16000,
+    ) == {
+        "type": "start",
+        "api_key": "runtime-key",
+        "language": "zh",
+        "sample_rate": 16000,
+        "format": "pcm_s16le",
+    }
+    assert stream_asr_client.finish_message("legacy") == {"type": "end"}
+
+
+def test_gateway_stream_info_selects_header_auth_and_finish_command():
+    stream_info = {
+        "protocol_version": 2,
+        "websocket_url": "/v1/transcribe/stream",
+        "format": "pcm_s16le",
+        "sample_rate": 16000,
+        "channels": 1,
+    }
+
+    assert stream_asr_client.detect_protocol(stream_info) == "gateway"
+    assert stream_asr_client.build_start_message(
+        protocol="gateway",
+        api_key="runtime-key",
+        language="zh",
+        sample_rate=16000,
+    ) == {
+        "type": "start",
+        "language": "zh",
+        "sample_rate": 16000,
+        "format": "pcm_s16le",
+    }
+    assert stream_asr_client.finish_message("gateway") == {"type": "finish"}
+
+
 def test_error_payload_is_not_treated_as_transcript():
     state = stream_asr_client.DisplayState()
 

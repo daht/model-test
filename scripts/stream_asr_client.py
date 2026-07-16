@@ -87,6 +87,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sample-rate", type=int, default=16000)
     parser.add_argument("--chunk-ms", type=int, default=200)
     parser.add_argument("--print-mode", choices=["events", "display"], default="events")
+    parser.add_argument(
+        "--protocol",
+        choices=["auto", "legacy", "gateway"],
+        default="auto",
+        help="Streaming protocol; auto detects it from /stream-info.",
+    )
     parser.add_argument("--stream-info-url", default=os.environ.get("STREAM_INFO_URL"))
     parser.add_argument("--show-stream-info", action="store_true")
     parser.add_argument(
@@ -139,6 +145,39 @@ def fetch_stream_info(url: str, api_key: str) -> dict[str, object]:
     request = urllib.request.Request(url, headers={"X-API-Key": api_key})
     with urllib.request.urlopen(request, timeout=10) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def detect_protocol(stream_info: dict[str, object]) -> str:
+    start_message = stream_info.get("start_message")
+    end_message = stream_info.get("end_message")
+    if (isinstance(start_message, dict) and "api_key" in start_message) or (
+        isinstance(end_message, dict)
+        and end_message.get("type") == "end"
+    ):
+        return "legacy"
+    return "gateway"
+
+
+def build_start_message(
+    *,
+    protocol: str,
+    api_key: str,
+    language: str,
+    sample_rate: int,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "type": "start",
+        "language": language,
+        "sample_rate": sample_rate,
+        "format": "pcm_s16le",
+    }
+    if protocol == "legacy":
+        payload["api_key"] = api_key
+    return payload
+
+
+def finish_message(protocol: str) -> dict[str, str]:
+    return {"type": "end" if protocol == "legacy" else "finish"}
 
 
 async def start_ffmpeg(
@@ -300,7 +339,7 @@ async def send_audio(
     if return_code:
         raise StreamClientError(f"ffmpeg exited with status {return_code}")
     try:
-        await websocket.send(json.dumps({"type": "finish"}))
+        await websocket.send(json.dumps(finish_message(args.protocol)))
     except websockets.ConnectionClosed as exc:
         raise StreamClientError("server closed before end could be sent") from exc
 
@@ -373,10 +412,17 @@ async def run_stream_tasks(
 async def stream_audio(args: argparse.Namespace) -> None:
     validate_api_key_input(args)
 
-    if args.show_stream_info:
+    stream_info = None
+    if args.show_stream_info or args.protocol == "auto":
         stream_info_url = args.stream_info_url or default_stream_info_url(args.url)
+        stream_info = fetch_stream_info(stream_info_url, args.api_key)
+    if args.show_stream_info:
         print("ASR stream info:")
-        print(json.dumps(fetch_stream_info(stream_info_url, args.api_key), ensure_ascii=False, indent=2))
+        print(json.dumps(stream_info, ensure_ascii=False, indent=2))
+    if args.protocol == "auto":
+        if not isinstance(stream_info, dict):
+            raise StreamClientError("stream-info response must be a JSON object")
+        args.protocol = detect_protocol(stream_info)
 
     bytes_per_second = args.sample_rate * 2
     chunk_size = max(1, bytes_per_second * args.chunk_ms // 1000)
@@ -388,12 +434,12 @@ async def stream_audio(args: argparse.Namespace) -> None:
     ) as websocket:
         await websocket.send(
             json.dumps(
-                {
-                    "type": "start",
-                    "language": args.language,
-                    "sample_rate": args.sample_rate,
-                    "format": "pcm_s16le",
-                },
+                build_start_message(
+                    protocol=args.protocol,
+                    api_key=args.api_key,
+                    language=args.language,
+                    sample_rate=args.sample_rate,
+                ),
                 ensure_ascii=False,
             )
         )
