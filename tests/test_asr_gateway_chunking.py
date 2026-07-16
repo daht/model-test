@@ -2,6 +2,7 @@ import pytest
 
 from app.asr_gateway_backends import VadMode
 from app.asr_gateway_chunking import ChunkPolicy, PcmRingBuffer
+from app.asr_observability import CapacityBufferError
 
 
 def test_ring_buffer_exact_boundary_retains_remainder():
@@ -23,6 +24,17 @@ def test_ring_buffer_rollback_restores_exact_range():
     assert ring.buffered_samples == 8
     again = ring.reserve_range(8)
     assert (again.start_sample, again.end_sample) == (0, 8)
+
+
+def test_ring_buffer_overflow_has_exact_capacity_reason_and_accounting():
+    ring = PcmRingBuffer(max_samples=4)
+    ring.append(b"\x00\x00" * 3)
+
+    with pytest.raises(CapacityBufferError, match="buffer") as rejected:
+        ring.append(b"\x00\x00" * 2)
+
+    assert rejected.value.reason == "session_pcm_limit"
+    assert rejected.value.safe_fields == {"limit": 4, "current": 3, "incoming": 2}
 
 
 def test_chunk_policy_exact_maximum_and_vad_ownership():

@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from app.asr_gateway_backends import DispatchMode, WorkerAdapter
+from app.asr_observability import CapacityBufferError, events, stable_batch_id
 
 
 class StaleResultError(RuntimeError):
@@ -117,6 +118,7 @@ class GatewayScheduler:
         self.inference_timeout_seconds = inference_timeout_seconds
         self._queues: dict[str, list[InferenceJob]] = defaultdict(list)
         self._queued_samples = 0
+        self._fragmentation: dict[str, int] = defaultdict(int)
         self._cancelled_generations: set[tuple[str, int]] = set()
         self._accepted: dict[tuple[str, int], asyncio.Event] = {}
         self._wake = asyncio.Event()
@@ -132,9 +134,21 @@ class GatewayScheduler:
             raise ValueError("job PCM range does not match pcm_s16le bytes")
         total_jobs = sum(len(queue) for queue in self._queues.values())
         if total_jobs >= self.max_ready_jobs:
-            raise BufferError("ready queue job limit exceeded")
+            raise CapacityBufferError(
+                "scheduler_ready_job_limit",
+                limit=self.max_ready_jobs,
+                current=total_jobs,
+                incoming=1,
+                message="ready queue job limit exceeded",
+            )
         if self._queued_samples + job.sample_count > self.max_queued_samples:
-            raise BufferError("ready queue audio limit exceeded")
+            raise CapacityBufferError(
+                "scheduler_queued_audio_limit",
+                limit=self.max_queued_samples,
+                current=self._queued_samples,
+                incoming=job.sample_count,
+                message="ready queue audio limit exceeded",
+            )
         if not job.enqueued_at:
             job = InferenceJob(**{**job.__dict__, "enqueued_at": self.clock()})
         self._queues[job.worker_id].append(job)
@@ -201,9 +215,50 @@ class GatewayScheduler:
             cost += item.sample_count
         if not batch:
             return []
+        incompatible_jobs = sum(1 for item in queue if item.batch_key != first.batch_key)
+        fragmentation_reasons: set[str] = set()
+        if incompatible_jobs:
+            self._fragmentation["batch_key"] += 1
+            for item in queue:
+                if item.batch_key == first.batch_key:
+                    continue
+                for field_name in BatchKey.__dataclass_fields__:
+                    if getattr(item.batch_key, field_name) != getattr(first.batch_key, field_name):
+                        reason = (
+                            "partial_final_identity"
+                            if field_name == "decoding_identity"
+                            and item.batch_key.decoding_identity.split(":", 1)[0]
+                            != first.batch_key.decoding_identity.split(":", 1)[0]
+                            else field_name
+                        )
+                        fragmentation_reasons.add(reason)
+            for reason in fragmentation_reasons:
+                self._fragmentation[reason] += 1
+        if len(compatible) > len({item.session_id for item in compatible}):
+            self._fragmentation["session_uniqueness"] += 1
+        if due and not full:
+            self._fragmentation["arrival_window"] += 1
+        if len(batch) < min(limit, len({item.session_id for item in compatible})):
+            self._fragmentation["sample_limit"] += 1
         for item in batch:
             queue.remove(item)
             self._accepted.setdefault((item.session_id, item.generation), asyncio.Event())
+        batch_id = stable_batch_id(batch)
+        events().emit(
+            "asr_batch_dispatched",
+            component="gateway_scheduler",
+            diagnostic=True,
+            worker_id=worker_id,
+            batch_id=batch_id,
+            selected_jobs=len(batch),
+            compatible_jobs=len(compatible),
+            batch_capacity=limit,
+            batch_audio_samples=cost,
+            queued_jobs_after_dispatch=len(queue),
+            queue_wait_seconds=max(0.0, self.clock() - first.enqueued_at),
+            dispatch_reason=("forced" if force else "full" if full else "due"),
+            fragmentation_reasons=sorted(fragmentation_reasons),
+        )
         self._stage("scheduler_dispatched", batch, limit)
         self._stage("worker_accepted", batch, limit)
         try:
@@ -297,6 +352,7 @@ class GatewayScheduler:
             "ready_depth": sum(len(q) for q in self._queues.values()),
             "queued_samples": self._queued_samples,
             "workers": {key: len(value) for key, value in self._queues.items()},
+            "fragmentation": dict(sorted(self._fragmentation.items())),
         }
 
     @staticmethod

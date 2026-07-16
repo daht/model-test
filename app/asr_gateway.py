@@ -14,6 +14,11 @@ from fastapi.responses import JSONResponse
 
 from app.asr_gateway_backends import BackendLease, BackendRegistry, ResultMode, VadMode
 from app.asr_gateway_metrics import GatewayMetrics, JobTimeline, gateway_readiness
+from app.asr_observability import (
+    CapacityBufferError,
+    configure_events,
+    events as observability_events,
+)
 from app.asr_gateway_protocol import ProtocolSession, StartCommand, parse_client_command
 from app.asr_gateway_scheduler import BatchKey, GatewayScheduler, InferenceJob, InferenceResult, StaleResultError
 from app.asr_gateway_sessions import GatewaySession, SessionManager, TerminalState
@@ -58,10 +63,19 @@ class GatewayRuntime:
         clock: Any | None = None,
     ) -> None:
         self.settings = settings
+        configure_events(
+            diagnostic_enabled=settings.asr_diagnostic_logging,
+            slow_engine_seconds=settings.asr_slow_engine_log_seconds,
+        )
         self.adapters = dict(adapters)
         self.registry = BackendRegistry()
         self.sessions = SessionManager(max_sessions=settings.asr_gateway_max_active_sessions)
         self.metrics = GatewayMetrics()
+        for adapter in self.adapters.values():
+            if hasattr(adapter, "set_engine_observer"):
+                adapter.set_engine_observer(self.metrics.record_engine_call)
+            if hasattr(adapter, "set_capacity_observer"):
+                adapter.set_capacity_observer(self.metrics.record_capacity_rejection)
         self._contexts: dict[str, _SessionContext] = {}
         self._vad_factory = vad_factory
         self._timelines: dict[str, tuple[JobTimeline, int, int]] = {}
@@ -100,6 +114,14 @@ class GatewayRuntime:
                 await self.registry.mark_ready(worker_id, True)
             await self.scheduler.start()
             self._started = True
+            observability_events().emit(
+                "asr_process_started",
+                component="gateway",
+                backend=self.settings.asr_backend,
+                stream_mode=self.settings.asr_stream_mode,
+                diagnostic_enabled=self.settings.asr_diagnostic_logging,
+                worker_count=len(self.adapters),
+            )
         except Exception:
             for adapter in self.adapters.values():
                 with suppress(Exception):
@@ -159,6 +181,15 @@ class GatewayRuntime:
             asyncio.Queue(), idle, vad, False, 0, self.scheduler.clock(), None,
         )
         self._update_gauges()
+        observability_events().emit(
+            "asr_session_opened",
+            component="gateway",
+            session_id=session_id,
+            generation=session.generation,
+            worker_id=worker_id,
+            language=language,
+            active_sessions=self.sessions.snapshot()["active_sessions"],
+        )
         return session
 
     def _required_streaming_mode(self):
@@ -194,6 +225,19 @@ class GatewayRuntime:
                 ctx.first_undecoded_at = self.scheduler.clock()
         scheduled = self._schedule_next(session, force=force)
         self._update_gauges()
+        accounting = session.sample_accounting
+        observability_events().emit(
+            "asr_audio_ingested",
+            component="gateway",
+            diagnostic=True,
+            session_id=session.session_id,
+            generation=session.generation,
+            incoming_samples=incoming_samples,
+            buffered_samples=accounting["buffered"],
+            reserved_samples=accounting["reserved"],
+            pending_vad_samples=accounting["pending_vad"],
+            scheduled=scheduled,
+        )
         return scheduled
 
     def check_deadlines(self, session_id: str) -> None:
@@ -256,6 +300,19 @@ class GatewayRuntime:
             timeline.mark("scheduler_enqueued", now)
             self._timelines[job.job_id] = (timeline, 1, caps.max_batch_items)
             self.scheduler.enqueue(job)
+            observability_events().emit(
+                "asr_job_enqueued",
+                component="gateway",
+                diagnostic=True,
+                session_id=job.session_id,
+                generation=job.generation,
+                job_id=job.job_id,
+                worker_id=job.worker_id,
+                chunk_samples=job.sample_count,
+                final=job.final,
+                length_bucket=job.batch_key.length_bucket,
+                ready_depth=self.scheduler.snapshot()["ready_depth"],
+            )
         except Exception:
             session.rollback(reservation.job_sequence)
             ctx.idle.set()
@@ -305,6 +362,15 @@ class GatewayRuntime:
             event = ctx.protocol.final()
             events.append(event)
             ctx.session.succeed()
+            observability_events().emit(
+                "asr_session_terminal",
+                component="gateway",
+                session_id=session_id,
+                generation=ctx.session.generation,
+                terminal_state="succeeded",
+                reason="finished",
+                close_code=1000,
+            )
             await ctx.lease.release()
             ctx.lease_released = True
             await self._enqueue_events(
@@ -353,7 +419,22 @@ class GatewayRuntime:
                 code,
                 type(exc).__name__,
             )
-            await self._fail_session(ctx)
+            if isinstance(exc, CapacityBufferError):
+                self.metrics.record_capacity_rejection(exc.reason)
+                observability_events().emit(
+                    "asr_buffer_rejected",
+                    component="gateway",
+                    session_id=session_id,
+                    generation=generation,
+                    reason=exc.reason,
+                    **exc.safe_fields,
+                )
+            await self._fail_session(
+                ctx,
+                reason=(exc.reason if isinstance(exc, CapacityBufferError) else code),
+                close_code=close_code,
+                exception_type=type(exc).__name__,
+            )
             await self._enqueue_events(
                 ctx,
                 [ctx.protocol.error(exc, code=code)],
@@ -375,6 +456,15 @@ class GatewayRuntime:
         )
         self.metrics.cancellations += 1
         ctx.session.abort()
+        observability_events().emit(
+            "asr_session_terminal",
+            component="gateway",
+            session_id=session_id,
+            generation=ctx.session.generation,
+            terminal_state="aborted",
+            reason="client_abort",
+            close_code=1000,
+        )
         if ctx.vad is not None:
             ctx.vad.reset()
         await self.adapters[ctx.session.selected_worker_id].abort_session(session_id)
@@ -388,23 +478,49 @@ class GatewayRuntime:
         await self.scheduler.wait_session_safe(session_id, generation=ctx.session.generation)
         self.metrics.cancellations += 1
         ctx.session.abort()
+        observability_events().emit(
+            "asr_session_terminal",
+            component="gateway",
+            session_id=session_id,
+            generation=ctx.session.generation,
+            terminal_state="aborted",
+            reason="connection_abort",
+        )
         if ctx.vad is not None:
             ctx.vad.reset()
         with suppress(Exception):
             await self.adapters[ctx.session.selected_worker_id].abort_session(session_id)
         await self._release_session(session_id)
 
-    async def _fail_session(self, ctx: _SessionContext) -> None:
+    async def _fail_session(
+        self,
+        ctx: _SessionContext,
+        *,
+        reason: str,
+        close_code: int = 1011,
+        exception_type: str | None = None,
+    ) -> None:
         ctx.session.fail()
         with suppress(Exception):
             await self.adapters[ctx.session.selected_worker_id].abort_session(
                 ctx.session.session_id
             )
+        observability_events().emit(
+            "asr_session_terminal",
+            component="gateway",
+            session_id=ctx.session.session_id,
+            generation=ctx.session.generation,
+            terminal_state="failed",
+            reason=reason,
+            close_code=close_code,
+            exception_type=exception_type,
+        )
 
     async def _release_session(self, session_id: str) -> None:
         ctx = self._contexts.pop(session_id, None)
         self.sessions.close(session_id)
         if ctx is not None:
+            accounting = ctx.session.sample_accounting
             if not ctx.lease_released:
                 await ctx.lease.release()
                 ctx.lease_released = True
@@ -413,6 +529,16 @@ class GatewayRuntime:
                 for item in self._contexts.values()
             ):
                 self._worker_empty[ctx.session.selected_worker_id].set()
+            observability_events().emit(
+                "asr_session_released",
+                component="gateway",
+                session_id=session_id,
+                generation=ctx.session.generation,
+                buffered_samples=accounting["buffered"],
+                reserved_samples=accounting["reserved"],
+                pending_vad_samples=accounting["pending_vad"],
+                lease_released=ctx.lease_released,
+            )
         self._update_gauges()
 
     async def drain_worker(self, worker_id: str) -> None:
@@ -442,6 +568,15 @@ class GatewayRuntime:
             )
         ):
             self.metrics.conflicts += 1
+            observability_events().emit(
+                "asr_cleanup_conflict",
+                component="gateway",
+                session_id=job.session_id,
+                generation=job.generation,
+                job_id=job.job_id,
+                current_generation=(ctx.session.generation if ctx is not None else None),
+                reservation_present=bool(ctx and ctx.session.in_flight),
+            )
             raise StaleResultError("job no longer owns the session reservation")
         ctx.session.acknowledge(job.job_sequence, generation=job.generation)
         accounting = ctx.session.sample_accounting
@@ -450,6 +585,18 @@ class GatewayRuntime:
         else:
             ctx.first_undecoded_at = None
         self._update_gauges()
+        accounting = ctx.session.sample_accounting
+        observability_events().emit(
+            "asr_job_cleaned",
+            component="gateway",
+            diagnostic=True,
+            session_id=job.session_id,
+            generation=job.generation,
+            job_id=job.job_id,
+            outcome="acknowledged",
+            buffered_samples=accounting["buffered"],
+            reserved_samples=accounting["reserved"],
+        )
 
     async def _reject_job(self, job: InferenceJob) -> None:
         ctx = self._contexts.get(job.session_id)
@@ -465,6 +612,8 @@ class GatewayRuntime:
 
     def _record_stage(self, stage: str, jobs: Any, capacity: int) -> None:
         now = self.scheduler.clock()
+        if stage == "scheduler_dispatched":
+            self.metrics.record_scheduler_batch(len(jobs))
         for job in jobs:
             record = self._timelines.get(job.job_id)
             if record is None:
@@ -520,7 +669,9 @@ class GatewayRuntime:
                 return
             self.metrics.conflicts += 1
             async with ctx.protocol_lock:
-                await self._fail_session(ctx)
+                await self._fail_session(
+                    ctx, reason="result_conflict", exception_type=type(exc).__name__
+                )
                 if not ctx.protocol.terminal:
                     event = ctx.protocol.error(exc, code="result_conflict")
                     self._mark_result_applied(result.job_id)
@@ -550,7 +701,7 @@ class GatewayRuntime:
         received_at = record[0].stages.get("audio_received", now) if record else now
         if now - received_at > self.settings.asr_max_connection_lag_seconds:
             self.metrics.failures += 1
-            await self._fail_session(ctx)
+            await self._fail_session(ctx, reason="connection_lag")
             event = ctx.protocol.error(
                 TimeoutError("connection lag exceeded"), code="audio_lag"
             )
@@ -565,7 +716,7 @@ class GatewayRuntime:
             and now - ctx.first_undecoded_at > self.settings.asr_max_undecoded_age_seconds
         ):
             self.metrics.failures += 1
-            await self._fail_session(ctx)
+            await self._fail_session(ctx, reason="undecoded_audio_age")
             event = ctx.protocol.error(
                 TimeoutError("undecoded audio age exceeded"), code="audio_lag"
             )
@@ -576,7 +727,7 @@ class GatewayRuntime:
             ctx.idle.set()
             return
         if result.error:
-            await self._fail_session(ctx)
+            await self._fail_session(ctx, reason="adapter_result_error")
             event = ctx.protocol.error(RuntimeError(result.error))
             self._mark_result_applied(result.job_id)
             await self._enqueue_events(
@@ -634,6 +785,18 @@ class GatewayRuntime:
         else:
             # No egress occurred, so this job is intentionally not completed.
             self._timelines.pop(result.job_id, None)
+        observability_events().emit(
+            "asr_result_published",
+            component="gateway",
+            diagnostic=True,
+            session_id=result.session_id,
+            generation=result.generation,
+            job_id=result.job_id,
+            worker_id=result.worker_id,
+            final=result.final,
+            emitted_events=len(events),
+            scheduled_next=scheduled,
+        )
 
     def _apply_control_result(
         self,
@@ -790,7 +953,10 @@ def create_app(*, runtime: GatewayRuntime | None = None) -> FastAPI:
     @app.get("/v1/asr/metrics")
     async def metrics(x_api_key: str | None = Header(default=None, alias="X-API-Key")):
         require_key(x_api_key)
-        return current().metrics.snapshot()
+        return {
+            **current().metrics.snapshot(),
+            "scheduler": current().scheduler.snapshot(),
+        }
 
     @app.websocket("/v1/transcribe/stream")
     async def stream(websocket: WebSocket) -> None:

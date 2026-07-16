@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from typing import Any
 
 from app.asr_gateway_backends import BackendRegistry
+from app.asr_observability import BoundedValues
 
 
 STAGES = (
@@ -53,6 +54,16 @@ class GatewayMetrics:
         self._completed: deque[tuple[JobTimeline, int, int]] = deque(maxlen=max_completed)
         self._completed_total = 0
         self._session_buffer_high_water_samples = 0
+        self._scheduler_batch_sizes = BoundedValues(maxlen=max_completed)
+        self._engine_group_sizes = BoundedValues(maxlen=max_completed)
+        self._engine_groups_per_batch = BoundedValues(maxlen=max_completed)
+        self._engine_partial_seconds = BoundedValues(maxlen=max_completed)
+        self._engine_final_seconds = BoundedValues(maxlen=max_completed)
+        self._engine_accumulated_audio_seconds = BoundedValues(maxlen=max_completed)
+        self._engine_output_characters = BoundedValues(maxlen=max_completed)
+        self._engine_maximum_character_run = BoundedValues(maxlen=max_completed)
+        self._engine_calls = 0
+        self._capacity_rejections: Counter[str] = Counter()
         self._gauges = {
             "active_sessions": 0,
             "ready_depth": 0,
@@ -65,6 +76,50 @@ class GatewayMetrics:
         self.cancellations = 0
         self.conflicts = 0
         self.failures = 0
+
+    def record_scheduler_batch(self, batch_size: int) -> None:
+        self._scheduler_batch_sizes.add(batch_size)
+
+    def record_capacity_rejection(self, reason: str) -> None:
+        self._capacity_rejections[reason] += 1
+
+    def record_engine_call(
+        self,
+        *,
+        group_size: int,
+        group_ordinal: int = 1,
+        group_count: int = 1,
+        elapsed_seconds: float,
+        final: bool,
+        accumulated_audio_seconds: float,
+        output_characters: int,
+        maximum_character_run: int,
+    ) -> None:
+        self._engine_calls += 1
+        self._engine_group_sizes.add(group_size)
+        if group_ordinal == 1:
+            self._engine_groups_per_batch.add(group_count)
+        target = self._engine_final_seconds if final else self._engine_partial_seconds
+        target.add(elapsed_seconds)
+        self._engine_accumulated_audio_seconds.add(accumulated_audio_seconds)
+        self._engine_output_characters.add(output_characters)
+        self._engine_maximum_character_run.add(maximum_character_run)
+
+    def _observability_snapshot(self) -> dict[str, Any]:
+        return {
+            "scheduler_batch_size": self._scheduler_batch_sizes.summary(),
+            "engine": {
+                "calls": self._engine_calls,
+                "group_size": self._engine_group_sizes.summary(),
+                "groups_per_scheduler_batch": self._engine_groups_per_batch.summary(),
+                "partial_inference_seconds": self._engine_partial_seconds.summary(),
+                "final_inference_seconds": self._engine_final_seconds.summary(),
+                "accumulated_audio_seconds": self._engine_accumulated_audio_seconds.summary(),
+                "output_characters": self._engine_output_characters.summary(),
+                "maximum_character_run": self._engine_maximum_character_run.summary(),
+            },
+            "buffer_rejections": dict(sorted(self._capacity_rejections.items())),
+        }
 
     def complete(self, timeline: JobTimeline, *, batch_size: int, batch_capacity: int) -> None:
         timeline.require_complete()
@@ -115,6 +170,7 @@ class GatewayMetrics:
                 "cancellations": self.cancellations,
                 "conflicts": self.conflicts,
                 "failures": self.failures,
+                **self._observability_snapshot(),
             }
         durations = [timeline.durations() for timeline, _, _ in self._completed]
         latency = {
@@ -135,6 +191,7 @@ class GatewayMetrics:
             "cancellations": self.cancellations,
             "conflicts": self.conflicts,
             "failures": self.failures,
+            **self._observability_snapshot(),
         }
 
 

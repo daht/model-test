@@ -5,6 +5,7 @@ import pytest
 
 from app.asr_gateway_backends import DispatchMode
 from app.asr_gateway_scheduler import BatchKey, GatewayScheduler, InferenceJob, InferenceResult, StaleResultError
+from app.asr_observability import CapacityBufferError
 from tests.test_asr_gateway_backends import capabilities
 
 
@@ -77,8 +78,9 @@ def test_deadline_fairness_keys_and_bounds_without_sleep():
         scheduler.enqueue(job("same", sequence=1))
         scheduler.enqueue(job("same", sequence=2))
         scheduler.enqueue(job("other", language="ja"))
-        with pytest.raises(BufferError, match="ready queue"):
+        with pytest.raises(CapacityBufferError, match="ready queue") as rejected:
             scheduler.enqueue(job("overflow"))
+        assert rejected.value.reason == "scheduler_ready_job_limit"
         assert await scheduler.run_once("worker-1") == []
         clock.advance(.02)
         first = await scheduler.run_once("worker-1")
@@ -88,6 +90,23 @@ def test_deadline_fairness_keys_and_bounds_without_sleep():
         assert all(len({j.session_id for j in call}) == len(call) for call in adapter.calls)
         assert all(len({j.batch_key for j in call}) == 1 for call in adapter.calls)
     asyncio.run(scenario())
+
+
+def test_scheduler_audio_overflow_has_exact_capacity_reason():
+    scheduler = GatewayScheduler(
+        {"worker-1": RecordingAdapter(capabilities())},
+        clock=FakeClock(),
+        max_wait_seconds=0,
+        max_ready_jobs=10,
+        max_queued_samples=150,
+    )
+    scheduler.enqueue(job("first", samples=100))
+
+    with pytest.raises(CapacityBufferError, match="ready queue") as rejected:
+        scheduler.enqueue(job("second", samples=100))
+
+    assert rejected.value.reason == "scheduler_queued_audio_limit"
+    assert rejected.value.safe_fields == {"limit": 150, "current": 100, "incoming": 100}
 
 
 def test_cleanup_completes_before_success_publication_and_stale_is_discarded():

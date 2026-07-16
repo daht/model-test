@@ -7,6 +7,7 @@ import pytest
 from app.asr_faster_whisper import DecodedText, FasterWhisperAdapter
 from app.asr_gateway_backends import DispatchMode, ResultMode, StreamingMode, VadMode
 from app.asr_gateway_scheduler import BatchKey, InferenceJob
+from app.asr_observability import CapacityBufferError
 
 
 @dataclass
@@ -41,7 +42,7 @@ class RecordingEngine:
         self.closed += 1
 
 
-def make_adapter(engine, *, batch_size=4):
+def make_adapter(engine, *, batch_size=4, max_segment_samples=480_000):
     return FasterWhisperAdapter(
         lambda: engine,
         worker_id="local",
@@ -52,7 +53,7 @@ def make_adapter(engine, *, batch_size=4):
         batch_size=batch_size,
         partial_beam_size=1,
         final_beam_size=5,
-        max_segment_samples=480_000,
+        max_segment_samples=max_segment_samples,
     )
 
 
@@ -212,3 +213,42 @@ def test_stale_identity_rejection_abort_and_close_remove_all_session_state():
     assert snapshot["active_sessions"] == 0
     assert snapshot["session_audio_samples"] == 0
     assert closed == 1
+
+
+def test_engine_observer_records_actual_group_and_accumulated_audio():
+    async def scenario():
+        adapter = make_adapter(RecordingEngine())
+        observed = []
+        adapter.set_engine_observer(lambda **values: observed.append(values))
+        await adapter.warmup()
+        await adapter.open_session("a", language="zh")
+        await adapter.open_session("b", language="zh")
+        await adapter.submit([
+            make_job("a", 1, b"\x01\x00" * 3),
+            make_job("b", 1, b"\x02\x00" * 5),
+        ])
+        return observed
+
+    observed = asyncio.run(scenario())
+
+    assert len(observed) == 1
+    assert observed[0]["group_size"] == 2
+    assert observed[0]["final"] is False
+    assert observed[0]["accumulated_audio_seconds"] == 8 / 16_000
+    assert observed[0]["output_characters"] > 0
+
+
+def test_adapter_utterance_overflow_has_exact_capacity_reason():
+    async def scenario():
+        adapter = make_adapter(RecordingEngine(), max_segment_samples=24_000)
+        await adapter.warmup()
+        await adapter.open_session("a", language="zh")
+        await adapter.submit([make_job("a", 1, b"\x01\x00" * 23_999)])
+        with pytest.raises(CapacityBufferError, match="utterance") as rejected:
+            await adapter.submit([make_job("a", 2, b"\x01\x00" * 2)])
+        return rejected.value
+
+    rejected = asyncio.run(scenario())
+
+    assert rejected.reason == "adapter_utterance_limit"
+    assert rejected.safe_fields == {"limit": 24_000, "current": 23_999, "incoming": 2}

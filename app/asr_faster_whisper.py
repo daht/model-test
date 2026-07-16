@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Sequence
 
@@ -16,6 +18,12 @@ from app.asr_gateway_backends import (
     VadMode,
 )
 from app.asr_gateway_scheduler import InferenceJob, InferenceResult
+from app.asr_observability import (
+    CapacityBufferError,
+    events,
+    maximum_character_run,
+    stable_batch_id,
+)
 
 
 @dataclass(frozen=True)
@@ -88,7 +96,7 @@ class FasterWhisperEngine:
             patience=1,
             length_penalty=1,
             repetition_penalty=1,
-            no_repeat_ngram_size=3,
+            no_repeat_ngram_size=0,
             log_prob_threshold=-1.0,
             no_speech_threshold=0.6,
             compression_ratio_threshold=2.4,
@@ -163,6 +171,8 @@ class FasterWhisperAdapter:
         self._final_beam_size = final_beam_size
         self._max_segment_samples = max_segment_samples
         self._model_manifest_path = model_manifest_path
+        self._engine_observer: Callable[..., None] | None = None
+        self._capacity_observer: Callable[[str], None] | None = None
         self.capabilities = BackendCapabilities(
             protocol_version=1,
             worker_id=worker_id,
@@ -186,6 +196,12 @@ class FasterWhisperAdapter:
             warmed=False,
             backend_id="local",
         )
+
+    def set_engine_observer(self, observer: Callable[..., None]) -> None:
+        self._engine_observer = observer
+
+    def set_capacity_observer(self, observer: Callable[[str], None]) -> None:
+        self._capacity_observer = observer
 
     async def warmup(self) -> None:
         if self._model_manifest_path:
@@ -238,8 +254,27 @@ class FasterWhisperAdapter:
                 raise KeyError("stale session backend identity")
             if job.session_id in seen_sessions:
                 raise ValueError("one batch cannot contain two jobs for one session")
-            if len(state.pcm) // 2 + job.sample_count > self._max_segment_samples:
-                raise BufferError("faster-whisper utterance limit exceeded")
+            current_samples = len(state.pcm) // 2
+            if current_samples + job.sample_count > self._max_segment_samples:
+                error = CapacityBufferError(
+                    "adapter_utterance_limit",
+                    limit=self._max_segment_samples,
+                    current=current_samples,
+                    incoming=job.sample_count,
+                    message="faster-whisper utterance limit exceeded",
+                )
+                events().emit(
+                    "asr_buffer_rejected",
+                    component="faster_whisper_adapter",
+                    session_id=job.session_id,
+                    generation=job.generation,
+                    job_id=job.job_id,
+                    reason=error.reason,
+                    **error.safe_fields,
+                )
+                if self._capacity_observer is not None:
+                    self._capacity_observer(error.reason)
+                raise error
             seen_sessions.add(job.session_id)
             states.append(state)
         for state, job in zip(states, jobs):
@@ -253,17 +288,88 @@ class FasterWhisperAdapter:
             grouped.setdefault((state.language, beam_size), []).append(index)
 
         decoded: list[DecodedText | None] = [None] * len(jobs)
+        batch_id = stable_batch_id(jobs)
         async with self._engine_lock:
-            for (language, beam_size), indices in grouped.items():
+            group_count = len(grouped)
+            for group_ordinal, ((language, beam_size), indices) in enumerate(
+                grouped.items(), start=1
+            ):
                 waveforms = [_pcm_to_float32(states[index].pcm) for index in indices]
+                accumulated = [len(waveform) / 16_000 for waveform in waveforms]
+                engine_call_id = f"{batch_id}-group-{group_ordinal}"
+                final_items = sum(1 for index in indices if jobs[index].final)
+                events().emit(
+                    "asr_engine_group_started",
+                    component="faster_whisper_adapter",
+                    diagnostic=True,
+                    worker_id=self.capabilities.worker_id,
+                    batch_id=batch_id,
+                    engine_call_id=engine_call_id,
+                    group_ordinal=group_ordinal,
+                    group_count=group_count,
+                    group_size=len(indices),
+                    language=language or "auto",
+                    beam_size=beam_size,
+                    final_items=final_items,
+                    accumulated_audio_min_seconds=min(accumulated),
+                    accumulated_audio_max_seconds=max(accumulated),
+                    accumulated_audio_sum_seconds=sum(accumulated),
+                )
+                started = time.monotonic()
                 items = await asyncio.to_thread(
                     engine.transcribe_batch,
                     waveforms,
                     language=language,
                     beam_size=beam_size,
                 )
+                elapsed = time.monotonic() - started
                 if len(items) != len(indices):
                     raise RuntimeError("faster-whisper result count mismatch")
+                output_characters = sum(len(item.text) for item in items)
+                max_run = max(
+                    (maximum_character_run(item.text) for item in items), default=0
+                )
+                event_fields = {
+                    "worker_id": self.capabilities.worker_id,
+                    "batch_id": batch_id,
+                    "engine_call_id": engine_call_id,
+                    "group_ordinal": group_ordinal,
+                    "group_count": group_count,
+                    "group_size": len(indices),
+                    "language": language or "auto",
+                    "beam_size": beam_size,
+                    "final_items": final_items,
+                    "accumulated_audio_min_seconds": min(accumulated),
+                    "accumulated_audio_max_seconds": max(accumulated),
+                    "accumulated_audio_sum_seconds": sum(accumulated),
+                    "elapsed_seconds": elapsed,
+                    "output_characters": output_characters,
+                    "maximum_character_run": max_run,
+                }
+                events().emit(
+                    "asr_engine_group_completed",
+                    component="faster_whisper_adapter",
+                    diagnostic=True,
+                    **event_fields,
+                )
+                if elapsed >= events().slow_engine_seconds:
+                    events().emit(
+                        "asr_engine_slow_call",
+                        component="faster_whisper_adapter",
+                        level=logging.WARNING,
+                        **event_fields,
+                    )
+                if self._engine_observer is not None:
+                    self._engine_observer(
+                        group_size=len(indices),
+                        group_ordinal=group_ordinal,
+                        group_count=group_count,
+                        elapsed_seconds=elapsed,
+                        final=bool(final_items),
+                        accumulated_audio_seconds=sum(accumulated),
+                        output_characters=output_characters,
+                        maximum_character_run=max_run,
+                    )
                 for index, item in zip(indices, items):
                     decoded[index] = item
 

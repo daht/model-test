@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.asr_gateway_backends import VadMode
+from app.asr_observability import CapacityBufferError
 
 
 @dataclass(frozen=True)
@@ -47,8 +48,15 @@ class PcmRingBuffer:
         if len(pcm) % 2:
             raise ValueError("pcm_s16le bytes must be sample-aligned")
         samples = len(pcm) // 2
-        if len(self._data) // 2 + samples > self.max_samples:
-            raise BufferError("session PCM buffer limit exceeded")
+        current = len(self._data) // 2
+        if current + samples > self.max_samples:
+            raise CapacityBufferError(
+                "session_pcm_limit",
+                limit=self.max_samples,
+                current=current,
+                incoming=samples,
+                message="session PCM buffer limit exceeded",
+            )
         start = self.accepted_samples
         self._data.extend(pcm)
         self.accepted_samples += samples

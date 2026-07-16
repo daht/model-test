@@ -451,3 +451,39 @@ Rebuild the ASR image after vLLM dependency or Dockerfile changes:
 ```bash
 SERVICE=qwen-asr-api BASE_URL=http://127.0.0.1:8002 scripts/update_service.sh build
 ```
+
+## ASR full-chain diagnostic capture
+
+Enable high-frequency structured events only for a diagnostic window:
+
+```bash
+sed -i 's/^ASR_DIAGNOSTIC_LOGGING=.*/ASR_DIAGNOSTIC_LOGGING=true/' .env
+SERVICE=qwen-asr-api BASE_URL=http://127.0.0.1:8002 scripts/update_service.sh env
+```
+
+Start the monitor on the A10 host before starting the client workload:
+
+```bash
+set -a
+source ./.env
+set +a
+scripts/monitor_asr_bottleneck.sh
+```
+
+The monitor records authenticated Gateway metrics, correlated structured ASR
+events, ASR and HY-MT container resources, GPU totals, and GPU processes. Press
+Ctrl+C after the workload. The command prints the unique run directory, the
+generated `report.md`, and the timestamped archive to provide for analysis.
+Credentials, audio, PCM, prompts, and transcript text are forbidden from the
+archive. Archive creation fails if the API key is detected.
+
+Retention defaults to 20 completed runs and 14 days. Override it without
+changing repository files:
+
+```bash
+ASR_MONITOR_KEEP_RUNS=10 ASR_MONITOR_KEEP_DAYS=7 scripts/monitor_asr_bottleneck.sh
+```
+
+After the incident window, set `ASR_DIAGNOSTIC_LOGGING=false` and recreate only
+the ASR service. Low-frequency terminal, buffer rejection, cleanup conflict,
+worker-state, and slow-engine events remain enabled.

@@ -80,6 +80,40 @@ def test_completed_jobs_is_lifetime_total_not_bounded_window_size():
     assert snapshot["completed_window_jobs"] == 2
 
 
+def test_scheduler_and_engine_metrics_report_real_bounded_distributions():
+    metrics = GatewayMetrics(max_completed=3)
+    for size in (2, 4, 5):
+        metrics.record_scheduler_batch(size)
+    metrics.record_engine_call(
+        group_size=5,
+        elapsed_seconds=1.25,
+        final=False,
+        accumulated_audio_seconds=30,
+        output_characters=120,
+        maximum_character_run=3,
+    )
+    metrics.record_engine_call(
+        group_size=2,
+        elapsed_seconds=4.5,
+        final=True,
+        accumulated_audio_seconds=60,
+        output_characters=224,
+        maximum_character_run=224,
+    )
+
+    snapshot = metrics.snapshot()
+
+    assert snapshot["scheduler_batch_size"] == {
+        "count": 3, "min": 2.0, "p50": 4.0, "p95": 5.0,
+        "p99": 5.0, "max": 5.0,
+    }
+    assert snapshot["engine"]["calls"] == 2
+    assert snapshot["engine"]["group_size"]["p50"] == 2
+    assert snapshot["engine"]["partial_inference_seconds"]["max"] == 1.25
+    assert snapshot["engine"]["final_inference_seconds"]["max"] == 4.5
+    assert snapshot["engine"]["maximum_character_run"]["max"] == 224
+
+
 def test_readiness_requires_warmed_accepting_capacity():
     async def scenario():
         registry = BackendRegistry()

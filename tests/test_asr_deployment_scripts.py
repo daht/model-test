@@ -32,6 +32,21 @@ def test_update_service_uses_asr_readiness_without_changing_other_health_checks(
     assert "scripts/smoke_asr.sh" in content
 
 
+def test_asr_bottleneck_monitor_archives_unique_runs_and_correlates_hymt():
+    content = script("monitor_asr_bottleneck.sh")
+
+    assert 'RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)' in content
+    assert 'CURRENT_DIR="${RUNS_DIR}/${RUN_ID}"' in content
+    assert 'HYMT_SERVICE="${ASR_MONITOR_HYMT_SERVICE:-hy-mt-api}"' in content
+    assert "gpu-processes.csv" in content
+    assert 'docker stats --no-stream' in content
+    assert 'scripts/analyze_asr_bottleneck.py "${CURRENT_DIR}"' in content
+    assert 'PARTIAL_ARCHIVE="${ARCHIVE_PATH}.partial"' in content
+    assert 'ASR_MONITOR_KEEP_RUNS' in content
+    assert 'ASR_MONITOR_KEEP_DAYS' in content
+    assert 'grep -R -F -q -- "${API_KEY}"' in content
+
+
 def test_remote_deploy_targets_asr_and_runs_websocket_smoke():
     content = script("deploy_remote.sh")
 

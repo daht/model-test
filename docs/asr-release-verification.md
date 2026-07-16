@@ -265,3 +265,16 @@ last accepted image digest, configuration, model directory, and matching
 approved manifest together. Confirm readiness, then run live mode against the
 restored deployment. Do not roll back only code while leaving an incompatible
 model, VAD asset, config, or manifest in place.
+
+## Diagnostic evidence is supplemental
+
+`scripts/monitor_asr_bottleneck.sh` produces timestamped ASR diagnostic runs and
+invokes `scripts/analyze_asr_bottleneck.py` at finalization. This evidence can
+explain scheduler fragmentation, real faster-whisper engine grouping, inference
+tails, buffer rejection sources, cleanup ownership, and HY-MT GPU contention.
+It does not replace commit, release, live, or deployed-live gates.
+
+Diagnostic evidence remains outside the repository. Never stage its run
+directories, archives, logs, reports, audio, or credentials. Enable
+`ASR_DIAGNOSTIC_LOGGING=true` only for the observation window and recreate the
+ASR service after changing the setting.

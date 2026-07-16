@@ -50,6 +50,8 @@ class Settings(BaseSettings):
     asr_faster_whisper_partial_beam_size: int = Field(default=1, gt=0, le=20)
     asr_faster_whisper_final_beam_size: int = Field(default=5, gt=0, le=20)
     asr_faster_whisper_task: Literal["transcribe"] = "transcribe"
+    asr_diagnostic_logging: bool = False
+    asr_slow_engine_log_seconds: float = Field(default=2.0, gt=0, le=300)
     asr_stream_unfixed_chunk_num: int = Field(default=2, ge=0)
     asr_stream_unfixed_token_num: int = Field(default=5, ge=0)
     asr_stream_rollover_seconds: float = Field(default=120.0, gt=0, le=3600)
