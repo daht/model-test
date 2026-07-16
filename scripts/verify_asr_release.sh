@@ -129,7 +129,7 @@ C05 high-confidence secret scan of tracked worktree and index
 C06 forbidden tracked paths plus binary/large staged delta checks
 C03 git ls-files '*.sh' | bash -n each script
 C02 PYTHONPYCACHEPREFIX=<temporary>/pycache python -m compileall -q app tests scripts
-C01 MODEL_BACKEND=mock ASR_BACKEND=mock TTS_BACKEND=mock API_KEY=<ephemeral> python -m pytest tests -q
+C01 MODEL_BACKEND=mock ASR_BACKEND=mock ASR_STREAM_MODE=chunked ASR_REQUIRE_MODEL_MANIFEST=false ASR_MODEL_MANIFEST_PATH=<empty> ASR_VLLM_GPU_MEMORY_UTILIZATION=0.8 ASR_VLLM_MAX_MODEL_LEN=65536 TTS_BACKEND=mock API_KEY=<ephemeral> python -m pytest tests -q
 EOF
 }
 
@@ -529,6 +529,11 @@ run_commit_gates() {
   PYTHONDONTWRITEBYTECODE=1 \
     MODEL_BACKEND=mock \
     ASR_BACKEND=mock \
+    ASR_STREAM_MODE=chunked \
+    ASR_REQUIRE_MODEL_MANIFEST=false \
+    ASR_MODEL_MANIFEST_PATH= \
+    ASR_VLLM_GPU_MEMORY_UTILIZATION=0.8 \
+    ASR_VLLM_MAX_MODEL_LEN=65536 \
     TTS_BACKEND=mock \
     API_KEY="${mock_api_key}" \
     "${PYTHON_BIN}" -m pytest tests -q -p no:cacheprovider

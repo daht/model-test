@@ -76,6 +76,11 @@ def test_commit_dry_run_plans_full_suite_once_and_all_local_gates():
     assert "git diff --cached --check" in result.stdout
     assert "high-confidence secret scan" in result.stdout
     assert "forbidden tracked paths" in result.stdout
+    assert "ASR_REQUIRE_MODEL_MANIFEST=false" in result.stdout
+    assert "ASR_MODEL_MANIFEST_PATH=<empty>" in result.stdout
+    assert "ASR_STREAM_MODE=chunked" in result.stdout
+    assert "ASR_VLLM_GPU_MEMORY_UTILIZATION=0.8" in result.stdout
+    assert "ASR_VLLM_MAX_MODEL_LEN=65536" in result.stdout
 
 
 def test_live_dry_run_includes_release_and_strict_language_chunk_matrix():

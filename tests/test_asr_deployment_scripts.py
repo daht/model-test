@@ -121,6 +121,9 @@ def test_runbook_has_faster_whisper_model_manifest_validation_and_qwen_rollback(
     assert "ASR_BACKEND=qwen_vllm" in runbook
     assert "ASR_STREAM_MODE=stateful" in runbook
     assert "faster_whisper -> qwen_vllm" in runbook
+    assert "Compose intentionally loads the repository root `.env`" in runbook
+    assert 'ASR_RELEASE_ENV_FILE="$PWD/.env"' in runbook
+    assert 'ASR_RELEASE_ENV_FILE="$PWD/.env.faster-whisper"' not in runbook
 
 
 def test_release_gate_accepts_faster_whisper_contract_and_runs_gateway_warmup():

@@ -25,27 +25,35 @@ python3 -m app.asr_artifacts create \
 
 Do not create the approval manifest from an unverified target-host download.
 Transfer the model directory and manifest through the authenticated release
-channel. Prepare the faster-whisper environment without copying a runtime key
-onto a command line:
+channel. Compose intentionally loads the repository root `.env`; `--env-file`
+alone does not replace that service-level mapping. Prepare a candidate file and
+retain the current Qwen environment and image before the maintenance window:
 
 ```bash
-cp cloud/A10.faster-whisper.env.example .env.faster-whisper
-chmod 600 .env.faster-whisper
-editor .env.faster-whisper
-docker compose --env-file .env.faster-whisper build qwen-asr-api
-docker compose --env-file .env.faster-whisper up -d --force-recreate --no-deps qwen-asr-api
-docker compose --env-file .env.faster-whisper ps qwen-asr-api
-docker compose --env-file .env.faster-whisper logs --tail 200 qwen-asr-api
+cp --preserve=mode .env .env.qwen-rollback
+docker tag qwen-asr-api:latest qwen-asr-api:qwen-rollback
+cp cloud/A10.faster-whisper.env.example .env.faster-whisper-candidate
+chmod 600 .env.faster-whisper-candidate .env.qwen-rollback
+editor .env.faster-whisper-candidate
+docker compose build qwen-asr-api
 ```
 
-Before cutover, run the backend-aware release gate against the same environment
-and approved artifacts:
+Stop the current model owner, install the candidate as root `.env`, then run the
+backend-aware release gate against that exact environment and approved
+artifacts. R08 loads a disposable full model, so the old owner must already be
+stopped on a single A10:
 
 ```bash
-export ASR_RELEASE_ENV_FILE="$PWD/.env.faster-whisper"
+docker compose stop qwen-asr-api
+cp .env.faster-whisper-candidate .env
+chmod 600 .env
+export ASR_RELEASE_ENV_FILE="$PWD/.env"
 export ASR_RELEASE_MODEL_DIR="$PWD/models/faster-whisper-large-v3"
 export ASR_RELEASE_MANIFEST="$PWD/models/faster-whisper-large-v3.manifest.json"
 scripts/verify_asr_release.sh release
+docker compose up -d --force-recreate --no-deps --no-build qwen-asr-api
+docker compose ps qwen-asr-api
+docker compose logs --tail 200 qwen-asr-api
 ```
 
 Verify `/ready`, strict Chinese/Japanese speech, and a 1/4/8/12/14/16 stream
@@ -59,6 +67,16 @@ atomic rollback direction is `faster_whisper -> qwen_vllm`: restore the prior
 environment with `ASR_BACKEND=qwen_vllm`, `ASR_STREAM_MODE=stateful`, the Qwen
 model ID and matching manifest, recreate only `qwen-asr-api`, then require
 `/ready` and strict speech verification before reopening admission.
+
+The concrete rollback uses the retained artifacts:
+
+```bash
+docker compose stop qwen-asr-api
+cp .env.qwen-rollback .env
+docker tag qwen-asr-api:qwen-rollback qwen-asr-api:latest
+docker compose up -d --force-recreate --no-deps --no-build qwen-asr-api
+docker compose ps qwen-asr-api
+```
 
 ## Semantic Gateway topology
 

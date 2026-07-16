@@ -63,11 +63,18 @@ scripts/verify_asr_release.sh release
 For faster-whisper, use the matching environment and artifact paths instead:
 
 ```bash
-export ASR_RELEASE_ENV_FILE="$PWD/.env.faster-whisper"
+cp cloud/A10.faster-whisper.env.example .env
+chmod 600 .env
+editor .env
+export ASR_RELEASE_ENV_FILE="$PWD/.env"
 export ASR_RELEASE_MODEL_DIR="$PWD/models/faster-whisper-large-v3"
 export ASR_RELEASE_MANIFEST="$PWD/models/faster-whisper-large-v3.manifest.json"
 scripts/verify_asr_release.sh release
 ```
+
+Back up the previous root `.env` before replacing it. The runner intentionally
+requires `ASR_RELEASE_ENV_FILE` to be the repository root `.env` because that is
+the service-level Compose `env_file` mapping.
 
 The environment must configure either `qwen_vllm` with `stateful` streaming or
 `faster_whisper` with `rolling` streaming. The faster-whisper release contract

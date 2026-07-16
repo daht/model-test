@@ -1976,6 +1976,7 @@ def test_qwen_vllm_streaming_session_feeds_pcm_and_finishes(monkeypatch):
 
     transcriber = QwenVLLMASRTranscriber(
         Settings(
+            _env_file=None,
             asr_backend="qwen_vllm",
             asr_model_id="Qwen/Qwen3-ASR-1.7B",
             api_key=TEST_ONLY_LONG_API_KEY,
