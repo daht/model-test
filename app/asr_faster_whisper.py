@@ -88,7 +88,7 @@ class FasterWhisperEngine:
             patience=1,
             length_penalty=1,
             repetition_penalty=1,
-            no_repeat_ngram_size=0,
+            no_repeat_ngram_size=3,
             log_prob_threshold=-1.0,
             no_speech_threshold=0.6,
             compression_ratio_threshold=2.4,
