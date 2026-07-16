@@ -51,6 +51,7 @@ class GatewayMetrics:
         if max_completed <= 0:
             raise ValueError("max_completed must be positive")
         self._completed: deque[tuple[JobTimeline, int, int]] = deque(maxlen=max_completed)
+        self._completed_total = 0
         self._gauges = {"active_sessions": 0, "ready_depth": 0, "queued_audio_seconds": 0.0}
         self.cancellations = 0
         self.conflicts = 0
@@ -61,6 +62,7 @@ class GatewayMetrics:
         if batch_size <= 0 or batch_capacity < batch_size:
             raise ValueError("batch accounting is invalid")
         self._completed.append((timeline, batch_size, batch_capacity))
+        self._completed_total += 1
 
     def set_gauges(self, *, active_sessions: int, ready_depth: int, queued_samples: int, sample_rate: int) -> None:
         self._gauges = {
@@ -71,7 +73,14 @@ class GatewayMetrics:
 
     def snapshot(self) -> dict[str, Any]:
         if not self._completed:
-            return {**self._gauges, "completed_jobs": 0, "cancellations": self.cancellations, "conflicts": self.conflicts, "failures": self.failures}
+            return {
+                **self._gauges,
+                "completed_jobs": self._completed_total,
+                "completed_window_jobs": 0,
+                "cancellations": self.cancellations,
+                "conflicts": self.conflicts,
+                "failures": self.failures,
+            }
         durations = [timeline.durations() for timeline, _, _ in self._completed]
         latency = {
             key: sum(item[key] for item in durations) / len(durations)
@@ -82,7 +91,8 @@ class GatewayMetrics:
         fill = sum(size / capacity for _, size, capacity in self._completed) / len(self._completed)
         return {
             **self._gauges,
-            "completed_jobs": len(self._completed),
+            "completed_jobs": self._completed_total,
+            "completed_window_jobs": len(self._completed),
             "decoded_seconds": decoded_seconds,
             "aggregate_rtf": inference_seconds / decoded_seconds if decoded_seconds else 0.0,
             "batch_fill_ratio": fill,

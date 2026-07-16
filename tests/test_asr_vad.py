@@ -175,6 +175,26 @@ def test_finish_input_discards_and_resets_entire_unconfirmed_candidate():
     assert vad.state is VADEndpointState.WAITING_FOR_SPEECH
 
 
+def test_finish_input_discards_retained_waiting_preroll():
+    vad = detector(
+        [0.1, 0.1],
+        sample_rate=1000,
+        frame_samples=1,
+        pre_roll_ms=10,
+    )
+
+    decisions = [
+        vad.add_audio(pcm(1, samples=1)),
+        vad.add_audio(pcm(2, samples=1)),
+        vad.finish_input(),
+    ]
+
+    assert sum(len(item.audio_to_model) // 2 for item in decisions) == 0
+    assert sum(item.discarded_samples for item in decisions) == 2
+    assert vad._pre_roll == b""
+    assert vad.state is VADEndpointState.WAITING_FOR_SPEECH
+
+
 def test_trailing_silence_is_released_when_speech_resumes():
     vad = detector([0.9, 0.9, 0.9, 0.1, 0.1, 0.8])
     speech = [pcm(1000 + index) for index in range(3)]

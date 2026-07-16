@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 import uuid
 from contextlib import asynccontextmanager, suppress
@@ -17,6 +18,9 @@ from app.asr_gateway_protocol import ProtocolSession, StartCommand, parse_client
 from app.asr_gateway_scheduler import BatchKey, GatewayScheduler, InferenceJob, InferenceResult, StaleResultError
 from app.asr_gateway_sessions import GatewaySession, SessionManager, TerminalState
 from app.config import Settings, get_settings
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -154,6 +158,7 @@ class GatewayRuntime:
             ),
             asyncio.Queue(), idle, vad, False, 0, self.scheduler.clock(), None,
         )
+        self._update_gauges()
         return session
 
     def _required_streaming_mode(self):
@@ -272,7 +277,15 @@ class GatewayRuntime:
             if decision.discarded_samples:
                 ctx.session.record_discarded(decision.discarded_samples)
         ctx.session.request_finish()
-        await self.ingest(ctx.session, b"", force=True)
+        scheduled = await self.ingest(ctx.session, b"", force=True)
+        if (
+            not scheduled
+            and not ctx.session.in_flight
+            and ctx.session.buffer.buffered_samples == 0
+            and ctx.session.sample_accounting["pending_vad"] == 0
+        ):
+            ctx.idle.set()
+            ctx.first_undecoded_at = None
         await ctx.idle.wait()
         async with ctx.protocol_lock:
             result = await self.adapters[ctx.session.selected_worker_id].finish_session(session_id)
@@ -318,6 +331,13 @@ class GatewayRuntime:
         async with ctx.protocol_lock:
             if ctx.protocol.terminal:
                 return
+            self.metrics.failures += 1
+            logger.warning(
+                "asr_gateway_session_error session_id=%s code=%s exception_type=%s",
+                session_id,
+                code,
+                type(exc).__name__,
+            )
             ctx.session.fail()
             await self._enqueue_events(
                 ctx,
@@ -371,6 +391,7 @@ class GatewayRuntime:
                 for item in self._contexts.values()
             ):
                 self._worker_empty[ctx.session.selected_worker_id].set()
+        self._update_gauges()
 
     async def drain_worker(self, worker_id: str) -> None:
         await self.registry.begin_drain(worker_id)

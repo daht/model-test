@@ -216,7 +216,9 @@ class StreamingVADEndpointDetector:
                 transitions.append(
                     self._transition(VADEndpointState.WAITING_FOR_SPEECH)
                 )
+        discarded += len(self._pre_roll) // 2
         self._input_buffer.clear()
+        self._pre_roll.clear()
         self._candidate.clear()
         self._candidate_speech_samples = 0
         self._trailing.clear()

@@ -27,6 +27,33 @@ def test_job_timeline_and_bounded_aggregates_are_sanitized():
     assert not any(word in str(snapshot).lower() for word in forbidden)
 
 
+def test_completed_jobs_is_lifetime_total_not_bounded_window_size():
+    metrics = GatewayMetrics(max_completed=2)
+
+    for job_index in range(3):
+        timeline = JobTimeline(f"j-{job_index}", "w", 16000)
+        for stage_index, stage in enumerate(
+            (
+                "audio_received",
+                "chunk_ready",
+                "scheduler_enqueued",
+                "scheduler_dispatched",
+                "worker_accepted",
+                "inference_started",
+                "inference_completed",
+                "result_applied",
+                "event_sent",
+            )
+        ):
+            timeline.mark(stage, float(stage_index))
+        metrics.complete(timeline, batch_size=1, batch_capacity=1)
+
+    snapshot = metrics.snapshot()
+
+    assert snapshot["completed_jobs"] == 3
+    assert snapshot["completed_window_jobs"] == 2
+
+
 def test_readiness_requires_warmed_accepting_capacity():
     async def scenario():
         registry = BackendRegistry()

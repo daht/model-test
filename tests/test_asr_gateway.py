@@ -215,6 +215,64 @@ def test_gateway_owned_vad_conserves_input_and_commits_endpoint():
     assert submitted == [2, 2]
 
 
+def test_finish_unblocks_after_vad_discards_last_pending_sample():
+    class FinishVad:
+        def add_audio(self, pcm):
+            return type(
+                "D",
+                (),
+                {
+                    "audio_to_model": pcm[:4],
+                    "endpoint": False,
+                    "discarded_samples": 0,
+                },
+            )()
+
+        def finish_input(self):
+            return type(
+                "D",
+                (),
+                {
+                    "audio_to_model": b"",
+                    "endpoint": False,
+                    "discarded_samples": 1,
+                },
+            )()
+
+        def reset(self):
+            return None
+
+    async def scenario():
+        adapter = FakeAdapter()
+        adapter.capabilities = replace(adapter.capabilities, vad_mode=VadMode.GATEWAY)
+        settings = Settings(
+            model_backend="mock",
+            asr_backend="mock",
+            asr_stream_mode="stateful",
+            api_key="test-key",
+            asr_gateway_default_backend="fake",
+            asr_gateway_schedule_max_wait_ms=0,
+        )
+        runtime = GatewayRuntime(
+            settings, {"fake": adapter}, vad_factory=FinishVad
+        )
+        await runtime.start()
+        session = await runtime.open_session("s", language="zh", options={})
+        await runtime.ingest(session, b"\x01\x00" * 3, force=True)
+        await runtime.scheduler.run_once("fake", force=True)
+        assert runtime._contexts["s"].idle.is_set() is False
+        final = await asyncio.wait_for(runtime.finish("s"), timeout=0.1)
+        accounting = session.sample_accounting
+        await runtime.abort("s")
+        await runtime.close()
+        return final, accounting
+
+    final, accounting = asyncio.run(scenario())
+
+    assert final["type"] == "final"
+    assert accounting["pending_vad"] == 0
+
+
 def test_exact_maximum_rolls_backend_state_before_remainder_submit():
     async def scenario():
         adapter = FakeAdapter(); adapter.capabilities = replace(adapter.capabilities, preferred_chunk_samples=6, max_input_samples=6, max_segment_samples=6, max_batch_samples=6)
@@ -274,6 +332,54 @@ def test_runtime_records_all_job_timeline_stages_and_counters():
     assert snapshot["completed_jobs"] == 1
     assert set(snapshot["latency"]) == {"chunk_wait_seconds", "batch_wait_seconds", "worker_wait_seconds", "inference_seconds", "egress_seconds"}
     assert cancelled["cancellations"] == 1
+
+
+def test_error_terminal_releases_lease_updates_gauges_and_logs(caplog):
+    class WebSocket:
+        def __init__(self):
+            self.sent = []
+            self.closed = []
+
+        async def send_json(self, payload):
+            self.sent.append(payload)
+
+        async def close(self, code):
+            self.closed.append(code)
+
+    async def scenario():
+        adapter = FakeAdapter()
+        settings = Settings(
+            model_backend="mock",
+            asr_backend="mock",
+            asr_stream_mode="stateful",
+            api_key="test-key",
+            asr_gateway_default_backend="fake",
+        )
+        runtime = GatewayRuntime(settings, {"fake": adapter})
+        await runtime.start()
+        await runtime.open_session("s", language="zh", options={})
+        active_before = runtime.metrics.snapshot()["active_sessions"]
+        await runtime.enqueue_error(
+            "s", BufferError("private details"), code="invalid_audio", close_code=1008
+        )
+        websocket = WebSocket()
+        await send_outbound_events(runtime, runtime._contexts["s"], websocket)
+        registry = await runtime.registry.snapshot()
+        metrics = runtime.metrics.snapshot()
+        await runtime.close()
+        return active_before, websocket, registry, metrics
+
+    with caplog.at_level("WARNING", logger="app.asr_gateway"):
+        active_before, websocket, registry, metrics = asyncio.run(scenario())
+
+    assert active_before == 1
+    assert websocket.closed == [1008]
+    assert websocket.sent[0]["type"] == "error"
+    assert registry["workers"]["fake"]["active_leases"] == 0
+    assert metrics["active_sessions"] == 0
+    assert metrics["failures"] == 1
+    assert "session_id=s code=invalid_audio exception_type=BufferError" in caplog.text
+    assert "private details" not in caplog.text
 
 
 def test_runtime_enforces_audio_session_and_undecoded_deadlines_with_fake_clock():
