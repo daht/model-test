@@ -951,6 +951,75 @@ def test_result_capacity_failure_preserves_sequence_and_capacity_reason():
     assert terminal_state.value == "failed"
 
 
+def test_ingest_waits_for_inflight_cleanup_before_rejecting_session_buffer():
+    class BlockingAdapter(FakeAdapter):
+        def __init__(self):
+            super().__init__(dynamic=True)
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+            self.capabilities = replace(
+                self.capabilities,
+                preferred_chunk_samples=4,
+                max_input_samples=4,
+                max_segment_samples=16,
+                max_batch_samples=16,
+            )
+
+        async def submit(self, jobs):
+            self.calls.append(list(jobs))
+            self.entered.set()
+            await self.release.wait()
+            return [
+                InferenceResult.from_job(job, text=f"heard-{job.sample_count}")
+                for job in jobs
+            ]
+
+    async def scenario():
+        adapter = BlockingAdapter()
+        settings = Settings(
+            _env_file=None,
+            model_backend="mock",
+            asr_backend="mock",
+            asr_stream_mode="stateful",
+            api_key="test-key",
+            asr_gateway_default_backend="fake",
+            asr_gateway_schedule_max_wait_ms=1_000,
+            asr_gateway_max_session_buffer_seconds=12 / 16_000,
+            asr_gateway_max_queued_audio_seconds=1,
+            asr_stream_queue_timeout_seconds=1,
+        )
+        runtime = GatewayRuntime(settings, {"fake": adapter})
+        await adapter.warmup()
+        await runtime.registry.register(adapter.capabilities)
+        await runtime.registry.mark_ready("fake", True)
+        session = await runtime.open_session("s", language="zh", options={})
+        await runtime.ingest(session, b"\x01\x00" * 8)
+        dispatch = asyncio.create_task(
+            runtime.scheduler.run_once("fake", force=True)
+        )
+        await adapter.entered.wait()
+
+        overflow = asyncio.create_task(
+            runtime.ingest(session, b"\x02\x00" * 8)
+        )
+        done, _ = await asyncio.wait({overflow}, timeout=0)
+        waited_for_cleanup = overflow not in done
+
+        adapter.release.set()
+        await dispatch
+        await overflow
+        accounting = session.sample_accounting
+        await runtime.abort("s")
+        await runtime.close()
+        return waited_for_cleanup, accounting
+
+    waited_for_cleanup, accounting = asyncio.run(scenario())
+
+    assert waited_for_cleanup is True
+    assert accounting["accepted"] == 16
+    assert accounting["buffered"] + accounting["reserved"] <= 12
+
+
 def test_exact_maximum_job_is_final_for_batched_beam_five_rollover():
     async def scenario():
         adapter = FakeAdapter(dynamic=True, result_mode=ResultMode.REPLACEABLE_SEGMENT)

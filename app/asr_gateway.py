@@ -203,6 +203,17 @@ class GatewayRuntime:
 
     async def ingest(self, session: GatewaySession, pcm: bytes, *, force: bool = False) -> bool:
         ctx = self._contexts[session.session_id]
+        async with ctx.protocol_lock:
+            return await self._ingest_locked(ctx, session, pcm, force=force)
+
+    async def _ingest_locked(
+        self,
+        ctx: _SessionContext,
+        session: GatewaySession,
+        pcm: bytes,
+        *,
+        force: bool,
+    ) -> bool:
         self.check_deadlines(session.session_id)
         incoming_samples = len(pcm) // 2
         if session.sample_accounting["accepted"] + incoming_samples > round(
@@ -213,7 +224,9 @@ class GatewayRuntime:
             session.accept_vad_input(pcm)
             decision = ctx.vad.add_audio(pcm)
             if decision.audio_to_model:
-                session.append_pcm(decision.audio_to_model, count_accepted=False)
+                await self._append_pcm_with_backpressure(
+                    session, decision.audio_to_model, count_accepted=False
+                )
                 if ctx.first_undecoded_at is None:
                     ctx.first_undecoded_at = self.scheduler.clock()
             if decision.discarded_samples:
@@ -221,7 +234,7 @@ class GatewayRuntime:
             ctx.endpoint_pending = ctx.endpoint_pending or decision.endpoint
             force = force or decision.endpoint
         elif pcm:
-            session.append_pcm(pcm)
+            await self._append_pcm_with_backpressure(session, pcm)
             if ctx.first_undecoded_at is None:
                 ctx.first_undecoded_at = self.scheduler.clock()
         scheduled = self._schedule_next(session, force=force)
@@ -240,6 +253,26 @@ class GatewayRuntime:
             scheduled=scheduled,
         )
         return scheduled
+
+    async def _append_pcm_with_backpressure(
+        self,
+        session: GatewaySession,
+        pcm: bytes,
+        *,
+        count_accepted: bool = True,
+    ) -> None:
+        while True:
+            try:
+                session.append_pcm(pcm, count_accepted=count_accepted)
+                return
+            except CapacityBufferError as exc:
+                if exc.reason != "session_pcm_limit" or not session.in_flight:
+                    raise
+                await asyncio.wait_for(
+                    session.wait_reservation_released(),
+                    timeout=self.settings.asr_stream_queue_timeout_seconds,
+                )
+                self.check_deadlines(session.session_id)
 
     def check_deadlines(self, session_id: str) -> None:
         ctx = self._contexts[session_id]

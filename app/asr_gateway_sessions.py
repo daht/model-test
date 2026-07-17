@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -46,6 +47,8 @@ class GatewaySession:
         self.buffer = PcmRingBuffer(max_samples=max_buffer_samples)
         self._next_job_sequence = 1
         self._reservation: SessionReservation | None = None
+        self._reservation_released = asyncio.Event()
+        self._reservation_released.set()
         self.finish_requested = False
         self._accepted_samples = 0
         self._external_discarded_samples = 0
@@ -115,6 +118,7 @@ class GatewaySession:
         reservation = SessionReservation(self._next_job_sequence, self.generation, chunk)
         self._next_job_sequence += 1
         self._reservation = reservation
+        self._reservation_released.clear()
         return reservation
 
     def acknowledge(self, job_sequence: int, *, generation: int) -> ReadyChunk:
@@ -123,6 +127,7 @@ class GatewaySession:
         reservation = self._require_reservation(job_sequence)
         self.buffer.acknowledge(reservation.chunk.start_sample, reservation.chunk.end_sample)
         self._reservation = None
+        self._reservation_released.set()
         return reservation.chunk
 
     def rollback(self, job_sequence: int) -> bool:
@@ -131,7 +136,11 @@ class GatewaySession:
         chunk = self._reservation.chunk
         self.buffer.rollback(chunk.start_sample, chunk.end_sample)
         self._reservation = None
+        self._reservation_released.set()
         return True
+
+    async def wait_reservation_released(self) -> None:
+        await self._reservation_released.wait()
 
     def matches_reservation(self, job_sequence: int, start_sample: int, end_sample: int) -> bool:
         return bool(
@@ -154,6 +163,7 @@ class GatewaySession:
             chunk = self._reservation.chunk
             self.buffer.rollback(chunk.start_sample, chunk.end_sample)
             self._reservation = None
+            self._reservation_released.set()
         if self.buffer.buffered_samples:
             self.buffer.discard(self.buffer.buffered_samples)
         pending = self.sample_accounting["pending_vad"]
