@@ -602,12 +602,16 @@ def test_runtime_enforces_audio_session_and_undecoded_deadlines_with_fake_clock(
             api_key="test-key", asr_gateway_default_backend="fake",
             asr_max_audio_seconds=.001, asr_max_session_seconds=.01,
             asr_max_undecoded_age_seconds=.005,
+            asr_gateway_default_update_ms=1,
         )
-        runtime = GatewayRuntime(settings, {"fake":adapter}, clock=clock); await runtime.start()
+        runtime = GatewayRuntime(settings, {"fake":adapter}, clock=clock)
+        await adapter.warmup()
+        await runtime.registry.register(adapter.capabilities)
+        await runtime.registry.mark_ready("fake", True)
         session = await runtime.open_session("s", language="zh", options={})
         with pytest.raises(RuntimeError, match="audio duration"):
             await runtime.ingest(session, b"\x00\x00" * 17)
-        await runtime.ingest(session, b"\x00\x00" * 8)
+        await runtime.ingest(session, b"\x00\x00" * 16)
         clock.value = .006
         with pytest.raises(TimeoutError, match="undecoded"):
             await runtime.ingest(session, b"\x00\x00" * 1)
@@ -615,6 +619,37 @@ def test_runtime_enforces_audio_session_and_undecoded_deadlines_with_fake_clock(
         with pytest.raises(TimeoutError, match="session deadline"):
             runtime.check_deadlines("s")
         await runtime.abort("s"); await runtime.close()
+    asyncio.run(scenario())
+
+
+def test_subthreshold_audio_does_not_trigger_undecoded_deadline():
+    async def scenario():
+        clock = type(
+            "Clock", (), {"value": 0.0, "__call__": lambda self: self.value}
+        )()
+        adapter = FakeAdapter()
+        settings = Settings(
+            model_backend="mock",
+            asr_backend="mock",
+            asr_stream_mode="stateful",
+            api_key="test-key",
+            asr_gateway_default_backend="fake",
+            asr_gateway_default_update_ms=2,
+            asr_max_undecoded_age_seconds=.005,
+        )
+        runtime = GatewayRuntime(settings, {"fake": adapter}, clock=clock)
+        await adapter.warmup()
+        await runtime.registry.register(adapter.capabilities)
+        await runtime.registry.mark_ready("fake", True)
+        session = await runtime.open_session("s", language="zh", options={})
+        await runtime.ingest(session, b"\x00\x00" * 16)
+        clock.value = .006
+
+        runtime.check_deadlines("s")
+
+        await runtime.abort("s")
+        await runtime.close()
+
     asyncio.run(scenario())
 
 

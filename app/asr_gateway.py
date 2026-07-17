@@ -279,8 +279,20 @@ class GatewayRuntime:
         now = self.scheduler.clock()
         if now - ctx.opened_at > self.settings.asr_max_session_seconds:
             raise TimeoutError("session deadline exceeded")
+        preferred = round(
+            self.settings.asr_gateway_default_update_ms
+            / 1000
+            * ctx.session.sample_rate
+        )
+        schedulable = bool(
+            ctx.session.in_flight
+            or ctx.session.buffer.buffered_samples >= preferred
+            or ctx.endpoint_pending
+            or ctx.session.finish_requested
+        )
         if (
             ctx.first_undecoded_at is not None
+            and schedulable
             and now - ctx.first_undecoded_at > self.settings.asr_max_undecoded_age_seconds
         ):
             raise TimeoutError("undecoded audio age exceeded")
