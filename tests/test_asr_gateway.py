@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from app.asr_gateway import GatewayRuntime, OutboundEvent, _default_runtime, create_app, send_outbound_events
 from app.asr_gateway_backends import DispatchMode, ResultMode, StreamingMode, VadMode
 from app.asr_gateway_scheduler import InferenceResult
+from app.asr_observability import CapacityBufferError
 from app.config import Settings
 from scripts import stream_asr_client
 from tests.test_asr_gateway_backends import capabilities
@@ -841,7 +842,7 @@ def test_rolling_route_and_endpoint_jobs_use_final_decode_batch_identity():
     assert queued.batch_key.decoding_identity.startswith("final:")
 
 
-def test_faster_whisper_keeps_mixed_boundary_jobs_in_one_scheduler_batch():
+def test_faster_whisper_separates_partial_and_final_scheduler_batches():
     async def scenario():
         adapter = FakeAdapter(
             dynamic=True,
@@ -875,12 +876,79 @@ def test_faster_whisper_keeps_mixed_boundary_jobs_in_one_scheduler_batch():
         runtime._contexts["final"].endpoint_pending = True
         await runtime.ingest(final_session, b"\x01\x00" * 4, force=True)
         await runtime.ingest(partial_session, b"\x02\x00" * 3, force=True)
+        identities = [
+            job.batch_key.decoding_identity
+            for job in runtime.scheduler._queues["fake"]
+        ]
+        await runtime.scheduler.run_once("fake", force=True)
         await runtime.scheduler.run_once("fake", force=True)
         calls = [[(job.final, job.sample_count) for job in call] for call in adapter.calls]
         await runtime.close()
-        return calls
+        return identities, calls
 
-    assert asyncio.run(scenario()) == [[(True, 4), (False, 3)]]
+    identities, calls = asyncio.run(scenario())
+
+    assert identities[0] != identities[1]
+    assert calls == [[(True, 4)], [(False, 3)]]
+
+
+def test_result_capacity_failure_preserves_sequence_and_capacity_reason():
+    async def scenario():
+        adapter = FakeAdapter(dynamic=True)
+        adapter.capabilities = replace(
+            adapter.capabilities,
+            preferred_chunk_samples=4,
+            max_input_samples=4,
+            max_segment_samples=16,
+            max_batch_samples=16,
+        )
+        settings = Settings(
+            _env_file=None,
+            model_backend="mock",
+            asr_backend="mock",
+            asr_stream_mode="stateful",
+            api_key="test-key",
+            asr_gateway_default_backend="fake",
+            asr_gateway_schedule_max_wait_ms=1_000,
+        )
+        runtime = GatewayRuntime(settings, {"fake": adapter})
+        await adapter.warmup()
+        await runtime.registry.register(adapter.capabilities)
+        await runtime.registry.mark_ready("fake", True)
+        session = await runtime.open_session("s", language="zh", options={})
+        await runtime.enqueue_ready("s")
+        await runtime.ingest(session, b"\x01\x00" * 8)
+
+        def reject_followup(_job):
+            raise CapacityBufferError(
+                "scheduler_queued_audio_limit",
+                limit=4,
+                current=4,
+                incoming=4,
+            )
+
+        runtime.scheduler.enqueue = reject_followup
+        await runtime.scheduler.run_once("fake", force=True)
+        payloads = []
+        queue = runtime.event_queue("s")
+        while not queue.empty():
+            envelope = queue.get_nowait()
+            if envelope.payload is not None:
+                payloads.append(envelope.payload)
+        metrics = runtime.metrics.snapshot()
+        terminal_state = session.terminal_state
+        await runtime.close()
+        return payloads, metrics, terminal_state
+
+    payloads, metrics, terminal_state = asyncio.run(scenario())
+
+    assert [event["sequence"] for event in payloads] == [1, 2]
+    assert payloads[-1]["type"] == "error"
+    assert payloads[-1]["code"] == "overloaded"
+    assert metrics["failures"] == 1
+    assert metrics["conflicts"] == 0
+    assert metrics["buffer_rejections"] == {"scheduler_queued_audio_limit": 1}
+    assert terminal_state.value == "failed"
 
 
 def test_exact_maximum_job_is_final_for_batched_beam_five_rollover():

@@ -6,6 +6,7 @@ import logging
 import time
 import uuid
 from contextlib import asynccontextmanager, suppress
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -276,9 +277,7 @@ class GatewayRuntime:
         faster_whisper = self.settings.asr_backend == "faster_whisper"
         bucket = 0 if faster_whisper else min(15, max(0, count.bit_length() - 1))
         decoding_identity = (
-            options_identity
-            if faster_whisper
-            else ("final:" if reservation.chunk.final else "partial:")
+            ("final:" if reservation.chunk.final else "partial:")
             + options_identity
         )
         job = InferenceJob(
@@ -674,20 +673,40 @@ class GatewayRuntime:
             ctx = self._contexts.get(result.session_id)
             if ctx is None:
                 return
-            self.metrics.conflicts += 1
+            capacity_failure = isinstance(exc, CapacityBufferError)
+            if capacity_failure:
+                self.metrics.failures += 1
+                self.metrics.record_capacity_rejection(exc.reason)
+                observability_events().emit(
+                    "asr_buffer_rejected",
+                    component="gateway",
+                    session_id=result.session_id,
+                    generation=result.generation,
+                    job_id=result.job_id,
+                    reason=exc.reason,
+                    **exc.safe_fields,
+                )
+            else:
+                self.metrics.conflicts += 1
             async with ctx.protocol_lock:
+                reason = exc.reason if capacity_failure else "result_conflict"
+                code = "overloaded" if capacity_failure else "result_conflict"
+                close_code = 1013 if capacity_failure else 1011
                 await self._fail_session(
-                    ctx, reason="result_conflict", exception_type=type(exc).__name__
+                    ctx,
+                    reason=reason,
+                    close_code=close_code,
+                    exception_type=type(exc).__name__,
                 )
                 if not ctx.protocol.terminal:
-                    event = ctx.protocol.error(exc, code="result_conflict")
+                    event = ctx.protocol.error(exc, code=code)
                     self._mark_result_applied(result.job_id)
                     await self._enqueue_events(
                         ctx,
                         [event],
                         job_id=result.job_id,
                         terminal=True,
-                        close_code=1011,
+                        close_code=close_code,
                     )
                 ctx.idle.set()
 
@@ -696,7 +715,14 @@ class GatewayRuntime:
         if ctx is None:
             return
         async with ctx.protocol_lock:
-            await self._apply_result_locked(ctx, result)
+            state = deepcopy(ctx.protocol.state)
+            terminal = ctx.protocol.terminal
+            try:
+                await self._apply_result_locked(ctx, result)
+            except Exception:
+                ctx.protocol.state = state
+                ctx.protocol.terminal = terminal
+                raise
 
     async def _apply_result_locked(
         self,
