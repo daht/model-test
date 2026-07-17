@@ -221,22 +221,18 @@ class GatewayRuntime:
         ):
             raise RuntimeError("audio duration limit exceeded")
         if pcm and ctx.vad is not None:
-            session.accept_vad_input(pcm)
+            await self._accept_vad_with_backpressure(session, pcm)
             decision = ctx.vad.add_audio(pcm)
             if decision.audio_to_model:
                 await self._append_pcm_with_backpressure(
                     session, decision.audio_to_model, count_accepted=False
                 )
-                if ctx.first_undecoded_at is None:
-                    ctx.first_undecoded_at = self.scheduler.clock()
             if decision.discarded_samples:
                 session.record_discarded(decision.discarded_samples)
             ctx.endpoint_pending = ctx.endpoint_pending or decision.endpoint
             force = force or decision.endpoint
         elif pcm:
             await self._append_pcm_with_backpressure(session, pcm)
-            if ctx.first_undecoded_at is None:
-                ctx.first_undecoded_at = self.scheduler.clock()
         scheduled = self._schedule_next(session, force=force)
         self._update_gauges()
         accounting = session.sample_accounting
@@ -253,6 +249,24 @@ class GatewayRuntime:
             scheduled=scheduled,
         )
         return scheduled
+
+    async def _accept_vad_with_backpressure(
+        self,
+        session: GatewaySession,
+        pcm: bytes,
+    ) -> None:
+        while True:
+            try:
+                session.accept_vad_input(pcm)
+                return
+            except CapacityBufferError as exc:
+                if exc.reason != "session_pcm_limit" or not session.in_flight:
+                    raise
+                await asyncio.wait_for(
+                    session.wait_reservation_released(),
+                    timeout=self.settings.asr_stream_queue_timeout_seconds,
+                )
+                self.check_deadlines(session.session_id)
 
     async def _append_pcm_with_backpressure(
         self,
@@ -358,6 +372,8 @@ class GatewayRuntime:
             timeline.mark("scheduler_enqueued", now)
             self._timelines[job.job_id] = (timeline, 1, caps.max_batch_items)
             self.scheduler.enqueue(job)
+            if ctx.first_undecoded_at is None:
+                ctx.first_undecoded_at = now
             observability_events().emit(
                 "asr_job_enqueued",
                 component="gateway",
@@ -372,6 +388,7 @@ class GatewayRuntime:
                 ready_depth=self.scheduler.snapshot()["ready_depth"],
             )
         except Exception:
+            self._timelines.pop(job.job_id, None)
             session.rollback(reservation.job_sequence)
             ctx.idle.set()
             raise
@@ -637,11 +654,7 @@ class GatewayRuntime:
             )
             raise StaleResultError("job no longer owns the session reservation")
         ctx.session.acknowledge(job.job_sequence, generation=job.generation)
-        accounting = ctx.session.sample_accounting
-        if accounting["buffered"] or accounting["reserved"]:
-            ctx.first_undecoded_at = self.scheduler.clock()
-        else:
-            ctx.first_undecoded_at = None
+        ctx.first_undecoded_at = None
         self._update_gauges()
         accounting = ctx.session.sample_accounting
         observability_events().emit(
@@ -657,6 +670,7 @@ class GatewayRuntime:
         )
 
     async def _reject_job(self, job: InferenceJob) -> None:
+        self._timelines.pop(job.job_id, None)
         ctx = self._contexts.get(job.session_id)
         if ctx is None or ctx.session.generation != job.generation:
             return
@@ -917,7 +931,10 @@ class GatewayRuntime:
         buffered = sum(item["buffered"] for item in accounting)
         reserved = sum(item["reserved"] for item in accounting)
         max_held = max(
-            (item["buffered"] + item["reserved"] for item in accounting),
+            (
+                item["buffered"] + item["reserved"] + item["pending_vad"]
+                for item in accounting
+            ),
             default=0,
         )
         self.metrics.set_gauges(
@@ -991,13 +1008,17 @@ async def send_outbound_events(
 ) -> None:
     while True:
         envelope = await ctx.events.get()
-        if envelope.payload is not None:
-            await websocket.send_json(envelope.payload)
-        if envelope.completes_timeline and envelope.job_id is not None:
-            runtime.mark_event_sent(envelope.job_id)
+        try:
+            if envelope.payload is not None:
+                await websocket.send_json(envelope.payload)
+            if envelope.completes_timeline and envelope.job_id is not None:
+                runtime.mark_event_sent(envelope.job_id)
+            if envelope.terminal:
+                await websocket.close(code=envelope.close_code or 1000)
+        finally:
+            if envelope.terminal:
+                await runtime._release_session(ctx.session.session_id)
         if envelope.terminal:
-            await websocket.close(code=envelope.close_code or 1000)
-            await runtime._release_session(ctx.session.session_id)
             return
 
 

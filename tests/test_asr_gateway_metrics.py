@@ -80,6 +80,16 @@ def test_completed_jobs_is_lifetime_total_not_bounded_window_size():
     assert snapshot["completed_window_jobs"] == 2
 
 
+def test_incomplete_timeline_does_not_count_or_raise():
+    metrics = GatewayMetrics()
+    timeline = JobTimeline("queued", "w", 16000)
+    timeline.mark("audio_received", 0)
+
+    metrics.complete(timeline, batch_size=1, batch_capacity=1)
+
+    assert metrics.snapshot()["completed_jobs"] == 0
+
+
 def test_scheduler_and_engine_metrics_report_real_bounded_distributions():
     metrics = GatewayMetrics(max_completed=3)
     for size in (2, 4, 5):

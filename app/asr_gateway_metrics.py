@@ -122,7 +122,8 @@ class GatewayMetrics:
         }
 
     def complete(self, timeline: JobTimeline, *, batch_size: int, batch_capacity: int) -> None:
-        timeline.require_complete()
+        if any(stage not in timeline.stages for stage in STAGES):
+            return
         if batch_size <= 0 or batch_capacity < batch_size:
             raise ValueError("batch accounting is invalid")
         self._completed.append((timeline, batch_size, batch_capacity))

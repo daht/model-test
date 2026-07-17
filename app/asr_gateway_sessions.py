@@ -6,6 +6,7 @@ from enum import Enum
 from typing import Any
 
 from app.asr_gateway_chunking import PcmRingBuffer, ReadyChunk
+from app.asr_observability import CapacityBufferError
 from app.asr_streaming import StreamingTranscriptState
 
 
@@ -91,7 +92,20 @@ class GatewaySession:
     def accept_vad_input(self, pcm: bytes) -> None:
         if len(pcm) % 2:
             raise ValueError("pcm_s16le bytes must be sample-aligned")
-        self._accepted_samples += len(pcm) // 2
+        samples = len(pcm) // 2
+        accounting = self.sample_accounting
+        current = sum(
+            accounting[key] for key in ("buffered", "reserved", "pending_vad")
+        )
+        if current + samples > self.buffer.max_samples:
+            raise CapacityBufferError(
+                "session_pcm_limit",
+                limit=self.buffer.max_samples,
+                current=current,
+                incoming=samples,
+                message="session PCM buffer limit exceeded",
+            )
+        self._accepted_samples += samples
 
     def record_discarded(self, samples: int) -> None:
         if samples < 0 or samples > self.sample_accounting["pending_vad"]:
