@@ -1184,11 +1184,13 @@ def create_app(*, runtime: GatewayRuntime | None = None) -> FastAPI:
                     if sender is not None:
                         await sender
         finally:
-            if sender is not None:
-                sender.cancel()
-                with suppress(asyncio.CancelledError):
-                    await sender
-            await runtime_value.abort(session_id)
+            try:
+                if sender is not None:
+                    sender.cancel()
+                    with suppress(asyncio.CancelledError, WebSocketDisconnect):
+                        await sender
+            finally:
+                await runtime_value.abort(session_id)
 
     return app
 

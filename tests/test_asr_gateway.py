@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from app.asr_gateway import GatewayRuntime, OutboundEvent, _default_runtime, create_app, send_outbound_events
 from app.asr_gateway_backends import DispatchMode, ResultMode, StreamingMode, VadMode
@@ -92,6 +93,61 @@ def test_websocket_auth_start_audio_segment_finish_and_close_1000():
             assert [event["type"] for event in finish_events] == ["partial", "final"]
             assert [event["sequence"] for event in segment_events + finish_events] == [3, 4, 5, 6, 7]
         assert adapter.sessions == set()
+
+
+def test_websocket_sender_disconnect_releases_session_and_lease():
+    class DisconnectingWebSocket:
+        def __init__(self):
+            self.headers = {"x-api-key": "test-key"}
+            self.send_attempted = asyncio.Event()
+
+        async def accept(self):
+            return None
+
+        async def receive_json(self):
+            return {"type": "start", "language": "zh"}
+
+        async def receive(self):
+            await self.send_attempted.wait()
+            return {"type": "websocket.disconnect", "code": 1006}
+
+        async def send_json(self, _payload):
+            self.send_attempted.set()
+            raise WebSocketDisconnect(code=1006)
+
+    async def scenario():
+        adapter = FakeAdapter()
+        settings = Settings(
+            model_backend="mock",
+            asr_backend="mock",
+            asr_stream_mode="stateful",
+            api_key="test-key",
+            asr_gateway_default_backend="fake",
+        )
+        runtime = GatewayRuntime(settings, {"fake": adapter})
+        app = create_app(runtime=runtime)
+        endpoint = next(
+            route.endpoint
+            for route in app.routes
+            if getattr(route, "path", None) == "/v1/transcribe/stream"
+        )
+
+        async with app.router.lifespan_context(app):
+            error = None
+            try:
+                await endpoint(DisconnectingWebSocket())
+            except WebSocketDisconnect as exc:
+                error = exc
+            registry = await runtime.registry.snapshot()
+            return (
+                error,
+                runtime.metrics.snapshot()["active_sessions"],
+                registry["workers"]["fake"]["active_leases"],
+                set(runtime._contexts),
+                set(adapter.sessions),
+            )
+
+    assert asyncio.run(scenario()) == (None, 0, 0, set(), set())
 
 
 def test_invalid_start_and_odd_audio_fail_explicitly_once():
