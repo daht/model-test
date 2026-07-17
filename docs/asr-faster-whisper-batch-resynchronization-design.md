@@ -24,9 +24,16 @@ stricter `BatchKey` therefore prevented the adapter grouping boundary from ever
 receiving mixed partial/final work. HY-MT was idle, total GPU memory remained
 below half of the A10 capacity, and cleanup returned all gauges to zero.
 
-The monitor also captured only the warning-level slow call despite
-`ASR_DIAGNOSTIC_LOGGING=true`. The dedicated event logger inherited a level that
-filtered INFO records before they reached the configured Uvicorn handlers.
+The first resynchronization candidate still failed live after 106 seconds. Its
+last two calls were complete five-item batches, but decoding 26.8 and 28.8
+seconds per session took 2.179 and 2.279 seconds. That exceeds the two-second
+input cadence even with optimal batching, proving that repeated full-segment
+rolling decode is the primary capacity limit. Batch fragmentation is a
+secondary amplifier.
+
+The monitor also captured only warning-level slow calls despite
+`ASR_DIAGNOSTIC_LOGGING=true`. Setting the dedicated logger level was
+insufficient because it had no production handler.
 
 ## Selected Design
 
@@ -39,9 +46,13 @@ returns only after all internal groups finish, result cleanup and publication
 again form one synchronization barrier for the sessions in that submission.
 
 All other backends retain their current partial/final and length-bucket keys.
-No buffer, timeout, VAD, beam, utterance, or protocol setting changes.
+The A10 faster-whisper contract uses a 15-second maximum utterance boundary so
+the adapter clears its accumulated PCM before full-batch inference exceeds the
+two-second arrival cadence. Buffer, timeout, VAD, beam, and protocol semantics
+remain unchanged; continuous speech emits confirmed segments more frequently.
 
-Set the dedicated `app.asr.events` logger to INFO when the emitter is configured.
+Emit through a child of the configured `uvicorn.error` logger so production
+handlers receive INFO records.
 Diagnostic gating still suppresses high-frequency events unless
 `ASR_DIAGNOSTIC_LOGGING=true`; always-on lifecycle events remain visible.
 

@@ -597,6 +597,7 @@ if backend == "faster_whisper":
         "ASR_FASTER_WHISPER_PARTIAL_BEAM_SIZE": "1",
         "ASR_FASTER_WHISPER_FINAL_BEAM_SIZE": "5",
         "ASR_FASTER_WHISPER_TASK": "transcribe",
+        "ASR_MAX_UTTERANCE_SECONDS": "15.0",
         "ASR_GATEWAY_SCHEDULE_MAX_WAIT_MS": "200",
         "ASR_GATEWAY_MAX_SESSION_BUFFER_SECONDS": "6.0",
     })

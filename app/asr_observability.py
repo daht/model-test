@@ -188,7 +188,7 @@ def configure_events(
     *, diagnostic_enabled: bool, slow_engine_seconds: float
 ) -> EventEmitter:
     global _emitter
-    logger = logging.getLogger("app.asr.events")
+    logger = logging.getLogger("uvicorn.error.asr.events")
     logger.setLevel(logging.INFO)
     _emitter = EventEmitter(
         logger,

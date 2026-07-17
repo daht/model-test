@@ -10,6 +10,9 @@ not a validated A10 capacity claim.
 
 The candidate uses 200 ms bounded coalescing latency so compatible public
 WebSocket streams that arrive slightly offset can share a dynamic batch. Its
+15-second maximum utterance boundary caps the repeated full-segment work of the
+rolling adapter; longer continuous speech is committed in bounded segments.
+Its
 `ASR_GATEWAY_MAX_SESSION_BUFFER_SECONDS=6.0` setting provides six seconds of jitter headroom, not an accepted lag target. Keep
 `ASR_MAX_CONNECTION_LAG_SECONDS=4.0` and
 `ASR_MAX_UNDECODED_AGE_SECONDS=8.0` unchanged so sustained lag still fails

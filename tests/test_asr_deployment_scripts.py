@@ -121,6 +121,7 @@ def test_a10_faster_whisper_example_is_fp16_large_v3_batch_four_transcribe_only(
         "ASR_FASTER_WHISPER_PARTIAL_BEAM_SIZE=1",
         "ASR_FASTER_WHISPER_FINAL_BEAM_SIZE=5",
         "ASR_FASTER_WHISPER_TASK=transcribe",
+        "ASR_MAX_UTTERANCE_SECONDS=15.0",
         "ASR_GATEWAY_SCHEDULE_MAX_WAIT_MS=200",
         "ASR_GATEWAY_MAX_SESSION_BUFFER_SECONDS=6.0",
         "ASR_GATEWAY_DEFAULT_UPDATE_MS=2000",
@@ -158,6 +159,7 @@ def test_release_gate_accepts_faster_whisper_contract_and_runs_gateway_warmup():
     assert '"ASR_FASTER_WHISPER_PARTIAL_BEAM_SIZE": "1"' in verifier
     assert '"ASR_FASTER_WHISPER_FINAL_BEAM_SIZE": "5"' in verifier
     assert '"ASR_FASTER_WHISPER_TASK": "transcribe"' in verifier
+    assert '"ASR_MAX_UTTERANCE_SECONDS": "15.0"' in verifier
     assert '"ASR_GATEWAY_SCHEDULE_MAX_WAIT_MS": "200"' in verifier
     assert '"ASR_GATEWAY_MAX_SESSION_BUFFER_SECONDS": "6.0"' in verifier
     assert "from app.asr_gateway import _default_runtime" in verifier
