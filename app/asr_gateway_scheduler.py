@@ -101,6 +101,7 @@ class GatewayScheduler:
         worker_failed: Callable[[str, str], Awaitable[None]] = _noop_failure,
         stage_hook: Callable[[str, Sequence[InferenceJob], int], None] | None = None,
         reject: AsyncHook = _noop,
+        discard: AsyncHook = _noop,
         inference_timeout_seconds: float | None = None,
     ) -> None:
         if max_wait_seconds < 0 or max_ready_jobs <= 0 or max_queued_samples <= 0:
@@ -115,6 +116,7 @@ class GatewayScheduler:
         self.worker_failed = worker_failed
         self.stage_hook = stage_hook
         self.reject = reject
+        self.discard = discard
         self.inference_timeout_seconds = inference_timeout_seconds
         self._queues: dict[str, list[InferenceJob]] = defaultdict(list)
         self._queued_samples = 0
@@ -291,7 +293,10 @@ class GatewayScheduler:
             try:
                 await self.cleanup(job)
             except StaleResultError:
-                self._mark_safe(job)
+                try:
+                    await self.discard(job)
+                finally:
+                    self._mark_safe(job)
                 continue
             except Exception:
                 # A cleanup failure poisons this result; success is never visible.
@@ -300,10 +305,16 @@ class GatewayScheduler:
                 self._mark_safe(job)
                 continue
             if (job.session_id, job.generation) in self._cancelled_generations:
-                self._mark_safe(job)
+                try:
+                    await self.discard(job)
+                finally:
+                    self._mark_safe(job)
                 continue
             if result.generation != job.generation or result.job_sequence != job.job_sequence:
-                self._mark_safe(job)
+                try:
+                    await self.discard(job)
+                finally:
+                    self._mark_safe(job)
                 continue
             try:
                 await self.publish(result)

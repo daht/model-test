@@ -855,12 +855,15 @@ def test_terminal_sender_failure_still_releases_session(failure_point):
         await runtime.start()
         await runtime.open_session("s", language="zh", options={})
         ctx = runtime._contexts["s"]
+        timeline = JobTimeline("job", "fake", 4)
+        timeline.mark("audio_received", runtime.scheduler.clock())
+        runtime._timelines["job"] = (timeline, 1, 1)
         final = ctx.protocol.final()
         await ctx.events.put(
             OutboundEvent(
                 final,
-                job_id="job" if failure_point == "metric" else None,
-                completes_timeline=failure_point == "metric",
+                job_id="job",
+                completes_timeline=True,
                 terminal=True,
                 close_code=1000,
             )
@@ -876,10 +879,16 @@ def test_terminal_sender_failure_still_releases_session(failure_point):
         registry = await runtime.registry.snapshot()
         contexts = set(runtime._contexts)
         active_sessions = runtime.sessions.snapshot()["active_sessions"]
+        timelines = dict(runtime._timelines)
         await runtime.close()
-        return contexts, active_sessions, registry["workers"]["fake"]["active_leases"]
+        return (
+            contexts,
+            active_sessions,
+            registry["workers"]["fake"]["active_leases"],
+            timelines,
+        )
 
-    assert asyncio.run(scenario()) == (set(), 0, 0)
+    assert asyncio.run(scenario()) == (set(), 0, 0, {})
 
 
 def test_incomplete_terminal_timeline_is_not_completed_or_raised():
@@ -1405,6 +1414,57 @@ def test_cancelled_queued_timeline_is_settled_once():
         runtime.scheduler.cancel_session("s", generation=session.generation)
         await runtime.scheduler.run_once("fake", force=True)
         await runtime.scheduler.run_once("fake", force=True)
+        remaining = dict(runtime._timelines)
+        completed = runtime.metrics.snapshot()["completed_jobs"]
+        await runtime.abort("s")
+        await runtime.close()
+        return job_id, remaining, completed
+
+    job_id, remaining, completed = asyncio.run(scenario())
+
+    assert job_id not in remaining
+    assert completed == 0
+
+
+def test_cancelled_dispatched_timeline_is_settled_once():
+    class BlockingAdapter(FakeAdapter):
+        def __init__(self):
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def submit(self, jobs):
+            self.calls.append(list(jobs))
+            self.entered.set()
+            await self.release.wait()
+            return [InferenceResult.from_job(job, text="heard") for job in jobs]
+
+    async def scenario():
+        adapter = BlockingAdapter()
+        settings = Settings(
+            _env_file=None,
+            model_backend="mock",
+            asr_backend="mock",
+            asr_stream_mode="stateful",
+            api_key="test-key",
+            asr_gateway_default_backend="fake",
+            asr_gateway_schedule_max_wait_ms=1_000,
+        )
+        runtime = GatewayRuntime(settings, {"fake": adapter})
+        await adapter.warmup()
+        await runtime.registry.register(adapter.capabilities)
+        await runtime.registry.mark_ready("fake", True)
+        session = await runtime.open_session("s", language="zh", options={})
+        await runtime.ingest(session, b"\x01\x00" * 4, force=True)
+        job_id = runtime.scheduler._queues["fake"][0].job_id
+        dispatch = asyncio.create_task(
+            runtime.scheduler.run_once("fake", force=True)
+        )
+        await adapter.entered.wait()
+
+        runtime.scheduler.cancel_session("s", generation=session.generation)
+        adapter.release.set()
+        await dispatch
         remaining = dict(runtime._timelines)
         completed = runtime.metrics.snapshot()["completed_jobs"]
         await runtime.abort("s")

@@ -96,6 +96,7 @@ class GatewayRuntime:
             worker_failed=self._worker_failed,
             stage_hook=self._record_stage,
             reject=self._reject_job,
+            discard=self._discard_job,
             inference_timeout_seconds=settings.asr_stream_inference_timeout_seconds,
         )
         self._started = False
@@ -388,7 +389,7 @@ class GatewayRuntime:
                 ready_depth=self.scheduler.snapshot()["ready_depth"],
             )
         except Exception:
-            self._timelines.pop(job.job_id, None)
+            self.discard_timeline(job.job_id)
             session.rollback(reservation.job_sequence)
             ctx.idle.set()
             raise
@@ -670,13 +671,16 @@ class GatewayRuntime:
         )
 
     async def _reject_job(self, job: InferenceJob) -> None:
-        self._timelines.pop(job.job_id, None)
+        self.discard_timeline(job.job_id)
         ctx = self._contexts.get(job.session_id)
         if ctx is None or ctx.session.generation != job.generation:
             return
         if not ctx.session.rollback(job.job_sequence):
             self.metrics.conflicts += 1
             raise StaleResultError("rejected job lost its reservation")
+
+    async def _discard_job(self, job: InferenceJob) -> None:
+        self.discard_timeline(job.job_id)
 
     async def _worker_failed(self, worker_id: str, reason: str) -> None:
         self.metrics.failures += 1
@@ -710,6 +714,9 @@ class GatewayRuntime:
         timeline, batch_size, capacity = record
         timeline.mark("event_sent", self.scheduler.clock())
         self.metrics.complete(timeline, batch_size=batch_size, batch_capacity=capacity)
+
+    def discard_timeline(self, job_id: str) -> None:
+        self._timelines.pop(job_id, None)
 
     async def _enqueue_events(
         self,
@@ -892,7 +899,7 @@ class GatewayRuntime:
             await self._enqueue_events(ctx, events, job_id=result.job_id)
         else:
             # No egress occurred, so this job is intentionally not completed.
-            self._timelines.pop(result.job_id, None)
+            self.discard_timeline(result.job_id)
         observability_events().emit(
             "asr_result_published",
             component="gateway",
@@ -1017,6 +1024,8 @@ async def send_outbound_events(
                 await websocket.close(code=envelope.close_code or 1000)
         finally:
             if envelope.terminal:
+                if envelope.job_id is not None:
+                    runtime.discard_timeline(envelope.job_id)
                 await runtime._release_session(ctx.session.session_id)
         if envelope.terminal:
             return
