@@ -109,6 +109,49 @@ def test_scheduler_audio_overflow_has_exact_capacity_reason():
     assert rejected.value.safe_fields == {"limit": 150, "current": 100, "incoming": 100}
 
 
+def test_completed_batch_releases_queued_audio_before_result_publication():
+    async def scenario():
+        caps = replace(
+            capabilities(),
+            dispatch_mode=DispatchMode.DYNAMIC_MICROBATCH,
+            max_batch_items=7,
+            max_batch_samples=700,
+        )
+        adapter = RecordingAdapter(caps)
+        adapter.release.set()
+        rejected = []
+        published = []
+        scheduler = None
+
+        async def publish(result):
+            nonlocal scheduler
+            published.append(result.job_id)
+            if len(published) == 1:
+                try:
+                    scheduler.enqueue(job("followup", samples=200))
+                except CapacityBufferError as exc:
+                    rejected.append(exc.reason)
+
+        scheduler = GatewayScheduler(
+            {"worker-1": adapter},
+            clock=FakeClock(),
+            max_wait_seconds=0,
+            max_ready_jobs=10,
+            max_queued_samples=750,
+            publish=publish,
+        )
+        for index in range(7):
+            scheduler.enqueue(job(f"s{index}", samples=100))
+        await scheduler.run_once("worker-1", force=True)
+        return rejected, published, scheduler.snapshot()
+
+    rejected, published, snapshot = asyncio.run(scenario())
+
+    assert rejected == []
+    assert len(published) == 7
+    assert snapshot["queued_samples"] == 200
+
+
 def test_cleanup_completes_before_success_publication_and_stale_is_discarded():
     async def scenario():
         adapter = RecordingAdapter(capabilities()); adapter.release.set()

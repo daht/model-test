@@ -278,9 +278,9 @@ class GatewayScheduler:
             await self.worker_failed(worker_id, "submit_failed")
             results = [InferenceResult.from_job(job, error=f"{type(exc).__name__}: batch failed") for job in batch]
 
+        self._queued_samples -= sum(job.sample_count for job in batch)
         for job, result in zip(batch, results):
             # Ownership/queue cleanup is deliberately complete before publication.
-            self._queued_samples -= job.sample_count
             try:
                 await self.cleanup(job)
             except StaleResultError:
