@@ -842,6 +842,92 @@ def test_rolling_route_and_endpoint_jobs_use_final_decode_batch_identity():
     assert queued.batch_key.decoding_identity.startswith("final:")
 
 
+def test_endpoint_arriving_during_partial_inference_schedules_batched_final():
+    class HeldAdapter(FakeAdapter):
+        def __init__(self):
+            super().__init__(dynamic=True, result_mode=ResultMode.REPLACEABLE_SEGMENT)
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+            self.finish_segment_calls = 0
+
+        async def submit(self, jobs):
+            self.calls.append(list(jobs))
+            if len(self.calls) == 1:
+                self.entered.set()
+                await self.release.wait()
+            return [
+                InferenceResult.from_job(job, text=f"heard-{job.sample_count}")
+                for job in jobs
+            ]
+
+        async def finish_segment(self, session_id):
+            self.finish_segment_calls += 1
+            return await super().finish_segment(session_id)
+
+    class EndpointVad:
+        @staticmethod
+        def endpoint_finalized():
+            return type(
+                "Decision",
+                (),
+                {"audio_to_model": b"", "discarded_samples": 0, "endpoint": False},
+            )()
+
+        @staticmethod
+        def reset():
+            return None
+
+    async def scenario():
+        adapter = HeldAdapter()
+        adapter.capabilities = replace(
+            adapter.capabilities,
+            streaming_mode=StreamingMode.ROLLING,
+            preferred_chunk_samples=4,
+            max_input_samples=16,
+            max_segment_samples=16,
+            max_batch_samples=64,
+        )
+        settings = Settings(
+            _env_file=None,
+            model_backend="mock",
+            asr_backend="mock",
+            asr_stream_mode="rolling",
+            api_key="test-key",
+            asr_gateway_default_backend="fake",
+            asr_gateway_schedule_max_wait_ms=0,
+        )
+        runtime = GatewayRuntime(settings, {"fake": adapter})
+        await adapter.warmup()
+        await runtime.registry.register(adapter.capabilities)
+        await runtime.registry.mark_ready("fake", True)
+        session = await runtime.open_session("s", language="zh", options={})
+        await runtime.ingest(session, b"\x01\x00" * 4, force=True)
+        partial = asyncio.create_task(
+            runtime.scheduler.run_once("fake", force=True)
+        )
+        await adapter.entered.wait()
+        session.append_pcm(b"\x02\x00" * 4)
+        runtime._contexts["s"].endpoint_pending = True
+        runtime._contexts["s"].vad = EndpointVad()
+        adapter.release.set()
+        await partial
+        queued = runtime.scheduler._queues["fake"][0]
+        finish_calls_after_partial = adapter.finish_segment_calls
+        await runtime.scheduler.run_once("fake", force=True)
+        finish_calls_after_final = adapter.finish_segment_calls
+        calls = [[(job.final, job.sample_count) for job in call] for call in adapter.calls]
+        await runtime.close()
+        return queued, finish_calls_after_partial, finish_calls_after_final, calls
+
+    queued, after_partial, after_final, calls = asyncio.run(scenario())
+
+    assert queued.final is True
+    assert queued.batch_key.decoding_identity.startswith("final:")
+    assert after_partial == 0
+    assert after_final == 1
+    assert calls == [[(False, 4)], [(True, 4)]]
+
+
 def test_faster_whisper_separates_partial_and_final_scheduler_batches():
     async def scenario():
         adapter = FakeAdapter(

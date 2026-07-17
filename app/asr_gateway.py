@@ -823,10 +823,15 @@ class GatewayRuntime:
         )
         ctx.utterance_samples += result.end_sample - result.start_sample
         caps = self.adapters[result.worker_id].capabilities
+        deferred_endpoint_final = bool(
+            ctx.endpoint_pending
+            and not result.final
+            and self._schedule_next(ctx.session, force=True)
+        )
         continuation_ready = False
         if (
             result.final
-            or ctx.endpoint_pending
+            or (ctx.endpoint_pending and not deferred_endpoint_final)
             or ctx.utterance_samples >= caps.max_segment_samples
         ):
             control = await self.adapters[result.worker_id].finish_segment(result.session_id)
@@ -844,7 +849,7 @@ class GatewayRuntime:
                 if decision.discarded_samples:
                     ctx.session.record_discarded(decision.discarded_samples)
                 ctx.endpoint_pending = decision.endpoint
-        scheduled = self._schedule_next(
+        scheduled = deferred_endpoint_final or self._schedule_next(
             ctx.session,
             force=continuation_ready or ctx.endpoint_pending or ctx.session.finish_requested,
         )
