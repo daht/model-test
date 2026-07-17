@@ -31,6 +31,14 @@ input cadence even with optimal batching, proving that repeated full-segment
 rolling decode is the primary capacity limit. Batch fragmentation is a
 secondary amplifier.
 
+The 15-second candidate removed that sustained growth but exposed a second,
+independent decoder bound after about 223 seconds. Of 195 engine calls, 192
+normal calls averaged 0.601 seconds and never exceeded 1.586 seconds. The three
+abnormal calls each contained a 224-character run, averaged 2.378 seconds, and
+immediately preceded the session buffer rejection. The repeated output occurred
+with only 8–14 seconds of accumulated audio, so shortening the rolling window
+alone cannot prevent it.
+
 The monitor also captured only warning-level slow calls despite
 `ASR_DIAGNOSTIC_LOGGING=true`. Setting the dedicated logger level was
 insufficient because it had no production handler.
@@ -50,6 +58,9 @@ The A10 faster-whisper contract uses a 15-second maximum utterance boundary so
 the adapter clears its accumulated PCM before full-batch inference exceeds the
 two-second arrival cadence. Buffer, timeout, VAD, beam, and protocol semantics
 remain unchanged; continuous speech emits confirmed segments more frequently.
+The engine also sets `no_repeat_ngram_size=3` to prevent the observed repeated
+decoder sequence from consuming the whole batch budget. It does not impose an
+untested `max_new_tokens` truncation.
 
 Emit through a child of the configured `uvicorn.error` logger so production
 handlers receive INFO records.

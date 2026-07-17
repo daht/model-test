@@ -1,10 +1,12 @@
 import asyncio
+import sys
+import types
 from dataclasses import dataclass
 
 import numpy as np
 import pytest
 
-from app.asr_faster_whisper import DecodedText, FasterWhisperAdapter
+from app.asr_faster_whisper import DecodedText, FasterWhisperAdapter, FasterWhisperEngine
 from app.asr_gateway_backends import DispatchMode, ResultMode, StreamingMode, VadMode
 from app.asr_gateway_scheduler import BatchKey, InferenceJob
 from app.asr_observability import CapacityBufferError
@@ -75,6 +77,61 @@ def make_job(session_id, sequence, pcm, *, final=False, language="zh"):
         ),
         final=final,
     )
+
+
+def test_engine_suppresses_repeated_three_token_sequences(monkeypatch):
+    audio_module = types.ModuleType("faster_whisper.audio")
+    audio_module.pad_or_trim = lambda features: features
+    tokenizer_module = types.ModuleType("faster_whisper.tokenizer")
+
+    class Tokenizer:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def decode(self, _tokens):
+            return "decoded"
+
+    tokenizer_module.Tokenizer = Tokenizer
+    transcribe_module = types.ModuleType("faster_whisper.transcribe")
+
+    class TranscriptionOptions:
+        def __init__(self, **values):
+            self.__dict__.update(values)
+
+    transcribe_module.TranscriptionOptions = TranscriptionOptions
+    transcribe_module.get_suppressed_tokens = lambda _tokenizer, values: values
+    monkeypatch.setitem(sys.modules, "faster_whisper.audio", audio_module)
+    monkeypatch.setitem(sys.modules, "faster_whisper.tokenizer", tokenizer_module)
+    monkeypatch.setitem(sys.modules, "faster_whisper.transcribe", transcribe_module)
+
+    class Model:
+        hf_tokenizer = object()
+        model = type("InnerModel", (), {"is_multilingual": True})()
+
+        @staticmethod
+        def feature_extractor(_audio):
+            return np.zeros((80, 2), dtype=np.float32)
+
+    captured = {}
+
+    class Pipeline:
+        @staticmethod
+        def generate_segment_batched(_features, _tokenizer, options):
+            captured["options"] = options
+            return None, [{"tokens": [1]}]
+
+    engine = object.__new__(FasterWhisperEngine)
+    engine._model = Model()
+    engine._pipeline = Pipeline()
+
+    result = engine.transcribe_batch(
+        [np.zeros(1600, dtype=np.float32)],
+        language="zh",
+        beam_size=1,
+    )
+
+    assert result == [DecodedText("decoded", "zh")]
+    assert captured["options"].no_repeat_ngram_size == 3
 
 
 def test_adapter_advertises_real_rolling_dynamic_batch_contract():
