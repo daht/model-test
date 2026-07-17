@@ -147,6 +147,31 @@ def test_final_batch_uses_beam_five_then_control_consumes_cache_without_decode()
     assert snapshot["active_sessions"] == 1
 
 
+def test_mixed_partial_final_submission_partitions_beams_and_restores_order():
+    async def scenario():
+        engine = RecordingEngine()
+        adapter = make_adapter(engine)
+        observed = []
+        adapter.set_engine_observer(lambda **values: observed.append(values))
+        await adapter.warmup()
+        await adapter.open_session("partial", language="zh")
+        await adapter.open_session("final", language="zh")
+        results = await adapter.submit([
+            make_job("partial", 1, b"\x01\x00" * 3),
+            make_job("final", 1, b"\x02\x00" * 4, final=True),
+        ])
+        return engine.calls, observed, results
+
+    calls, observed, results = asyncio.run(scenario())
+
+    assert calls == [
+        EngineCall([3], "zh", 1),
+        EngineCall([4], "zh", 5),
+    ]
+    assert [item["group_count"] for item in observed] == [2, 2]
+    assert [item.session_id for item in results] == ["partial", "final"]
+
+
 def test_explicit_segment_redecodes_one_session_with_final_beam_and_clears_audio():
     async def scenario():
         engine = RecordingEngine()

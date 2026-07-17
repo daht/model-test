@@ -271,8 +271,16 @@ class GatewayRuntime:
         )
         reservation = session.reserve(count, final=final_decode)
         ctx.idle.clear()
-        bucket = min(15, max(0, count.bit_length() - 1))
         options = session.options
+        options_identity = str(hash(json.dumps(options, sort_keys=True, default=str)))
+        faster_whisper = self.settings.asr_backend == "faster_whisper"
+        bucket = 0 if faster_whisper else min(15, max(0, count.bit_length() - 1))
+        decoding_identity = (
+            options_identity
+            if faster_whisper
+            else ("final:" if reservation.chunk.final else "partial:")
+            + options_identity
+        )
         job = InferenceJob(
             job_id=f"{session.session_id}:{session.generation}:{reservation.job_sequence}",
             session_id=session.session_id, generation=session.generation,
@@ -285,8 +293,7 @@ class GatewayRuntime:
                 session.selected_worker_id, caps.model_revision, session.language,
                 str(options.get("task", "transcribe")), bool(options.get("timestamps", False)),
                 str(hash(str(options.get("prompt", "")))),
-                ("final:" if reservation.chunk.final else "partial:")
-                + str(hash(json.dumps(options, sort_keys=True, default=str))),
+                decoding_identity,
                 "pcm_s16le", bucket,
             ),
             final=reservation.chunk.final,

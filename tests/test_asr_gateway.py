@@ -841,6 +841,48 @@ def test_rolling_route_and_endpoint_jobs_use_final_decode_batch_identity():
     assert queued.batch_key.decoding_identity.startswith("final:")
 
 
+def test_faster_whisper_keeps_mixed_boundary_jobs_in_one_scheduler_batch():
+    async def scenario():
+        adapter = FakeAdapter(
+            dynamic=True,
+            result_mode=ResultMode.REPLACEABLE_SEGMENT,
+        )
+        adapter.capabilities = replace(
+            adapter.capabilities,
+            streaming_mode=StreamingMode.ROLLING,
+            vad_mode=VadMode.NONE,
+            preferred_chunk_samples=4,
+            max_input_samples=16,
+            max_segment_samples=16,
+            max_batch_samples=64,
+            model_id="/models/faster-whisper-large-v3",
+        )
+        settings = Settings(
+            _env_file=None,
+            model_backend="mock",
+            asr_backend="faster_whisper",
+            asr_stream_mode="rolling",
+            asr_model_name="large-v3",
+            asr_model_id="/models/faster-whisper-large-v3",
+            api_key="unit-test-only-not-a-production-secret-000000",
+            asr_gateway_default_backend="fake",
+            asr_gateway_schedule_max_wait_ms=0,
+        )
+        runtime = GatewayRuntime(settings, {"fake": adapter})
+        await runtime.start()
+        final_session = await runtime.open_session("final", language="zh", options={})
+        partial_session = await runtime.open_session("partial", language="zh", options={})
+        runtime._contexts["final"].endpoint_pending = True
+        await runtime.ingest(final_session, b"\x01\x00" * 4, force=True)
+        await runtime.ingest(partial_session, b"\x02\x00" * 3, force=True)
+        await runtime.scheduler.run_once("fake", force=True)
+        calls = [[(job.final, job.sample_count) for job in call] for call in adapter.calls]
+        await runtime.close()
+        return calls
+
+    assert asyncio.run(scenario()) == [[(True, 4), (False, 3)]]
+
+
 def test_exact_maximum_job_is_final_for_batched_beam_five_rollover():
     async def scenario():
         adapter = FakeAdapter(dynamic=True, result_mode=ResultMode.REPLACEABLE_SEGMENT)

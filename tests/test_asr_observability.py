@@ -8,6 +8,7 @@ from app.asr_observability import (
     BoundedValues,
     CapacityBufferError,
     EventEmitter,
+    configure_events,
     stable_batch_id,
 )
 
@@ -63,6 +64,38 @@ def test_event_emitter_writes_stable_json_and_gates_diagnostics():
         "session_id": "session-1",
         "active_sessions": 1,
     }
+
+
+def test_configured_event_logger_emits_diagnostic_info(monkeypatch):
+    import app.asr_observability as observability
+
+    logger = logging.getLogger("app.asr.events")
+    previous_level = logger.level
+    previous_handlers = logger.handlers[:]
+    previous_propagate = logger.propagate
+    handler = RecordingHandler()
+    monkeypatch.setattr(observability, "_emitter", observability._emitter)
+    try:
+        logger.handlers[:] = [handler]
+        logger.propagate = False
+        logger.setLevel(logging.WARNING)
+        configured = configure_events(
+            diagnostic_enabled=True,
+            slow_engine_seconds=2.0,
+        )
+
+        configured.emit(
+            "asr_audio_ingested",
+            component="gateway",
+            diagnostic=True,
+            incoming_samples=3200,
+        )
+
+        assert len(handler.messages) == 1
+    finally:
+        logger.handlers[:] = previous_handlers
+        logger.propagate = previous_propagate
+        logger.setLevel(previous_level)
 
 
 @pytest.mark.parametrize(

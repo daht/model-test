@@ -188,8 +188,10 @@ def configure_events(
     *, diagnostic_enabled: bool, slow_engine_seconds: float
 ) -> EventEmitter:
     global _emitter
+    logger = logging.getLogger("app.asr.events")
+    logger.setLevel(logging.INFO)
     _emitter = EventEmitter(
-        logging.getLogger("app.asr.events"),
+        logger,
         diagnostic_enabled=diagnostic_enabled,
         slow_engine_seconds=slow_engine_seconds,
     )
