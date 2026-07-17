@@ -92,6 +92,42 @@ def test_deadline_fairness_keys_and_bounds_without_sleep():
     asyncio.run(scenario())
 
 
+def test_due_final_batch_preempts_older_partial_batch():
+    async def scenario():
+        clock = FakeClock()
+        clock.advance(2)
+        caps = replace(
+            capabilities(),
+            dispatch_mode=DispatchMode.DYNAMIC_MICROBATCH,
+            max_batch_items=4,
+            max_batch_samples=1000,
+        )
+        adapter = RecordingAdapter(caps)
+        adapter.release.set()
+        scheduler = GatewayScheduler(
+            {"worker-1": adapter},
+            clock=clock,
+            max_wait_seconds=.2,
+            max_ready_jobs=10,
+            max_queued_samples=1000,
+        )
+        partial = job("partial", deadline=1.0)
+        final = job("final", deadline=1.1)
+        final = replace(
+            final,
+            final=True,
+            batch_key=replace(final.batch_key, decoding_identity="final"),
+        )
+        scheduler.enqueue(partial)
+        scheduler.enqueue(final)
+
+        await scheduler.run_once("worker-1")
+
+        return [[item.session_id for item in call] for call in adapter.calls]
+
+    assert asyncio.run(scenario()) == [["final"]]
+
+
 def test_scheduler_audio_overflow_has_exact_capacity_reason():
     scheduler = GatewayScheduler(
         {"worker-1": RecordingAdapter(capabilities())},

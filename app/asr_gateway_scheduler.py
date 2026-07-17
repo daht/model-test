@@ -191,13 +191,20 @@ class GatewayScheduler:
         adapter = self.adapters[worker_id]
         caps = adapter.capabilities
         queue.sort(key=lambda item: (item.deadline, item.enqueued_at, item.job_id))
-        first = queue[0]
+        now = self.clock()
+        due_finals = [
+            item
+            for item in queue
+            if item.final
+            and now >= min(item.deadline, item.enqueued_at + self.max_wait_seconds)
+        ]
+        first = due_finals[0] if due_finals else queue[0]
         limit = 1 if caps.dispatch_mode is DispatchMode.SINGLE else caps.max_batch_items
         compatible = [
             item for item in queue
             if item.batch_key == first.batch_key
         ]
-        due = self.clock() >= min(first.deadline, first.enqueued_at + self.max_wait_seconds)
+        due = now >= min(first.deadline, first.enqueued_at + self.max_wait_seconds)
         full = len({item.session_id for item in compatible}) >= limit
         if not (force or due or full):
             return []
