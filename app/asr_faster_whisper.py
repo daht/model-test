@@ -32,6 +32,19 @@ class DecodedText:
     language: str
 
 
+def _stack_features(
+    feature_extractor: Callable[[np.ndarray], np.ndarray],
+    audio: Sequence[np.ndarray],
+    *,
+    pad_or_trim: Callable[..., np.ndarray],
+) -> np.ndarray:
+    extracted = [feature_extractor(item)[..., :-1] for item in audio]
+    batch_frames = max(item.shape[-1] for item in extracted)
+    return np.stack(
+        [pad_or_trim(item, length=batch_frames) for item in extracted]
+    )
+
+
 class FasterWhisperEngine:
     """Pinned faster-whisper 1.2.1 batched generation boundary."""
 
@@ -56,7 +69,7 @@ class FasterWhisperEngine:
         self._pipeline = BatchedInferencePipeline(self._model)
 
     def warmup(self) -> None:
-        samples = np.arange(8_000, dtype=np.float32)
+        samples = np.arange(32_000, dtype=np.float32)
         waveform = (0.01 * np.sin(2 * np.pi * 440 * samples / 16_000)).astype(
             np.float32
         )
@@ -78,11 +91,10 @@ class FasterWhisperEngine:
 
         if not audio:
             return []
-        features = np.stack(
-            [
-                pad_or_trim(self._model.feature_extractor(item)[..., :-1])
-                for item in audio
-            ]
+        features = _stack_features(
+            self._model.feature_extractor,
+            audio,
+            pad_or_trim=pad_or_trim,
         )
         tokenizer = Tokenizer(
             self._model.hf_tokenizer,
@@ -143,6 +155,7 @@ class _SessionState:
     backend_session_id: str
     language: str | None
     pcm: bytearray
+    partial_text: str = ""
     cached_final: str | None = None
 
 
@@ -294,7 +307,12 @@ class FasterWhisperAdapter:
             for group_ordinal, ((language, beam_size), indices) in enumerate(
                 grouped.items(), start=1
             ):
-                waveforms = [_pcm_to_float32(states[index].pcm) for index in indices]
+                waveforms = [
+                    _pcm_to_float32(
+                        states[index].pcm if jobs[index].final else jobs[index].pcm
+                    )
+                    for index in indices
+                ]
                 accumulated = [len(waveform) / 16_000 for waveform in waveforms]
                 engine_call_id = f"{batch_id}-group-{group_ordinal}"
                 final_items = sum(1 for index in indices if jobs[index].final)
@@ -381,11 +399,15 @@ class FasterWhisperAdapter:
                 state.language = item.language
             if job.final:
                 state.cached_final = item.text
+                text = item.text
+            else:
+                state.partial_text = _append_transcript(state.partial_text, item.text)
+                text = state.partial_text
             results.append(
                 InferenceResult.from_job(
                     job,
-                    text=item.text,
-                    tail_text=item.text,
+                    text=text,
+                    tail_text=text,
                     segment_id=1,
                     final=job.final,
                 )
@@ -464,6 +486,7 @@ class FasterWhisperAdapter:
         else:
             text = ""
         state.pcm.clear()
+        state.partial_text = ""
         state.cached_final = None
         return text
 
@@ -481,6 +504,15 @@ class FasterWhisperAdapter:
 
 def _pcm_to_float32(pcm: bytes | bytearray) -> np.ndarray:
     return np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+
+
+def _append_transcript(current: str, incoming: str) -> str:
+    if not current:
+        return incoming
+    if not incoming:
+        return current
+    separator = " " if current[-1].isascii() and incoming[0].isascii() else ""
+    return f"{current}{separator}{incoming}"
 
 
 def _runtime_device(device: str) -> tuple[str, int | list[int]]:

@@ -6,7 +6,12 @@ from dataclasses import dataclass
 import numpy as np
 import pytest
 
-from app.asr_faster_whisper import DecodedText, FasterWhisperAdapter, FasterWhisperEngine
+from app.asr_faster_whisper import (
+    DecodedText,
+    FasterWhisperAdapter,
+    FasterWhisperEngine,
+    _stack_features,
+)
 from app.asr_gateway_backends import DispatchMode, ResultMode, StreamingMode, VadMode
 from app.asr_gateway_scheduler import BatchKey, InferenceJob
 from app.asr_observability import CapacityBufferError
@@ -81,7 +86,7 @@ def make_job(session_id, sequence, pcm, *, final=False, language="zh"):
 
 def test_engine_suppresses_repeated_three_token_sequences(monkeypatch):
     audio_module = types.ModuleType("faster_whisper.audio")
-    audio_module.pad_or_trim = lambda features: features
+    audio_module.pad_or_trim = lambda features, *, length: features
     tokenizer_module = types.ModuleType("faster_whisper.tokenizer")
 
     class Tokenizer:
@@ -134,6 +139,27 @@ def test_engine_suppresses_repeated_three_token_sequences(monkeypatch):
     assert captured["options"].no_repeat_ngram_size == 3
 
 
+def test_engine_features_pad_only_to_longest_item_in_batch():
+    lengths = []
+
+    def pad_or_trim(features, length=3000):
+        lengths.append(length)
+        return np.pad(features, ((0, 0), (0, length - features.shape[-1])))
+
+    class FeatureExtractor:
+        def __call__(self, audio):
+            return np.zeros((80, len(audio) + 1), dtype=np.float32)
+
+    features = _stack_features(
+        FeatureExtractor(),
+        [np.zeros(200, dtype=np.float32), np.zeros(500, dtype=np.float32)],
+        pad_or_trim=pad_or_trim,
+    )
+
+    assert features.shape == (2, 80, 500)
+    assert lengths == [500, 500]
+
+
 def test_adapter_advertises_real_rolling_dynamic_batch_contract():
     adapter = make_adapter(RecordingEngine())
 
@@ -172,10 +198,13 @@ def test_cross_session_partial_is_one_batch_and_pcm_stays_isolated():
     assert engine.warmups == 1 and engine.closed == 1
     assert engine.calls == [
         EngineCall([3, 5], "zh", 1),
-        EngineCall([5, 9], "zh", 1),
+        EngineCall([2, 4], "zh", 1),
     ]
     assert [item.session_id for item in first] == ["a", "b"]
-    assert [item.text for item in second] == ["zh:5:1", "zh:9:1"]
+    assert [item.text for item in second] == [
+        "zh:3:1 zh:2:1",
+        "zh:5:1 zh:4:1",
+    ]
     assert snapshot["active_sessions"] == 2
 
 
@@ -202,6 +231,29 @@ def test_final_batch_uses_beam_five_then_control_consumes_cache_without_decode()
     assert a_final.text == "zh:3:5" and b_final.text == "zh:4:5"
     assert snapshot["session_audio_samples"] == 0
     assert snapshot["active_sessions"] == 1
+
+
+def test_partial_decodes_new_chunk_but_final_decodes_complete_segment():
+    async def scenario():
+        engine = RecordingEngine()
+        adapter = make_adapter(engine)
+        await adapter.warmup()
+        await adapter.open_session("a", language="zh")
+        partial = await adapter.submit([
+            make_job("a", 1, b"\x01\x00" * 6),
+        ])
+        final = await adapter.submit([
+            make_job("a", 2, b"\x02\x00" * 4, final=True),
+        ])
+        consumed = await adapter.finish_segment("a")
+        return engine.calls, partial, final, consumed
+
+    calls, partial, final, consumed = asyncio.run(scenario())
+
+    assert calls == [EngineCall([6], "zh", 1), EngineCall([10], "zh", 5)]
+    assert partial[0].text == "zh:6:1"
+    assert final[0].text == "zh:10:5"
+    assert consumed.text == "zh:10:5"
 
 
 def test_mixed_partial_final_submission_partitions_beams_and_restores_order():
@@ -268,12 +320,15 @@ def test_auto_language_detects_once_then_partitions_locked_languages_and_restore
 
     assert calls == [
         EngineCall([3, 4], None, 1),
-        EngineCall([6], "ja", 1),
-        EngineCall([5], "zh", 1),
+        EngineCall([2], "ja", 1),
+        EngineCall([2], "zh", 1),
     ]
     assert [item.text for item in first] == ["zh:3:1", "ja:4:1"]
     assert [item.session_id for item in second] == ["b", "a"]
-    assert [item.text for item in second] == ["ja:6:1", "zh:5:1"]
+    assert [item.text for item in second] == [
+        "ja:4:1 ja:2:1",
+        "zh:3:1 zh:2:1",
+    ]
 
 
 def test_stale_identity_rejection_abort_and_close_remove_all_session_state():
