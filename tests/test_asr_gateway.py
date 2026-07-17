@@ -1054,6 +1054,68 @@ def test_exact_maximum_job_is_final_for_batched_beam_five_rollover():
     assert queued.batch_key.decoding_identity.startswith("final:")
 
 
+def test_adapter_segment_remaining_is_authoritative_for_job_size():
+    class AuthoritativeAdapter(FakeAdapter):
+        def __init__(self):
+            super().__init__(dynamic=True)
+            self.rollovers = []
+
+        def remaining_segment_samples(self, _session_id):
+            return 1
+
+        async def finish_segment(self, session_id):
+            self.rollovers.append(session_id)
+            return await super().finish_segment(session_id)
+
+        async def submit(self, jobs):
+            self.calls.append(list(jobs))
+            return [
+                InferenceResult.from_job(
+                    job,
+                    text=f"heard-{job.sample_count}",
+                    final=job.final,
+                )
+                for job in jobs
+            ]
+
+    async def scenario():
+        adapter = AuthoritativeAdapter()
+        adapter.capabilities = replace(
+            adapter.capabilities,
+            preferred_chunk_samples=4,
+            max_input_samples=16,
+            max_segment_samples=16,
+            max_batch_samples=64,
+        )
+        settings = Settings(
+            _env_file=None,
+            model_backend="mock",
+            asr_backend="mock",
+            asr_stream_mode="stateful",
+            api_key="test-key",
+            asr_gateway_default_backend="fake",
+            asr_gateway_schedule_max_wait_ms=1_000,
+        )
+        runtime = GatewayRuntime(settings, {"fake": adapter})
+        await adapter.warmup()
+        await runtime.registry.register(adapter.capabilities)
+        await runtime.registry.mark_ready("fake", True)
+        session = await runtime.open_session("s", language="zh", options={})
+        await runtime.ingest(session, b"\x01\x00" * 4, force=True)
+        queued = runtime.scheduler._queues["fake"][0]
+        await runtime.scheduler.run_once("fake", force=True)
+        rollovers = list(adapter.rollovers)
+        await runtime.abort("s")
+        await runtime.close()
+        return queued, rollovers
+
+    queued, rollovers = asyncio.run(scenario())
+
+    assert queued.sample_count == 1
+    assert queued.final is True
+    assert rollovers == ["s"]
+
+
 def test_backend_frame_jobs_do_not_roll_state_before_segment_boundary():
     async def scenario():
         adapter = FakeAdapter()

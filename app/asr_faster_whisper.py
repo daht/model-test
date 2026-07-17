@@ -440,6 +440,10 @@ class FasterWhisperAdapter:
             ),
         }
 
+    def remaining_segment_samples(self, session_id: str) -> int:
+        state = self._session(session_id)
+        return max(0, self._max_segment_samples - len(state.pcm) // 2)
+
     async def _consume_final(self, state: _SessionState) -> str:
         if state.cached_final is not None:
             text = state.cached_final

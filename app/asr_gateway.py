@@ -287,9 +287,16 @@ class GatewayRuntime:
 
     def _schedule_next(self, session: GatewaySession, *, force: bool = False) -> bool:
         preferred = round(self.settings.asr_gateway_default_update_ms / 1000 * session.sample_rate)
-        caps = self.adapters[session.selected_worker_id].capabilities
+        adapter = self.adapters[session.selected_worker_id]
+        caps = adapter.capabilities
         ctx = self._contexts[session.session_id]
         segment_remaining = caps.max_segment_samples - ctx.utterance_samples
+        adapter_remaining = getattr(adapter, "remaining_segment_samples", None)
+        if callable(adapter_remaining):
+            segment_remaining = min(
+                segment_remaining,
+                adapter_remaining(session.session_id),
+            )
         maximum = min(caps.max_input_samples, segment_remaining)
         count = session.ready_samples(
             preferred=preferred,
@@ -817,7 +824,11 @@ class GatewayRuntime:
         ctx.utterance_samples += result.end_sample - result.start_sample
         caps = self.adapters[result.worker_id].capabilities
         continuation_ready = False
-        if ctx.endpoint_pending or ctx.utterance_samples >= caps.max_segment_samples:
+        if (
+            result.final
+            or ctx.endpoint_pending
+            or ctx.utterance_samples >= caps.max_segment_samples
+        ):
             control = await self.adapters[result.worker_id].finish_segment(result.session_id)
             if control.text:
                 events.extend(self._apply_control_result(ctx, control.text))
