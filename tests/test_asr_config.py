@@ -33,6 +33,22 @@ def test_protocol_version_accepts_string_from_environment(monkeypatch):
     assert settings.asr_protocol_version == 2
 
 
+def test_active_stream_limit_accepts_128_and_rejects_129():
+    settings = Settings(
+        _env_file=None,
+        asr_backend="mock",
+        asr_max_active_streams=128,
+    )
+
+    assert settings.asr_max_active_streams == 128
+    with pytest.raises(ValidationError, match="less than or equal to 128"):
+        Settings(
+            _env_file=None,
+            asr_backend="mock",
+            asr_max_active_streams=129,
+        )
+
+
 @pytest.mark.parametrize("version", ["1", "3"])
 def test_protocol_version_rejects_other_environment_values(monkeypatch, version):
     monkeypatch.setenv("ASR_PROTOCOL_VERSION", version)

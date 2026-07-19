@@ -83,7 +83,7 @@ class Settings(BaseSettings):
     asr_protocol_version: int = Field(default=2, ge=2, le=2)
     asr_eager_load: bool = True
     asr_file_transcribe_enabled: bool = False
-    asr_max_active_streams: int = Field(default=2, gt=0, le=64)
+    asr_max_active_streams: int = Field(default=2, gt=0, le=128)
     asr_inference_queue_size: int = Field(default=16, gt=0, le=1024)
     asr_max_queued_audio_seconds: float = Field(default=4.0, gt=0, le=120)
     asr_max_connection_lag_seconds: float = Field(default=2.0, gt=0, le=30)

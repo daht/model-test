@@ -131,7 +131,8 @@ def test_a10_sensevoice_release_contract_and_evaluation_runbook():
         "ASR_SENSEVOICE_USE_ITN=true",
         "ASR_MAX_UTTERANCE_SECONDS=15.0",
         "ASR_GATEWAY_DEFAULT_UPDATE_MS=2000",
-        "ASR_GATEWAY_MAX_ACTIVE_SESSIONS=64",
+        "ASR_MAX_ACTIVE_STREAMS=128",
+        "ASR_GATEWAY_MAX_ACTIVE_SESSIONS=128",
     }
     assert required <= set(example.splitlines())
     assert "API_KEY=\n" in example
