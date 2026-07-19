@@ -561,6 +561,13 @@ class GatewayRuntime:
         ctx = self._contexts.get(session_id)
         if ctx is None:
             return
+        if ctx.session.terminal_state in {
+            TerminalState.FAILED,
+            TerminalState.ABORTED,
+            TerminalState.SUCCEEDED,
+        }:
+            await self._release_session(session_id)
+            return
         self.scheduler.cancel_session(session_id, generation=ctx.session.generation)
         await self.scheduler.wait_session_safe(session_id, generation=ctx.session.generation)
         self.metrics.cancellations += 1

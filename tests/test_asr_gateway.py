@@ -1250,6 +1250,50 @@ def test_repeated_fatal_result_is_discarded_after_first_terminal(monkeypatch):
     assert sessions == set()
 
 
+def test_connection_abort_does_not_duplicate_pending_failure_terminal(monkeypatch):
+    class Emitter:
+        def __init__(self):
+            self.records = []
+
+        def emit(self, event, *, component, **fields):
+            self.records.append({"event": event, "component": component, **fields})
+
+    async def scenario():
+        adapter = FakeAdapter()
+        settings = Settings(
+            _env_file=None, model_backend="mock", asr_backend="mock",
+            asr_stream_mode="stateful", api_key="test-key",
+            asr_gateway_default_backend="fake",
+        )
+        runtime = GatewayRuntime(settings, {"fake": adapter})
+        emitter = Emitter()
+        monkeypatch.setattr("app.asr_gateway.observability_events", lambda: emitter)
+        await runtime.start()
+        await runtime.open_session("s", language="zh", options={})
+        result = InferenceResult(
+            job_id="fatal", session_id="s", generation=1, job_sequence=1,
+            worker_id="fake", start_sample=0, end_sample=1,
+            error="RuntimeError: batch failed",
+        )
+        await runtime._publish_result(result)
+        pending = runtime.event_queue("s").qsize()
+        await runtime.abort("s")
+        registry = await runtime.registry.snapshot()
+        await runtime.close()
+        return emitter.records, pending, runtime._contexts, adapter.sessions, registry
+
+    records, pending, contexts, sessions, registry = asyncio.run(scenario())
+    terminal = [item for item in records if item["event"] == "asr_session_terminal"]
+    assert pending == 1
+    assert [item["terminal_state"] for item in terminal] == ["failed"]
+    assert contexts == {}
+    assert sessions == set()
+    assert all(
+        worker["active_leases"] == 0
+        for worker in registry["workers"].values()
+    )
+
+
 def test_fatal_dynamic_batch_settles_all_sessions_once_without_conflicts(monkeypatch):
     from collections import Counter
 
