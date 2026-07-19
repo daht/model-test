@@ -514,12 +514,14 @@ class GatewayRuntime:
                     reason=exc.reason,
                     **exc.safe_fields,
                 )
-            await self._fail_session(
+            transitioned = await self._fail_session(
                 ctx,
                 reason=(exc.reason if isinstance(exc, CapacityBufferError) else code),
                 close_code=close_code,
                 exception_type=type(exc).__name__,
             )
+            if not transitioned:
+                return
             await self._enqueue_events(
                 ctx,
                 [ctx.protocol.error(exc, code=code)],
@@ -584,7 +586,13 @@ class GatewayRuntime:
         reason: str,
         close_code: int = 1011,
         exception_type: str | None = None,
-    ) -> None:
+    ) -> bool:
+        if ctx.session.terminal_state in {
+            TerminalState.FAILED,
+            TerminalState.ABORTED,
+            TerminalState.SUCCEEDED,
+        }:
+            return False
         ctx.session.fail()
         with suppress(Exception):
             await self.adapters[ctx.session.selected_worker_id].abort_session(
@@ -600,6 +608,7 @@ class GatewayRuntime:
             close_code=close_code,
             exception_type=exception_type,
         )
+        return True
 
     async def _release_session(self, session_id: str) -> None:
         ctx = self._contexts.pop(session_id, None)
@@ -754,33 +763,38 @@ class GatewayRuntime:
         except Exception as exc:
             ctx = self._contexts.get(result.session_id)
             if ctx is None:
+                self.discard_timeline(result.job_id)
                 return
-            capacity_failure = isinstance(exc, CapacityBufferError)
-            if capacity_failure:
-                self.metrics.failures += 1
-                self.metrics.record_capacity_rejection(exc.reason)
-                observability_events().emit(
-                    "asr_buffer_rejected",
-                    component="gateway",
-                    session_id=result.session_id,
-                    generation=result.generation,
-                    job_id=result.job_id,
-                    reason=exc.reason,
-                    **exc.safe_fields,
-                )
-            else:
-                self.metrics.conflicts += 1
             async with ctx.protocol_lock:
+                if self._result_is_stale_or_terminal(ctx, result):
+                    self.discard_timeline(result.job_id)
+                    ctx.idle.set()
+                    return
+                capacity_failure = isinstance(exc, CapacityBufferError)
+                if capacity_failure:
+                    self.metrics.failures += 1
+                    self.metrics.record_capacity_rejection(exc.reason)
+                    observability_events().emit(
+                        "asr_buffer_rejected",
+                        component="gateway",
+                        session_id=result.session_id,
+                        generation=result.generation,
+                        job_id=result.job_id,
+                        reason=exc.reason,
+                        **exc.safe_fields,
+                    )
+                else:
+                    self.metrics.conflicts += 1
                 reason = exc.reason if capacity_failure else "result_conflict"
                 code = "overloaded" if capacity_failure else "result_conflict"
                 close_code = 1013 if capacity_failure else 1011
-                await self._fail_session(
+                transitioned = await self._fail_session(
                     ctx,
                     reason=reason,
                     close_code=close_code,
                     exception_type=type(exc).__name__,
                 )
-                if not ctx.protocol.terminal:
+                if transitioned and not ctx.protocol.terminal:
                     event = ctx.protocol.error(exc, code=code)
                     self._mark_result_applied(result.job_id)
                     await self._enqueue_events(
@@ -795,8 +809,13 @@ class GatewayRuntime:
     async def _apply_result(self, result: InferenceResult) -> None:
         ctx = self._contexts.get(result.session_id)
         if ctx is None:
+            self.discard_timeline(result.job_id)
             return
         async with ctx.protocol_lock:
+            if self._result_is_stale_or_terminal(ctx, result):
+                self.discard_timeline(result.job_id)
+                ctx.idle.set()
+                return
             state = deepcopy(ctx.protocol.state)
             terminal = ctx.protocol.terminal
             segment_metadata = deepcopy(ctx.segment_metadata)
@@ -808,6 +827,18 @@ class GatewayRuntime:
                 ctx.segment_metadata = segment_metadata
                 raise
 
+    @staticmethod
+    def _result_is_stale_or_terminal(
+        ctx: _SessionContext,
+        result: InferenceResult,
+    ) -> bool:
+        return bool(
+            result.generation != ctx.session.generation
+            or ctx.protocol.terminal
+            or ctx.session.terminal_state
+            in {TerminalState.FAILED, TerminalState.ABORTED, TerminalState.SUCCEEDED}
+        )
+
     async def _apply_result_locked(
         self,
         ctx: _SessionContext,
@@ -818,7 +849,10 @@ class GatewayRuntime:
         received_at = record[0].stages.get("audio_received", now) if record else now
         if now - received_at > self.settings.asr_max_connection_lag_seconds:
             self.metrics.failures += 1
-            await self._fail_session(ctx, reason="connection_lag")
+            if not await self._fail_session(ctx, reason="connection_lag"):
+                self.discard_timeline(result.job_id)
+                ctx.idle.set()
+                return
             event = ctx.protocol.error(
                 TimeoutError("connection lag exceeded"), code="audio_lag"
             )
@@ -833,7 +867,10 @@ class GatewayRuntime:
             and now - ctx.first_undecoded_at > self.settings.asr_max_undecoded_age_seconds
         ):
             self.metrics.failures += 1
-            await self._fail_session(ctx, reason="undecoded_audio_age")
+            if not await self._fail_session(ctx, reason="undecoded_audio_age"):
+                self.discard_timeline(result.job_id)
+                ctx.idle.set()
+                return
             event = ctx.protocol.error(
                 TimeoutError("undecoded audio age exceeded"), code="audio_lag"
             )
@@ -844,7 +881,10 @@ class GatewayRuntime:
             ctx.idle.set()
             return
         if result.error:
-            await self._fail_session(ctx, reason="adapter_result_error")
+            if not await self._fail_session(ctx, reason="adapter_result_error"):
+                self.discard_timeline(result.job_id)
+                ctx.idle.set()
+                return
             event = ctx.protocol.error(RuntimeError(result.error))
             self._mark_result_applied(result.job_id)
             await self._enqueue_events(

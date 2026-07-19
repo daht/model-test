@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sys
 import types
 from dataclasses import dataclass
@@ -8,6 +9,7 @@ import pytest
 
 from app.asr_sensevoice import (
     SenseVoiceAdapter,
+    SenseVoiceBatchFailure,
     SenseVoiceDecoded,
     SenseVoiceEngine,
     normalize_sensevoice_output,
@@ -71,12 +73,144 @@ def test_engine_uses_local_batch_api_and_preserves_order(monkeypatch, tmp_path):
     assert model.generate_calls[0]["batch_size"] == 2
 
 
+def test_engine_classifies_generate_failure_without_private_text(monkeypatch, tmp_path):
+    class PrivateEngineError(RuntimeError):
+        pass
+
+    model = install_fake_funasr(monkeypatch, [])
+
+    def fail(**_kwargs):
+        raise PrivateEngineError("private-model-details")
+
+    model.generate = fail
+    engine = SenseVoiceEngine(str(tmp_path), device="cpu", use_itn=True)
+    with pytest.raises(SenseVoiceBatchFailure) as failure:
+        engine.transcribe_batch([np.ones(16, dtype=np.float32)], language="zh")
+    assert failure.value.stage == "engine_generate"
+    assert failure.value.exception_type == "PrivateEngineError"
+    assert "private-model-details" not in str(failure.value)
+
+
+def test_engine_classifies_result_count_failure(monkeypatch, tmp_path):
+    install_fake_funasr(monkeypatch, [{"text": "one"}])
+    engine = SenseVoiceEngine(str(tmp_path), device="cpu", use_itn=True)
+    with pytest.raises(SenseVoiceBatchFailure) as failure:
+        engine.transcribe_batch(
+            [np.ones(16, dtype=np.float32), np.ones(16, dtype=np.float32)],
+            language="zh",
+        )
+    assert failure.value.stage == "result_count"
+
+
+def test_engine_classifies_result_contract_failure(monkeypatch, tmp_path):
+    install_fake_funasr(monkeypatch, [{"private": "raw-output"}])
+    engine = SenseVoiceEngine(str(tmp_path), device="cpu", use_itn=True)
+    with pytest.raises(SenseVoiceBatchFailure) as failure:
+        engine.transcribe_batch([np.ones(16, dtype=np.float32)], language="zh")
+    assert failure.value.stage == "result_contract"
+    assert "raw-output" not in str(failure.value)
+
+
+def test_adapter_emits_one_safe_engine_group_failure(monkeypatch):
+    class PrivateEngineError(RuntimeError):
+        pass
+
+    class Engine(RecordingEngine):
+        def __init__(self):
+            super().__init__()
+            self.warmed = False
+
+        def transcribe_batch(self, audio, *, language):
+            if not self.warmed:
+                self.warmed = True
+                return super().transcribe_batch(audio, language=language)
+            raise SenseVoiceBatchFailure("engine_generate", "PrivateEngineError") from (
+                PrivateEngineError("private-model-details")
+            )
+
+    class Emitter:
+        slow_engine_seconds = 2.0
+
+        def __init__(self):
+            self.records = []
+
+        def emit(self, event, *, component, **fields):
+            self.records.append({"event": event, "component": component, **fields})
+
+    async def scenario():
+        emitter = Emitter()
+        monkeypatch.setattr("app.asr_sensevoice.events", lambda: emitter)
+        adapter = make_adapter(Engine(), batch_size=2)
+        await adapter.warmup()
+        await adapter.open_session("a", language="zh")
+        await adapter.open_session("b", language="zh")
+        with pytest.raises(SenseVoiceBatchFailure):
+            await adapter.submit([
+                make_job("a", 1, b"\x01\x00" * 16),
+                make_job("b", 1, b"\x02\x00" * 16),
+            ])
+        return [
+            record for record in emitter.records
+            if record["event"] == "asr_engine_group_failed"
+        ]
+
+    failures = asyncio.run(scenario())
+    assert len(failures) == 1
+    failure = failures[0]
+    assert failure["failure_stage"] == "engine_generate"
+    assert failure["exception_type"] == "PrivateEngineError"
+    assert failure["group_size"] == 2
+    assert failure["final_items"] == 0
+    assert failure["accumulated_audio_seconds"] == pytest.approx(0.002)
+    assert failure["min_input_audio_seconds"] == pytest.approx(0.001)
+    assert failure["max_input_audio_seconds"] == pytest.approx(0.001)
+    assert "private-model-details" not in json.dumps(failure)
+
+
+def test_adapter_classifies_omitted_result(monkeypatch):
+    class Engine(RecordingEngine):
+        def __init__(self):
+            super().__init__()
+            self.warmed = False
+
+        def transcribe_batch(self, audio, *, language):
+            if not self.warmed:
+                self.warmed = True
+                return super().transcribe_batch(audio, language=language)
+            return [None]
+
+    class Emitter:
+        slow_engine_seconds = 2.0
+
+        def __init__(self):
+            self.records = []
+
+        def emit(self, event, *, component, **fields):
+            self.records.append({"event": event, "component": component, **fields})
+
+    async def scenario():
+        emitter = Emitter()
+        monkeypatch.setattr("app.asr_sensevoice.events", lambda: emitter)
+        adapter = make_adapter(Engine(), batch_size=1)
+        await adapter.warmup()
+        await adapter.open_session("a", language="zh")
+        with pytest.raises(SenseVoiceBatchFailure) as failure:
+            await adapter.submit([make_job("a", 1, b"\x01\x00" * 16)])
+        return failure.value, emitter.records
+
+    failure, records = asyncio.run(scenario())
+    assert failure.stage == "result_omitted"
+    failed = [item for item in records if item["event"] == "asr_engine_group_failed"]
+    assert len(failed) == 1
+    assert failed[0]["failure_stage"] == "result_omitted"
+
+
 @pytest.mark.parametrize("outputs", [[], [{"text": "ok"}], [{"other": "x"}]])
 def test_engine_result_contract_fails_closed_without_raw_output(monkeypatch, tmp_path, outputs):
     install_fake_funasr(monkeypatch, outputs)
     engine = SenseVoiceEngine(str(tmp_path), device="cpu", use_itn=False)
     audio = [np.zeros(10, dtype=np.float32), np.ones(10, dtype=np.float32)]
-    with pytest.raises(RuntimeError, match="SenseVoice result contract mismatch") as failure:
+    with pytest.raises(SenseVoiceBatchFailure, match="SenseVoice batch failed at") as failure:
         engine.transcribe_batch(audio, language=None)
     assert repr(outputs) not in str(failure.value)
 
@@ -322,7 +456,7 @@ def test_validation_failures_do_not_extend_pcm_and_count_mismatch_fails_closed()
         with pytest.raises(CapacityBufferError, match="utterance"):
             await adapter.submit([make_job("a", 1, b"\x01\x00" * 4)])
         assert (await adapter.snapshot())["session_audio_samples"] == 0
-        with pytest.raises(RuntimeError, match="result count mismatch"):
+        with pytest.raises(SenseVoiceBatchFailure, match="result_count"):
             await adapter.submit([make_job("a", 1, b"\x01\x00" * 2)])
         retained = await adapter.snapshot()
         await adapter.cancel("a:1")

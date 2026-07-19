@@ -1195,6 +1195,178 @@ def test_real_sensevoice_finish_preserves_metadata_through_terminal_final():
     assert final["metadata"] == expected
 
 
+def test_repeated_fatal_result_is_discarded_after_first_terminal(monkeypatch):
+    class Emitter:
+        def __init__(self):
+            self.records = []
+
+        def emit(self, event, *, component, **fields):
+            self.records.append({"event": event, "component": component, **fields})
+
+    class WebSocket:
+        def __init__(self):
+            self.sent = []
+            self.closed = []
+
+        async def send_json(self, payload):
+            self.sent.append(payload)
+
+        async def close(self, code):
+            self.closed.append(code)
+
+    async def scenario():
+        adapter = FakeAdapter()
+        settings = Settings(
+            _env_file=None, model_backend="mock", asr_backend="mock",
+            asr_stream_mode="stateful", api_key="test-key",
+            asr_gateway_default_backend="fake",
+        )
+        runtime = GatewayRuntime(settings, {"fake": adapter})
+        emitter = Emitter()
+        monkeypatch.setattr("app.asr_gateway.observability_events", lambda: emitter)
+        await runtime.start()
+        await runtime.open_session("s", language="zh", options={})
+        ctx = runtime._contexts["s"]
+        result = InferenceResult(
+            job_id="fatal", session_id="s", generation=1, job_sequence=1,
+            worker_id="fake", start_sample=0, end_sample=1,
+            error="RuntimeError: batch failed",
+        )
+        await runtime._publish_result(result)
+        await runtime._publish_result(result)
+        websocket = WebSocket()
+        await send_outbound_events(runtime, ctx, websocket)
+        metrics = runtime.metrics.snapshot()
+        await runtime.close()
+        return emitter.records, websocket, metrics, runtime._contexts, adapter.sessions
+
+    records, websocket, metrics, contexts, sessions = asyncio.run(scenario())
+    terminal = [item for item in records if item["event"] == "asr_session_terminal"]
+    assert len(terminal) == 1
+    assert [item["type"] for item in websocket.sent] == ["error"]
+    assert websocket.closed == [1011]
+    assert metrics["conflicts"] == 0
+    assert contexts == {}
+    assert sessions == set()
+
+
+def test_fatal_dynamic_batch_settles_all_sessions_once_without_conflicts(monkeypatch):
+    from collections import Counter
+
+    class FatalAdapter(FakeAdapter):
+        def __init__(self):
+            super().__init__(dynamic=True)
+            self.capabilities = replace(
+                self.capabilities,
+                max_batch_items=2,
+                max_batch_samples=960_000,
+                session_capacity=4,
+            )
+            self.submit_calls = 0
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def submit(self, jobs):
+            self.submit_calls += 1
+            self.entered.set()
+            await self.release.wait()
+            raise RuntimeError("private-adapter-detail")
+
+    class Emitter:
+        def __init__(self):
+            self.records = []
+
+        def emit(self, event, *, component, **fields):
+            self.records.append({"event": event, "component": component, **fields})
+
+    class WebSocket:
+        def __init__(self):
+            self.sent = []
+            self.closed = []
+
+        async def send_json(self, payload):
+            self.sent.append(payload)
+
+        async def close(self, code):
+            self.closed.append(code)
+
+    async def scenario():
+        adapter = FatalAdapter()
+        settings = Settings(
+            _env_file=None, model_backend="mock", asr_backend="mock",
+            asr_stream_mode="stateful", api_key="test-key",
+            asr_gateway_default_backend="fake",
+            asr_gateway_schedule_max_wait_ms=1000,
+            asr_gateway_max_active_sessions=4,
+        )
+        runtime = GatewayRuntime(settings, {"fake": adapter})
+        emitter = Emitter()
+        monkeypatch.setattr("app.asr_gateway.observability_events", lambda: emitter)
+        await runtime.start()
+        sessions = [
+            await runtime.open_session(f"s{index}", language="zh", options={})
+            for index in range(4)
+        ]
+        contexts = dict(runtime._contexts)
+        await runtime.ingest(sessions[0], b"\x01\x00" * 2, force=True)
+        await runtime.ingest(sessions[1], b"\x01\x00" * 2, force=True)
+        await adapter.entered.wait()
+        await runtime.ingest(sessions[2], b"\x01\x00" * 2, force=True)
+        await runtime.ingest(sessions[3], b"\x01\x00" * 2, force=True)
+
+        all_published = asyncio.Event()
+        published = 0
+        original_publish = runtime.scheduler.publish
+
+        async def observe_publish(result):
+            nonlocal published
+            await original_publish(result)
+            published += 1
+            if published == 4:
+                all_published.set()
+
+        runtime.scheduler.publish = observe_publish
+        adapter.release.set()
+        await all_published.wait()
+        accounting = {
+            session_id: ctx.session.sample_accounting
+            for session_id, ctx in contexts.items()
+        }
+        websockets = {session_id: WebSocket() for session_id in contexts}
+        await asyncio.gather(*[
+            send_outbound_events(runtime, contexts[session_id], websocket)
+            for session_id, websocket in websockets.items()
+        ])
+        registry = await runtime.registry.snapshot()
+        metrics = runtime.metrics.snapshot()
+        scheduler = runtime.scheduler.snapshot()
+        await runtime.close()
+        return adapter, emitter.records, websockets, accounting, registry, metrics, scheduler, runtime._contexts
+
+    adapter, records, websockets, accounting, registry, metrics, scheduler, contexts = asyncio.run(scenario())
+    terminal_counts = Counter(
+        item["session_id"] for item in records
+        if item["event"] == "asr_session_terminal"
+    )
+    assert adapter.submit_calls == 1
+    assert terminal_counts == {f"s{index}": 1 for index in range(4)}
+    assert all([event["type"] for event in ws.sent] == ["error"] for ws in websockets.values())
+    assert all(ws.closed == [1011] for ws in websockets.values())
+    assert all(
+        values["buffered"] == values["reserved"] == values["pending_vad"] == 0
+        for values in accounting.values()
+    )
+    assert metrics["conflicts"] == 0
+    assert not [item for item in records if item["event"] == "asr_cleanup_conflict"]
+    assert scheduler["ready_depth"] == scheduler["queued_samples"] == 0
+    assert contexts == {}
+    assert adapter.sessions == set()
+    assert all(
+        worker["active_leases"] == 0
+        for worker in registry["workers"].values()
+    )
+
+
 def test_rolling_route_and_endpoint_jobs_use_final_decode_batch_identity():
     async def scenario():
         adapter = FakeAdapter(dynamic=True, result_mode=ResultMode.REPLACEABLE_SEGMENT)

@@ -124,6 +124,7 @@ class GatewayScheduler:
         self._fragmentation: dict[str, int] = defaultdict(int)
         self._cancelled_generations: set[tuple[str, int]] = set()
         self._accepted: dict[tuple[str, int], asyncio.Event] = {}
+        self._submit_failures: dict[str, str] = {}
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._closed = False
@@ -133,6 +134,8 @@ class GatewayScheduler:
             raise RuntimeError("scheduler is closed")
         if job.worker_id not in self.adapters:
             raise KeyError(f"unknown worker_id {job.worker_id}")
+        if job.worker_id in self._submit_failures:
+            raise RuntimeError("worker is failed")
         if job.sample_count <= 0 or len(job.pcm) != job.sample_count * 2:
             raise ValueError("job PCM range does not match pcm_s16le bytes")
         total_jobs = sum(len(queue) for queue in self._queues.values())
@@ -168,6 +171,11 @@ class GatewayScheduler:
 
     async def run_once(self, worker_id: str, *, force: bool = False) -> list[InferenceResult]:
         queue = self._queues[worker_id]
+        if worker_id in self._submit_failures:
+            queued_failures = await self._drain_failed_queue(worker_id)
+            for result in queued_failures:
+                await self.publish(result)
+            return []
         if not queue:
             return []
         expired = [item for item in queue if self.clock() > item.queue_deadline]
@@ -271,6 +279,7 @@ class GatewayScheduler:
         )
         self._stage("scheduler_dispatched", batch, limit)
         self._stage("worker_accepted", batch, limit)
+        queued_failures: list[InferenceResult] = []
         try:
             self._stage("inference_started", batch, limit)
             submission = adapter.submit(batch)
@@ -285,8 +294,12 @@ class GatewayScheduler:
             results = [self._coerce_result(job, result) for job, result in zip(batch, raw_results)]
         except Exception as exc:
             self._stage("inference_completed", batch, limit)
-            await self.worker_failed(worker_id, "submit_failed")
-            results = [InferenceResult.from_job(job, error=f"{type(exc).__name__}: batch failed") for job in batch]
+            error = f"{type(exc).__name__}: batch failed"
+            if worker_id not in self._submit_failures:
+                self._submit_failures[worker_id] = error
+                await self.worker_failed(worker_id, "submit_failed")
+            queued_failures = await self._drain_failed_queue(worker_id)
+            results = [InferenceResult.from_job(job, error=error) for job in batch]
 
         self._queued_samples -= sum(job.sample_count for job in batch)
         for job, result in zip(batch, results):
@@ -301,7 +314,8 @@ class GatewayScheduler:
                 continue
             except Exception:
                 # A cleanup failure poisons this result; success is never visible.
-                await self.worker_failed(worker_id, "cleanup_failed")
+                if worker_id not in self._submit_failures:
+                    await self.worker_failed(worker_id, "cleanup_failed")
                 await self.publish(InferenceResult.from_job(job, error="cleanup_failed"))
                 self._mark_safe(job)
                 continue
@@ -321,6 +335,31 @@ class GatewayScheduler:
                 await self.publish(result)
             finally:
                 self._mark_safe(job)
+        for result in queued_failures:
+            await self.publish(result)
+        return results
+
+    async def _drain_failed_queue(self, worker_id: str) -> list[InferenceResult]:
+        queue = self._queues[worker_id]
+        jobs = list(queue)
+        queue.clear()
+        self._queued_samples -= sum(job.sample_count for job in jobs)
+        results = []
+        for job in jobs:
+            try:
+                await self.reject(job)
+            except Exception:
+                await self.discard(job)
+                continue
+            if (job.session_id, job.generation) in self._cancelled_generations:
+                await self.discard(job)
+                continue
+            results.append(
+                InferenceResult.from_job(
+                    job,
+                    error=self._submit_failures[worker_id],
+                )
+            )
         return results
 
     def _stage(self, stage: str, jobs: Sequence[InferenceJob], capacity: int) -> None:

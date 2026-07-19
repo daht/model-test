@@ -114,6 +114,26 @@ def analyze_run(run: Path) -> dict[str, Any]:
     engine_calls = [
         item for item in ordered if item.get("event") == "asr_engine_group_completed"
     ]
+    engine_failures = [
+        {
+            name: item.get(name)
+            for name in (
+                "timestamp",
+                "batch_id",
+                "group_ordinal",
+                "group_count",
+                "group_size",
+                "final_items",
+                "accumulated_audio_seconds",
+                "min_input_audio_seconds",
+                "max_input_audio_seconds",
+                "failure_stage",
+                "exception_type",
+            )
+        }
+        for item in ordered
+        if item.get("event") == "asr_engine_group_failed"
+    ]
     slowest = sorted(
         engine_calls,
         key=lambda item: float(item.get("elapsed_seconds", 0)),
@@ -166,6 +186,7 @@ def analyze_run(run: Path) -> dict[str, Any]:
         "engine": {
             "calls": len(engine_calls),
             "slowest_calls": slowest,
+            "failures": engine_failures,
         },
         "failures": {
             "buffer_rejections": rejections,
@@ -204,6 +225,7 @@ def _markdown(report: dict[str, Any]) -> str:
         f"- Sessions opened/terminal/released: {lifecycle['opened_sessions']}/{lifecycle['terminal_sessions']}/{lifecycle['released_sessions']}",
         f"- Scheduler batches: {scheduler['dispatched_batches']} (largest {scheduler['largest_batch']})",
         f"- Engine calls: {engine['calls']}",
+        f"- Engine failures: {len(engine['failures'])}",
         f"- Buffer rejections: {len(failures['buffer_rejections'])}",
         f"- Cleanup conflicts: {len(failures['cleanup_conflicts'])}",
         "",
@@ -223,6 +245,19 @@ def _markdown(report: dict[str, Any]) -> str:
             )
     else:
         lines.append("- No engine completion events.")
+    lines.extend(["", "## Engine failures", ""])
+    if engine["failures"]:
+        for failure in engine["failures"]:
+            lines.append(
+                f"- {failure.get('timestamp', 'unknown')}: "
+                f"stage={failure.get('failure_stage', 'unknown')}, "
+                f"exception={failure.get('exception_type', 'unknown')}, "
+                f"group={failure.get('group_size', 'unknown')}, "
+                f"batch={failure.get('batch_id', 'unknown')}, "
+                f"audio={failure.get('accumulated_audio_seconds', 'unknown')}s"
+            )
+    else:
+        lines.append("- No engine failure events.")
     lines.extend(["", "## Buffer rejections", ""])
     if failures["buffer_rejections"]:
         for rejection in failures["buffer_rejections"]:

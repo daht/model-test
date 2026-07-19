@@ -297,3 +297,60 @@ def test_inference_timeout_cancels_accepted_submit_and_marks_worker_failed():
     failures, results = asyncio.run(scenario())
     assert failures == ["submit_failed"]
     assert results[0].error == "TimeoutError: batch failed"
+
+
+def test_submit_failure_halts_worker_and_settles_queued_jobs():
+    class BrokenAdapter:
+        capabilities = capabilities()
+
+        def __init__(self):
+            self.calls = []
+
+        async def submit(self, jobs):
+            self.calls.append([item.job_id for item in jobs])
+            raise RuntimeError("private-worker-detail")
+
+    async def scenario():
+        adapter = BrokenAdapter()
+        cleaned = []
+        rejected = []
+        published = []
+        failures = []
+
+        async def cleanup(item):
+            cleaned.append(item.job_id)
+
+        async def reject(item):
+            rejected.append(item.job_id)
+
+        async def publish(result):
+            published.append(result)
+
+        async def worker_failed(worker_id, reason):
+            failures.append((worker_id, reason))
+
+        scheduler = GatewayScheduler(
+            {"worker-1": adapter},
+            clock=FakeClock(),
+            max_wait_seconds=0,
+            max_ready_jobs=10,
+            max_queued_samples=1000,
+            cleanup=cleanup,
+            reject=reject,
+            publish=publish,
+            worker_failed=worker_failed,
+        )
+        scheduler.enqueue(job("first"))
+        scheduler.enqueue(job("queued"))
+        await scheduler.run_once("worker-1", force=True)
+        await scheduler.run_once("worker-1", force=True)
+        return adapter, cleaned, rejected, published, failures, scheduler.snapshot()
+
+    adapter, cleaned, rejected, published, failures, snapshot = asyncio.run(scenario())
+    assert adapter.calls == [["first-1"]]
+    assert failures == [("worker-1", "submit_failed")]
+    assert sorted(cleaned + rejected) == ["first-1", "queued-1"]
+    assert {item.job_id for item in published} == {"first-1", "queued-1"}
+    assert all(item.error == "RuntimeError: batch failed" for item in published)
+    assert snapshot["queued_samples"] == 0
+    assert snapshot["ready_depth"] == 0

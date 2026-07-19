@@ -49,3 +49,48 @@ def test_analyzer_reports_missing_evidence_and_writes_both_reports(tmp_path):
     assert "events.jsonl is missing or empty" in report["quality"]["warnings"]
     assert (run / "report.json").is_file()
     assert "ASR Bottleneck Report" in (run / "report.md").read_text()
+
+
+def test_analyzer_reports_safe_engine_group_failure_evidence(tmp_path):
+    run = tmp_path / "run"
+    run.mkdir()
+    write_jsonl(
+        run / "events.jsonl",
+        [{
+            "timestamp": "2026-07-18T12:00:00.000Z",
+            "event": "asr_engine_group_failed",
+            "batch_id": "batch-safe",
+            "group_ordinal": 1,
+            "group_count": 1,
+            "group_size": 8,
+            "final_items": 0,
+            "accumulated_audio_seconds": 12.5,
+            "min_input_audio_seconds": 1.5,
+            "max_input_audio_seconds": 1.625,
+            "failure_stage": "engine_generate",
+            "exception_type": "RuntimeError",
+            "exception_message": "private-engine-detail",
+        }],
+    )
+
+    report = analyze_run(run)
+    write_reports(run, report)
+
+    assert report["engine"]["failures"] == [{
+        "timestamp": "2026-07-18T12:00:00.000Z",
+        "batch_id": "batch-safe",
+        "group_ordinal": 1,
+        "group_count": 1,
+        "group_size": 8,
+        "final_items": 0,
+        "accumulated_audio_seconds": 12.5,
+        "min_input_audio_seconds": 1.5,
+        "max_input_audio_seconds": 1.625,
+        "failure_stage": "engine_generate",
+        "exception_type": "RuntimeError",
+    }]
+    markdown = (run / "report.md").read_text()
+    assert "engine_generate" in markdown
+    assert "RuntimeError" in markdown
+    assert "batch-safe" in markdown
+    assert "private-engine-detail" not in json.dumps(report)

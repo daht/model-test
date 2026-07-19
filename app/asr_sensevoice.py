@@ -30,6 +30,13 @@ class SenseVoiceDecoded:
     metadata: dict[str, str]
 
 
+class SenseVoiceBatchFailure(RuntimeError):
+    def __init__(self, stage: str, exception_type: str) -> None:
+        super().__init__(f"SenseVoice batch failed at {stage}")
+        self.stage = stage
+        self.exception_type = exception_type
+
+
 LANGUAGE_TAGS = {"zh", "yue", "en", "ja", "ko"}
 EMOTION_TAGS = {"HAPPY", "SAD", "ANGRY", "NEUTRAL"}
 EVENT_TAGS = {"Speech", "BGM", "Applause", "Laughter", "Cry", "Cough", "Sneeze"}
@@ -94,19 +101,26 @@ class SenseVoiceEngine:
         return samples.tobytes()
 
     def _generate(self, inputs: list[Any], *, language: str) -> list[SenseVoiceDecoded]:
-        raw = self._model.generate(
-            input=inputs,
-            cache={},
-            language=language,
-            use_itn=self._use_itn,
-            batch_size=len(inputs),
-        )
-        if not isinstance(raw, list) or len(raw) != len(inputs):
-            raise RuntimeError("SenseVoice result contract mismatch")
+        try:
+            raw = self._model.generate(
+                input=inputs,
+                cache={},
+                language=language,
+                use_itn=self._use_itn,
+                batch_size=len(inputs),
+            )
+        except Exception as exc:
+            raise SenseVoiceBatchFailure(
+                "engine_generate", type(exc).__name__
+            ) from exc
+        if not isinstance(raw, list):
+            raise SenseVoiceBatchFailure("result_contract", "TypeError")
+        if len(raw) != len(inputs):
+            raise SenseVoiceBatchFailure("result_count", "RuntimeError")
         decoded: list[SenseVoiceDecoded] = []
         for item in raw:
             if not isinstance(item, dict) or not isinstance(item.get("text"), str):
-                raise RuntimeError("SenseVoice result contract mismatch")
+                raise SenseVoiceBatchFailure("result_contract", "TypeError")
             decoded.append(normalize_sensevoice_output(item["text"]))
         return decoded
 
@@ -312,14 +326,48 @@ class SenseVoiceAdapter:
                 waveforms = [_pcm_to_float32(states[index].pcm) for index in indices]
                 accumulated = [len(item) / 16_000 for item in waveforms]
                 started = time.monotonic()
-                items = await asyncio.to_thread(
-                    engine.transcribe_batch,
-                    waveforms,
-                    language=language,
-                )
+                try:
+                    items = await asyncio.to_thread(
+                        engine.transcribe_batch,
+                        waveforms,
+                        language=language,
+                    )
+                    if len(items) != len(indices):
+                        raise SenseVoiceBatchFailure("result_count", "RuntimeError")
+                    for index, item in zip(indices, items):
+                        decoded[index] = item
+                    if any(decoded[index] is None for index in indices):
+                        raise SenseVoiceBatchFailure("result_omitted", "RuntimeError")
+                except Exception as exc:
+                    failure = (
+                        exc
+                        if isinstance(exc, SenseVoiceBatchFailure)
+                        else SenseVoiceBatchFailure(
+                            "engine_generate", type(exc).__name__
+                        )
+                    )
+                    events().emit(
+                        "asr_engine_group_failed",
+                        component="sensevoice_adapter",
+                        level=logging.ERROR,
+                        worker_id=self.capabilities.worker_id,
+                        batch_id=batch_id,
+                        group_ordinal=group_ordinal,
+                        group_count=len(grouped),
+                        group_size=len(indices),
+                        language=language or "auto",
+                        final_items=sum(1 for index in indices if jobs[index].final),
+                        accumulated_audio_seconds=sum(accumulated),
+                        min_input_audio_seconds=min(accumulated),
+                        max_input_audio_seconds=max(accumulated),
+                        elapsed_seconds=time.monotonic() - started,
+                        failure_stage=failure.stage,
+                        exception_type=failure.exception_type,
+                    )
+                    if failure is exc:
+                        raise
+                    raise failure from exc
                 elapsed = time.monotonic() - started
-                if len(items) != len(indices):
-                    raise RuntimeError("SenseVoice result count mismatch")
                 output_characters = sum(len(item.text) for item in items)
                 max_run = max((maximum_character_run(item.text) for item in items), default=0)
                 event_fields = {
@@ -359,13 +407,11 @@ class SenseVoiceAdapter:
                         output_characters=output_characters,
                         maximum_character_run=max_run,
                     )
-                for index, item in zip(indices, items):
-                    decoded[index] = item
 
         results: list[InferenceResult] = []
         for state, job, item in zip(states, jobs, decoded):
             if item is None:
-                raise RuntimeError("SenseVoice omitted a batch result")
+                raise SenseVoiceBatchFailure("result_omitted", "RuntimeError")
             if state.language is None and item.metadata.get("language") in self.capabilities.languages:
                 state.language = item.metadata["language"]
             if job.final:
