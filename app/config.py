@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     asr_model_id: str = "/models/Qwen3-ASR-1.7B-hf"
     asr_require_model_manifest: bool = False
     asr_model_manifest_path: str | None = None
-    asr_backend: Literal["qwen", "qwen_vllm", "faster_whisper", "mock"] = "qwen"
+    asr_backend: Literal["qwen", "qwen_vllm", "faster_whisper", "sensevoice", "mock"] = "qwen"
     asr_stream_mode: Literal["chunked", "stateful", "rolling"] = "chunked"
     api_key: str = Field(default="change-me", description="Required X-API-Key value")
     device: str = "auto"
@@ -50,6 +50,8 @@ class Settings(BaseSettings):
     asr_faster_whisper_partial_beam_size: int = Field(default=1, gt=0, le=20)
     asr_faster_whisper_final_beam_size: int = Field(default=5, gt=0, le=20)
     asr_faster_whisper_task: Literal["transcribe"] = "transcribe"
+    asr_sensevoice_batch_size: int = Field(default=8, gt=0, le=64)
+    asr_sensevoice_use_itn: bool = True
     asr_diagnostic_logging: bool = False
     asr_slow_engine_log_seconds: float = Field(default=2.0, gt=0, le=300)
     asr_stream_unfixed_chunk_num: int = Field(default=2, ge=0)
@@ -140,7 +142,7 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def bound_websocket_buffered_audio(self) -> "Settings":
-        if self.asr_backend in {"qwen", "qwen_vllm", "faster_whisper"}:
+        if self.asr_backend in {"qwen", "qwen_vllm", "faster_whisper", "sensevoice"}:
             normalized_api_key = self.api_key.strip()
             if (
                 len(normalized_api_key) < PRODUCTION_API_KEY_MIN_LENGTH
@@ -168,6 +170,8 @@ class Settings(BaseSettings):
             raise ValueError("asr_backend=qwen does not support stateful streaming")
         if self.asr_backend == "faster_whisper" and self.asr_stream_mode != "rolling":
             raise ValueError("asr_backend=faster_whisper requires rolling streaming")
+        if self.asr_backend == "sensevoice" and self.asr_stream_mode != "rolling":
+            raise ValueError("asr_backend=sensevoice requires rolling streaming")
         if self.asr_vad_onset_threshold <= self.asr_vad_offset_threshold:
             raise ValueError(
                 "asr_vad_onset_threshold must exceed asr_vad_offset_threshold"

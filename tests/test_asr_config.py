@@ -216,6 +216,31 @@ def test_faster_whisper_large_v3_configuration_contract():
     assert settings.asr_faster_whisper_task == "transcribe"
 
 
+def test_sensevoice_configuration_contract():
+    settings = Settings(
+        _env_file=None,
+        asr_backend="sensevoice",
+        asr_stream_mode="rolling",
+        asr_model_name="SenseVoiceSmall",
+        asr_model_id="/models/SenseVoiceSmall",
+        asr_sensevoice_batch_size=8,
+        asr_sensevoice_use_itn=True,
+        api_key=TEST_ONLY_LONG_API_KEY,
+    )
+    assert settings.asr_sensevoice_batch_size == 8
+    assert settings.asr_sensevoice_use_itn is True
+
+
+def test_sensevoice_requires_rolling_streaming():
+    with pytest.raises(ValidationError, match="rolling"):
+        Settings(
+            _env_file=None,
+            asr_backend="sensevoice",
+            asr_stream_mode="stateful",
+            api_key=TEST_ONLY_LONG_API_KEY,
+        )
+
+
 @pytest.mark.parametrize(
     "overrides,match",
     [

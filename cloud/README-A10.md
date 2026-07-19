@@ -1,5 +1,33 @@
 # HY-MT1.5-1.8B on NVIDIA A10
 
+## SenseVoice Small evaluation deployment
+
+The `sensevoice` path loads one local `FunAudioLLM/SenseVoiceSmall` model through
+pinned FunASR 1.3.14 on one GPU owner. It uses rolling full-utterance re-decode,
+dynamic batches of eight, ITN, a 15-second utterance ceiling, and 2-second
+partial updates. These are test settings, not an A10 capacity claim.
+
+On a trusted staging host, select and record an immutable revision, download it
+to `models/SenseVoiceSmall`, verify that the official `example/en.mp3` is
+present, and create `models/SenseVoiceSmall.manifest.json` with
+`python3 -m app.asr_artifacts create`. Transfer the approved directory and
+manifest together. Runtime startup is local-only and must not download or
+update model files.
+
+Use `cloud/A10.sensevoice.env.example`, keep `API_KEY` supplied only through the
+environment, then run `scripts/verify_asr_release.sh release`. R08 verifies the
+manifest, pinned Silero asset, model load, and real non-silent streaming warmup.
+After deployment, start `scripts/monitor_asr_bottleneck.sh` and run strict
+Chinese/Japanese speech at 1/8/16/24/32/64 streams. Record errors, p50/p95
+completion overhead, batch fill, GPU utilization, peak VRAM, buffered/reserved
+audio, and quality against the current accepted backend. Stop at the first
+failed stage; do not alter thresholds after observing it.
+
+Atomic rollback restores the prior matching backend configuration, image,
+model directory, and approved manifest as one unit, recreates only
+`qwen-asr-api`, then requires `/ready` and strict speech before admission is
+reopened.
+
 ## faster-whisper large-v3 evaluation deployment
 
 The selectable `faster_whisper` path uses one CTranslate2 `large-v3` model

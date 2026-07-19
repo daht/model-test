@@ -55,3 +55,27 @@ def test_replaceable_and_confirmed_plus_tail_modes_reuse_transcript_state():
     events = combined.apply_result(ResultMode.CONFIRMED_PLUS_TAIL, confirmed_text="fixed", tail_text="tail", decoded_samples=3)
     assert [event["type"] for event in events] == ["sentence_final", "partial", "partial"]
     assert combined.state.confirmed_text == "fixed"
+
+
+def test_optional_result_metadata_is_attached_without_changing_plain_events():
+    protocol = ProtocolSession(sample_rate=16000, segment_local=True)
+    plain = protocol.apply_result(
+        ResultMode.REPLACEABLE_SEGMENT,
+        text="plain",
+        decoded_samples=2,
+        segment_id=1,
+    )
+    rich = protocol.apply_result(
+        ResultMode.REPLACEABLE_SEGMENT,
+        text="rich",
+        decoded_samples=2,
+        segment_id=1,
+        metadata={"language": "zh", "emotion": "neutral", "audio_event": "speech"},
+    )
+    committed = protocol.segment(metadata={"language": "zh"})
+    final = protocol.final(metadata={"language": "zh"})
+
+    assert all("metadata" not in event for event in plain)
+    assert rich[-1]["metadata"]["emotion"] == "neutral"
+    assert committed[0]["metadata"] == {"language": "zh"}
+    assert final["metadata"] == {"language": "zh"}

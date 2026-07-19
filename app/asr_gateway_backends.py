@@ -4,7 +4,7 @@ import asyncio
 import inspect
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Awaitable, Callable, Protocol, Sequence
+from typing import Any, Awaitable, Callable, Mapping, Protocol, Sequence
 
 
 class StreamingMode(str, Enum):
@@ -263,6 +263,7 @@ class AdapterResult:
     decoded_samples: int = 0
     is_final: bool = False
     error: str | None = None
+    metadata: Mapping[str, Any] | None = None
 
 
 class WorkerAdapter(Protocol):

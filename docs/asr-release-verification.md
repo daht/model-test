@@ -72,22 +72,47 @@ export ASR_RELEASE_MANIFEST="$PWD/models/faster-whisper-large-v3.manifest.json"
 scripts/verify_asr_release.sh release
 ```
 
+For SenseVoice Small, stage an immutable approved revision of
+`FunAudioLLM/SenseVoiceSmall` under `models/SenseVoiceSmall`, create its manifest
+outside that directory, and use the local-only runtime paths:
+
+```bash
+cp cloud/A10.sensevoice.env.example .env
+chmod 600 .env
+editor .env
+export ASR_RELEASE_ENV_FILE="$PWD/.env"
+export ASR_RELEASE_MODEL_DIR="$PWD/models/SenseVoiceSmall"
+export ASR_RELEASE_MANIFEST="$PWD/models/SenseVoiceSmall.manifest.json"
+scripts/verify_asr_release.sh release
+```
+
+R08 must find the model-bundled non-silent `example/en.mp3`, produce non-empty
+text with a recognized language tag, and load the pinned Silero asset. After
+release, run strict Chinese and Japanese speech and the 1/8/16/24/32/64
+concurrency sweep with `scripts/monitor_asr_bottleneck.sh` active. Compare
+quality against the current accepted backend; local gates make no capacity or
+accuracy claim. Atomic rollback restores the prior matching backend, image,
+model, manifest, and configuration before readiness and strict speech are run
+again.
+
 Back up the previous root `.env` before replacing it. The runner intentionally
 requires `ASR_RELEASE_ENV_FILE` to be the repository root `.env` because that is
 the service-level Compose `env_file` mapping.
 
-The environment must configure either `qwen_vllm` with `stateful` streaming or
-`faster_whisper` with `rolling` streaming. The faster-whisper release contract
+The environment must configure `qwen_vllm` with `stateful` streaming,
+`faster_whisper` with `rolling` streaming, or `sensevoice` with `rolling`
+streaming. The faster-whisper release contract
 additionally fixes FP16, batch four, partial beam one, final beam five, and
 `transcribe`. Both paths require model manifest verification, eager loading,
 disabled file transcription, one Uvicorn worker, a read-only `/models` mount,
-and a non-placeholder production API key. The configured container paths must
+and a non-placeholder production API key. SenseVoice additionally fixes batch
+eight, ITN enabled, 15-second utterances, and 2-second rolling updates. The configured container paths must
 match the two host asset paths above.
 
 Release mode validates the exact model set against the operator-approved
 manifest, renders and checks Docker Compose configuration, builds
 `qwen-asr-api:latest`, reruns the pinned Qwen/vLLM and faster-whisper package
-contracts plus the Silero checksum inside that image, checks host and container
+contracts, pinned FunASR 1.3.14, and the Silero checksum inside that image, checks host and container
 GPU access, and starts a disposable Compose container for the selected real
 model, manifest, VAD, and backend warmup. The container uses `--rm`; a failure
 in Docker build/runtime, GPU access, model load, Silero verification, or warmup

@@ -52,6 +52,7 @@ class _SessionContext:
     first_undecoded_at: float | None = None
     protocol_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     lease_released: bool = False
+    segment_metadata: dict[str, Any] | None = None
 
 
 class GatewayRuntime:
@@ -341,8 +342,8 @@ class GatewayRuntime:
         ctx.idle.clear()
         options = session.options
         options_identity = str(hash(json.dumps(options, sort_keys=True, default=str)))
-        faster_whisper = self.settings.asr_backend == "faster_whisper"
-        bucket = 0 if faster_whisper else min(15, max(0, count.bit_length() - 1))
+        rolling_batch = self.settings.asr_backend in {"faster_whisper", "sensevoice"}
+        bucket = 0 if rolling_batch else min(15, max(0, count.bit_length() - 1))
         decoding_identity = (
             ("final:" if reservation.chunk.final else "partial:")
             + options_identity
@@ -404,8 +405,12 @@ class GatewayRuntime:
         await ctx.idle.wait()
         async with ctx.protocol_lock:
             result = await self.adapters[ctx.session.selected_worker_id].finish_segment(session_id)
-            events = self._apply_control_result(ctx, result.text) if result.text else []
-            events.extend(ctx.protocol.segment())
+            metadata = getattr(result, "metadata", None)
+            events = self._apply_control_result(ctx, result.text, metadata) if result.text else []
+            if metadata is not None:
+                ctx.segment_metadata = dict(metadata)
+            events.extend(ctx.protocol.segment(metadata=ctx.segment_metadata))
+            ctx.segment_metadata = None
             ctx.utterance_samples = 0
             await self._enqueue_events(ctx, events)
             return events
@@ -434,8 +439,12 @@ class GatewayRuntime:
         await ctx.idle.wait()
         async with ctx.protocol_lock:
             result = await self.adapters[ctx.session.selected_worker_id].finish_session(session_id)
-            events = self._apply_control_result(ctx, result.text) if result.text else []
-            event = ctx.protocol.final()
+            metadata = getattr(result, "metadata", None)
+            events = self._apply_control_result(ctx, result.text, metadata) if result.text else []
+            if metadata is not None:
+                ctx.segment_metadata = dict(metadata)
+            event = ctx.protocol.final(metadata=ctx.segment_metadata)
+            ctx.segment_metadata = None
             events.append(event)
             ctx.session.succeed()
             observability_events().emit(
@@ -790,11 +799,13 @@ class GatewayRuntime:
         async with ctx.protocol_lock:
             state = deepcopy(ctx.protocol.state)
             terminal = ctx.protocol.terminal
+            segment_metadata = deepcopy(ctx.segment_metadata)
             try:
                 await self._apply_result_locked(ctx, result)
             except Exception:
                 ctx.protocol.state = state
                 ctx.protocol.terminal = terminal
+                ctx.segment_metadata = segment_metadata
                 raise
 
     async def _apply_result_locked(
@@ -842,6 +853,8 @@ class GatewayRuntime:
             ctx.idle.set()
             return
         mode = self.adapters[result.worker_id].capabilities.result_mode
+        if result.metadata is not None:
+            ctx.segment_metadata = dict(result.metadata)
         text = result.text
         if (
             mode is ResultMode.CUMULATIVE_SNAPSHOT
@@ -852,7 +865,7 @@ class GatewayRuntime:
         events = ctx.protocol.apply_result(
             mode, text=text, confirmed_text=result.confirmed_text,
             tail_text=result.tail_text, decoded_samples=result.end_sample - result.start_sample,
-            segment_id=result.segment_id,
+            segment_id=result.segment_id, metadata=ctx.segment_metadata,
         )
         ctx.utterance_samples += result.end_sample - result.start_sample
         caps = self.adapters[result.worker_id].capabilities
@@ -868,9 +881,13 @@ class GatewayRuntime:
             or ctx.utterance_samples >= caps.max_segment_samples
         ):
             control = await self.adapters[result.worker_id].finish_segment(result.session_id)
+            control_metadata = getattr(control, "metadata", None)
             if control.text:
-                events.extend(self._apply_control_result(ctx, control.text))
-            events.extend(ctx.protocol.segment())
+                events.extend(self._apply_control_result(ctx, control.text, control_metadata))
+            elif control_metadata is not None:
+                ctx.segment_metadata = dict(control_metadata)
+            events.extend(ctx.protocol.segment(metadata=ctx.segment_metadata))
+            ctx.segment_metadata = None
             ctx.utterance_samples = 0
             continuation_ready = ctx.session.buffer.buffered_samples > 0
             if ctx.endpoint_pending and ctx.vad is not None:
@@ -917,14 +934,20 @@ class GatewayRuntime:
         self,
         ctx: _SessionContext,
         text: str,
+        metadata: Mapping[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
+        if metadata is not None:
+            ctx.segment_metadata = dict(metadata)
         mode = self.adapters[ctx.session.selected_worker_id].capabilities.result_mode
         if mode is ResultMode.REPLACEABLE_SEGMENT:
             segment_id = ctx.protocol.state.active_segment_id or 0
-            return ctx.protocol.apply_result(mode, text=text, segment_id=segment_id)
+            return ctx.protocol.apply_result(
+                mode, text=text, segment_id=segment_id, metadata=ctx.segment_metadata
+            )
         return ctx.protocol.apply_result(
                 ResultMode.CUMULATIVE_SNAPSHOT,
                 text=ctx.protocol.state.confirmed_text + text,
+                metadata=ctx.segment_metadata,
             )
 
     def event_queue(self, session_id: str) -> asyncio.Queue[OutboundEvent]:
@@ -961,6 +984,26 @@ def _authorized(value: str | None, settings: Settings) -> bool:
 
 def _default_runtime() -> GatewayRuntime:
     settings = get_settings()
+    if settings.asr_backend == "sensevoice":
+        from app.asr_sensevoice import SenseVoiceAdapter, SenseVoiceEngine
+
+        max_segment_samples = round(settings.asr_max_utterance_seconds * 16_000)
+        adapter = SenseVoiceAdapter(
+            lambda: SenseVoiceEngine(
+                settings.asr_model_id,
+                device=settings.asr_device,
+                use_itn=settings.asr_sensevoice_use_itn,
+            ),
+            worker_id="local",
+            model_id=settings.asr_model_id,
+            model_revision=settings.asr_model_name,
+            gpu_id=settings.asr_device,
+            session_capacity=settings.asr_max_active_streams,
+            batch_size=settings.asr_sensevoice_batch_size,
+            max_segment_samples=max_segment_samples,
+            model_manifest_path=settings.asr_model_manifest_path,
+        )
+        return GatewayRuntime(settings, {"local": adapter})
     if settings.asr_backend == "faster_whisper":
         from app.asr_faster_whisper import FasterWhisperAdapter, FasterWhisperEngine
 

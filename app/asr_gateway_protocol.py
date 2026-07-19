@@ -73,6 +73,7 @@ class ProtocolSession:
         tail_text: str = "",
         decoded_samples: int = 0,
         segment_id: int = 0,
+        metadata: Mapping[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         self._require_open()
         if mode is ResultMode.CUMULATIVE_SNAPSHOT:
@@ -95,17 +96,25 @@ class ProtocolSession:
             )
         else:
             raise ValueError("unsupported result mode")
-        return [self._serialize(event) for event in events]
+        extra = {"metadata": dict(metadata)} if metadata is not None else {}
+        return [self._serialize(event, **extra) for event in events]
 
-    def segment(self) -> list[dict[str, Any]]:
+    def segment(self, *, metadata: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
         self._require_open()
-        return [self._serialize(event) for event in self.state.commit_pending()]
+        extra = {"metadata": dict(metadata)} if metadata is not None else {}
+        return [self._serialize(event, **extra) for event in self.state.commit_pending()]
 
-    def final(self, tail_text: str | None = None) -> dict[str, Any]:
+    def final(
+        self,
+        tail_text: str | None = None,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         self._require_open()
         if tail_text is not None:
             self.state.apply_model_update(self.state.confirmed_text + tail_text, processed_samples=0)
-        event = self._serialize(self.state.final_event())
+        extra = {"metadata": dict(metadata)} if metadata is not None else {}
+        event = self._serialize(self.state.final_event(), **extra)
         self.terminal = True
         return event
 

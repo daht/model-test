@@ -103,8 +103,47 @@ def test_faster_whisper_runtime_is_pinned_and_installed_in_asr_image():
 
     assert "faster-whisper==1.2.1" in requirements
     assert "ctranslate2==4.8.1" in requirements
-    assert "COPY requirements.txt requirements-asr-vllm.txt requirements-asr-faster-whisper.txt ./" in dockerfile
+    assert "requirements-asr-faster-whisper.txt" in dockerfile
     assert "-r requirements-asr-faster-whisper.txt" in dockerfile
+
+
+def test_sensevoice_runtime_is_pinned_and_installed_in_asr_image():
+    requirements = Path("requirements-asr-sensevoice.txt").read_text()
+    dockerfile = Path("Dockerfile.asr").read_text()
+
+    assert requirements.strip() == "funasr==1.3.14"
+    assert "requirements-asr-sensevoice.txt" in dockerfile
+    assert "-r requirements-asr-sensevoice.txt" in dockerfile
+
+
+def test_a10_sensevoice_release_contract_and_evaluation_runbook():
+    example = Path("cloud/A10.sensevoice.env.example").read_text()
+    verifier = Path("scripts/verify_asr_release.sh").read_text()
+    release_doc = Path("docs/asr-release-verification.md").read_text()
+    runbook = Path("cloud/README-A10.md").read_text()
+    required = {
+        "ASR_BACKEND=sensevoice",
+        "ASR_STREAM_MODE=rolling",
+        "ASR_MODEL_NAME=SenseVoiceSmall",
+        "ASR_MODEL_ID=/models/SenseVoiceSmall",
+        "ASR_MODEL_MANIFEST_PATH=/models/SenseVoiceSmall.manifest.json",
+        "ASR_SENSEVOICE_BATCH_SIZE=8",
+        "ASR_SENSEVOICE_USE_ITN=true",
+        "ASR_MAX_UTTERANCE_SECONDS=15.0",
+        "ASR_GATEWAY_DEFAULT_UPDATE_MS=2000",
+        "ASR_GATEWAY_MAX_ACTIVE_SESSIONS=64",
+    }
+    assert required <= set(example.splitlines())
+    assert "API_KEY=\n" in example
+    assert '"sensevoice": "rolling"' in verifier
+    assert '"ASR_SENSEVOICE_BATCH_SIZE": "8"' in verifier
+    assert '"ASR_SENSEVOICE_USE_ITN": "true"' in verifier
+    assert 'm.version("funasr") == "1.3.14"' in verifier
+    for text in (release_doc, runbook):
+        assert "FunAudioLLM/SenseVoiceSmall" in text
+        assert "1/8/16/24/32/64" in text
+        assert "monitor_asr_bottleneck.sh" in text
+        assert "atomic rollback" in text.lower()
 
 
 def test_a10_faster_whisper_example_is_fp16_large_v3_batch_four_transcribe_only():

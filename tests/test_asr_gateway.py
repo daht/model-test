@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from app.asr_gateway import GatewayRuntime, OutboundEvent, _default_runtime, create_app, send_outbound_events
-from app.asr_gateway_backends import DispatchMode, ResultMode, StreamingMode, VadMode
+from app.asr_gateway_backends import AdapterResult, DispatchMode, ResultMode, StreamingMode, VadMode
 from app.asr_gateway_metrics import JobTimeline
 from app.asr_gateway_scheduler import InferenceResult
 from app.asr_observability import CapacityBufferError
@@ -1036,6 +1036,91 @@ def test_default_runtime_selects_faster_whisper_without_removing_qwen_rollback(m
     qwen_runtime = _default_runtime()
 
     assert isinstance(qwen_runtime.adapters["local"], LocalCoordinatorAdapter)
+
+
+def test_default_runtime_selects_sensevoice_and_preserves_rollback(monkeypatch):
+    from app.asr_sensevoice import SenseVoiceAdapter
+
+    settings = Settings(
+        _env_file=None,
+        model_backend="mock",
+        asr_backend="sensevoice",
+        asr_stream_mode="rolling",
+        asr_model_name="SenseVoiceSmall",
+        asr_model_id="/models/SenseVoiceSmall",
+        asr_sensevoice_batch_size=8,
+        api_key="unit-test-only-not-a-production-secret-000000",
+    )
+    monkeypatch.setattr("app.asr_gateway.get_settings", lambda: settings)
+    runtime = _default_runtime()
+    assert isinstance(runtime.adapters["local"], SenseVoiceAdapter)
+    assert runtime.adapters["local"].capabilities.max_batch_items == 8
+
+
+def test_gateway_metadata_follows_segment_and_is_replaced_by_next_segment():
+    class MetadataAdapter(FakeAdapter):
+        def __init__(self):
+            super().__init__(dynamic=True, result_mode=ResultMode.REPLACEABLE_SEGMENT)
+            self.capabilities = replace(
+                self.capabilities,
+                streaming_mode=StreamingMode.ROLLING,
+                vad_mode=VadMode.NONE,
+                preferred_chunk_samples=1,
+                model_id="/models/SenseVoiceSmall",
+            )
+            self.current = {"language": "zh", "emotion": "neutral"}
+
+        async def submit(self, jobs):
+            self.calls.append(list(jobs))
+            return [
+                InferenceResult.from_job(
+                    job,
+                    text=f"heard-{job.sample_count}",
+                    tail_text=f"heard-{job.sample_count}",
+                    segment_id=1,
+                    metadata=self.current,
+                )
+                for job in jobs
+            ]
+
+        async def finish_segment(self, session_id):
+            return AdapterResult(f"b-{session_id}", text="segment", metadata=self.current)
+
+        async def finish_session(self, session_id):
+            self.sessions.discard(session_id)
+            return AdapterResult(
+                f"b-{session_id}", text="done", is_final=True, metadata=self.current
+            )
+
+    async def scenario():
+        adapter = MetadataAdapter()
+        settings = Settings(
+            _env_file=None, model_backend="mock", asr_backend="sensevoice",
+            asr_stream_mode="rolling", asr_model_id="/models/SenseVoiceSmall",
+            api_key="unit-test-only-not-a-production-secret-000000",
+            asr_gateway_default_backend="fake", asr_gateway_schedule_max_wait_ms=0,
+        )
+        runtime = GatewayRuntime(settings, {"fake": adapter})
+        await runtime.start()
+        session = await runtime.open_session("s", language="zh", options={})
+        await runtime.ingest(session, b"\x01\x00" * 2, force=True)
+        await runtime.scheduler.run_once("fake", force=True)
+        first = await runtime.segment("s")
+        adapter.current = {"language": "ja", "audio_event": "speech"}
+        await runtime.ingest(session, b"\x02\x00" * 2, force=True)
+        await runtime.scheduler.run_once("fake", force=True)
+        final = await runtime.finish("s")
+        queued = []
+        while not runtime.event_queue("s").empty():
+            queued.append((await runtime.event_queue("s").get()).payload)
+        await runtime.close()
+        return first, final, queued
+
+    first, final, queued = asyncio.run(scenario())
+    sentence = next(event for event in first if event["type"] == "sentence_final")
+    assert sentence["metadata"]["language"] == "zh"
+    assert final["metadata"]["language"] == "ja"
+    assert any(event.get("metadata", {}).get("language") == "ja" for event in queued)
 
 
 def test_rolling_route_and_endpoint_jobs_use_final_decode_batch_identity():

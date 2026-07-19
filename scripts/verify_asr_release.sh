@@ -69,7 +69,7 @@ R02 release prerequisites: Docker Compose, Docker daemon, NVIDIA runtime, .env, 
 R03 Compose config: rendered qwen-asr-api config matches its selected production backend contract
 R04 model provenance: exact host artifact set matches the operator-approved manifest
 R05 ASR image build: Dockerfile.asr completes its pinned dependency and Silero checksum build gates
-R06 image runtime: pinned Qwen and faster-whisper contracts plus Silero checksum pass inside the image
+R06 image runtime: pinned Qwen, faster-whisper, and SenseVoice contracts plus Silero checksum pass inside the image
 R07 container GPU runtime: host and built image can access the NVIDIA GPU
 R08 real ASR warmup: one-shot container loads the selected approved model, VAD, and decode path
 EOF
@@ -581,6 +581,7 @@ backend = str(environment.get("ASR_BACKEND", "")).lower()
 stream_contracts = {
     "qwen_vllm": "stateful",
     "faster_whisper": "rolling",
+    "sensevoice": "rolling",
 }
 if backend not in stream_contracts:
     raise SystemExit(f"Compose ASR_BACKEND is unsupported for release: {backend or '<missing>'}")
@@ -598,6 +599,15 @@ if backend == "faster_whisper":
         "ASR_FASTER_WHISPER_FINAL_BEAM_SIZE": "5",
         "ASR_FASTER_WHISPER_TASK": "transcribe",
         "ASR_MAX_UTTERANCE_SECONDS": "15.0",
+        "ASR_GATEWAY_SCHEDULE_MAX_WAIT_MS": "200",
+        "ASR_GATEWAY_MAX_SESSION_BUFFER_SECONDS": "6.0",
+    })
+if backend == "sensevoice":
+    required.update({
+        "ASR_SENSEVOICE_BATCH_SIZE": "8",
+        "ASR_SENSEVOICE_USE_ITN": "true",
+        "ASR_MAX_UTTERANCE_SECONDS": "15.0",
+        "ASR_GATEWAY_DEFAULT_UPDATE_MS": "2000",
         "ASR_GATEWAY_SCHEDULE_MAX_WAIT_MS": "200",
         "ASR_GATEWAY_MAX_SESSION_BUFFER_SECONDS": "6.0",
     })
@@ -701,6 +711,8 @@ run_release_gates() {
     /tmp/check_qwen_streaming_contract.py
   docker run --rm --entrypoint python qwen-asr-api:latest -c \
     'import importlib.metadata as m; assert m.version("faster-whisper") == "1.2.1"; assert m.version("ctranslate2") == "4.8.1"'
+  docker run --rm --entrypoint python qwen-asr-api:latest -c \
+    'import importlib.metadata as m; assert m.version("funasr") == "1.3.14"'
   docker run --rm --entrypoint python qwen-asr-api:latest -c \
     'import hashlib, pathlib; p=pathlib.Path("/opt/asr-assets/silero_vad.onnx"); expected="1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"; actual=hashlib.sha256(p.read_bytes()).hexdigest(); assert actual == expected, actual'
 

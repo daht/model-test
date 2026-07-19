@@ -1,0 +1,327 @@
+import asyncio
+import sys
+import types
+from dataclasses import dataclass
+
+import numpy as np
+import pytest
+
+from app.asr_sensevoice import (
+    SenseVoiceAdapter,
+    SenseVoiceDecoded,
+    SenseVoiceEngine,
+    normalize_sensevoice_output,
+)
+from app.asr_gateway_backends import DispatchMode, ResultMode, StreamingMode, VadMode
+from app.asr_gateway_scheduler import BatchKey, InferenceJob
+from app.asr_observability import CapacityBufferError
+
+
+def install_fake_funasr(monkeypatch, outputs):
+    module = types.ModuleType("funasr")
+
+    class Model:
+        def __init__(self, **kwargs):
+            self.init_kwargs = kwargs
+            self.generate_calls = []
+
+        def generate(self, **kwargs):
+            self.generate_calls.append(kwargs)
+            return outputs
+
+    model = Model()
+    module.AutoModel = lambda **kwargs: (setattr(model, "init_kwargs", kwargs) or model)
+    monkeypatch.setitem(sys.modules, "funasr", module)
+    return model
+
+
+def test_normalize_sensevoice_output_extracts_tags_and_clean_text():
+    decoded = normalize_sensevoice_output(
+        "<|zh|><|NEUTRAL|><|Speech|>今天天气不错。"
+    )
+    assert decoded == SenseVoiceDecoded(
+        "今天天气不错。",
+        {"language": "zh", "emotion": "neutral", "audio_event": "speech"},
+    )
+
+
+def test_normalize_sensevoice_output_omits_unknown_tags():
+    decoded = normalize_sensevoice_output("<|xx|><|EMO_UNKNOWN|>hello")
+    assert decoded.text == "hello"
+    assert decoded.metadata == {}
+
+
+def test_engine_uses_local_batch_api_and_preserves_order(monkeypatch, tmp_path):
+    model = install_fake_funasr(monkeypatch, [
+        {"text": "<|zh|><|NEUTRAL|><|Speech|>甲"},
+        {"text": "<|zh|><|HAPPY|><|Laughter|>乙"},
+    ])
+    engine = SenseVoiceEngine(str(tmp_path), device="cuda:0", use_itn=True)
+    result = engine.transcribe_batch(
+        [np.zeros(1600, dtype=np.float32), np.ones(800, dtype=np.float32)],
+        language="zh",
+    )
+    assert [item.text for item in result] == ["甲", "乙"]
+    assert model.init_kwargs == {
+        "model": str(tmp_path), "device": "cuda:0",
+        "trust_remote_code": False, "disable_update": True,
+    }
+    assert model.generate_calls[0]["language"] == "zh"
+    assert model.generate_calls[0]["use_itn"] is True
+    assert model.generate_calls[0]["batch_size"] == 2
+
+
+@pytest.mark.parametrize("outputs", [[], [{"text": "ok"}], [{"other": "x"}]])
+def test_engine_result_contract_fails_closed_without_raw_output(monkeypatch, tmp_path, outputs):
+    install_fake_funasr(monkeypatch, outputs)
+    engine = SenseVoiceEngine(str(tmp_path), device="cpu", use_itn=False)
+    audio = [np.zeros(10, dtype=np.float32), np.ones(10, dtype=np.float32)]
+    with pytest.raises(RuntimeError, match="SenseVoice result contract mismatch") as failure:
+        engine.transcribe_batch(audio, language=None)
+    assert repr(outputs) not in str(failure.value)
+
+
+def test_engine_warmup_requires_bundled_real_speech_and_recognized_language(monkeypatch, tmp_path):
+    sample = tmp_path / "example" / "en.mp3"
+    sample.parent.mkdir()
+    sample.write_bytes(b"not-decoded-by-fake")
+    model = install_fake_funasr(monkeypatch, [
+        {"text": "<|en|><|NEUTRAL|><|Speech|>hello"},
+    ])
+    engine = SenseVoiceEngine(str(tmp_path), device="cpu", use_itn=True)
+    engine.warmup()
+    assert model.generate_calls[0]["input"] == [str(sample)]
+
+
+def test_engine_warmup_rejects_missing_sample(monkeypatch, tmp_path):
+    install_fake_funasr(monkeypatch, [])
+    engine = SenseVoiceEngine(str(tmp_path), device="cpu", use_itn=True)
+    with pytest.raises(RuntimeError, match="warmup speech sample"):
+        engine.warmup()
+
+
+@dataclass
+class EngineCall:
+    lengths: list[int]
+    language: str | None
+
+
+class RecordingEngine:
+    def __init__(self):
+        self.calls = []
+        self.warmups = 0
+        self.closed = 0
+
+    def warmup(self):
+        self.warmups += 1
+
+    def transcribe_batch(self, audio, *, language):
+        self.calls.append(EngineCall([len(item) for item in audio], language))
+        effective = language or "en"
+        return [
+            SenseVoiceDecoded(
+                f"text-{len(item)}",
+                {"language": effective, "emotion": "neutral"},
+            )
+            for item in audio
+        ]
+
+    def close(self):
+        self.closed += 1
+
+
+def make_adapter(engine, *, batch_size=8, max_segment_samples=240_000, manifest=None):
+    return SenseVoiceAdapter(
+        lambda: engine,
+        worker_id="local",
+        model_id="/models/SenseVoiceSmall",
+        model_revision="sensevoice-test-revision",
+        gpu_id="cuda:0",
+        session_capacity=64,
+        batch_size=batch_size,
+        max_segment_samples=max_segment_samples,
+        model_manifest_path=manifest,
+    )
+
+
+def make_job(session_id, sequence, pcm, *, start=0, final=False, language="zh"):
+    samples = len(pcm) // 2
+    return InferenceJob(
+        job_id=f"{session_id}:{sequence}",
+        session_id=session_id,
+        generation=1,
+        job_sequence=sequence,
+        worker_id="local",
+        backend_session_id=f"sv-{session_id}",
+        start_sample=start,
+        end_sample=start + samples,
+        pcm=pcm,
+        deadline=1,
+        batch_key=BatchKey(
+            "local", "sensevoice-test-revision", language, "transcribe", False,
+            "", "final" if final else "partial", "pcm_s16le", 0,
+        ),
+        final=final,
+    )
+
+
+def test_adapter_contract_and_open_validation():
+    async def scenario():
+        adapter = make_adapter(RecordingEngine())
+        await adapter.warmup()
+        assert adapter.capabilities.streaming_mode is StreamingMode.ROLLING
+        assert adapter.capabilities.dispatch_mode is DispatchMode.DYNAMIC_MICROBATCH
+        assert adapter.capabilities.result_mode is ResultMode.REPLACEABLE_SEGMENT
+        assert adapter.capabilities.vad_mode is VadMode.GATEWAY
+        assert adapter.capabilities.languages == ("auto", "zh", "yue", "en", "ja", "ko")
+        for options in ({"task": "translate"}, {"timestamps": True}, {"language": "fr"}):
+            with pytest.raises(ValueError):
+                await adapter.open_session("bad", **options)
+
+    asyncio.run(scenario())
+
+
+def test_partial_redecodes_full_accumulated_utterance_and_replaces_text():
+    async def scenario():
+        engine = RecordingEngine()
+        adapter = make_adapter(engine)
+        await adapter.warmup()
+        await adapter.open_session("a", language="zh")
+        first = await adapter.submit([make_job("a", 1, b"\x01\x00" * 3)])
+        second = await adapter.submit([make_job("a", 2, b"\x02\x00" * 2, start=3)])
+        return engine.calls, first, second
+
+    calls, first, second = asyncio.run(scenario())
+    assert calls == [EngineCall([3], "zh"), EngineCall([5], "zh")]
+    assert [first[0].text, second[0].text] == ["text-3", "text-5"]
+
+
+def test_cross_session_batch_preserves_identity_and_metadata():
+    async def scenario():
+        engine = RecordingEngine()
+        adapter = make_adapter(engine)
+        await adapter.warmup()
+        await adapter.open_session("a", language="zh")
+        await adapter.open_session("b", language="ja")
+        return await adapter.submit([
+            make_job("a", 1, b"\x01\x00" * 3, language="zh"),
+            make_job("b", 1, b"\x02\x00" * 4, language="ja"),
+        ])
+
+    results = asyncio.run(scenario())
+    assert [item.session_id for item in results] == ["a", "b"]
+    assert [item.metadata["language"] for item in results] == ["zh", "ja"]
+
+
+def test_final_batch_is_cached_then_finish_clears_pcm_and_metadata():
+    async def scenario():
+        engine = RecordingEngine()
+        adapter = make_adapter(engine)
+        await adapter.warmup()
+        await adapter.open_session("a", language="zh")
+        final_result = (await adapter.submit([
+            make_job("a", 1, b"\x01\x00" * 3, final=True),
+        ]))[0]
+        finish = await adapter.finish_segment("a")
+        snapshot = await adapter.snapshot()
+        return engine.calls, final_result, finish, snapshot
+
+    calls, final_result, finish, snapshot = asyncio.run(scenario())
+    assert calls == [EngineCall([3], "zh")]
+    assert finish.text == final_result.text
+    assert finish.metadata == final_result.metadata
+    assert snapshot["session_audio_samples"] == 0
+
+
+def test_explicit_segment_fallback_decodes_full_audio_and_finish_removes_session():
+    async def scenario():
+        engine = RecordingEngine()
+        adapter = make_adapter(engine)
+        await adapter.warmup()
+        await adapter.open_session("a", language="en")
+        await adapter.submit([make_job("a", 1, b"\x01\x00" * 4, language="en")])
+        segment = await adapter.finish_segment("a")
+        await adapter.submit([make_job("a", 2, b"\x02\x00" * 2, start=4, language="en")])
+        final = await adapter.finish_session("a")
+        return engine.calls, segment, final, await adapter.snapshot()
+
+    calls, segment, final, snapshot = asyncio.run(scenario())
+    assert calls == [
+        EngineCall([4], "en"), EngineCall([4], "en"),
+        EngineCall([2], "en"), EngineCall([2], "en"),
+    ]
+    assert segment.text == "text-4" and final.text == "text-2"
+    assert snapshot["active_sessions"] == 0
+
+
+def test_validation_failures_do_not_extend_pcm_and_count_mismatch_fails_closed():
+    class WrongCountEngine(RecordingEngine):
+        def transcribe_batch(self, audio, *, language):
+            super().transcribe_batch(audio, language=language)
+            return []
+
+    async def scenario():
+        adapter = make_adapter(WrongCountEngine(), max_segment_samples=3)
+        await adapter.warmup()
+        await adapter.open_session("a", language="zh")
+        stale = make_job("a", 1, b"\x01\x00")
+        stale = InferenceJob(**{**stale.__dict__, "backend_session_id": "wrong"})
+        with pytest.raises(KeyError, match="stale session backend identity"):
+            await adapter.submit([stale])
+        with pytest.raises(ValueError, match="two jobs"):
+            await adapter.submit([make_job("a", 1, b"\x01\x00"), make_job("a", 2, b"\x02\x00")])
+        with pytest.raises(CapacityBufferError, match="utterance"):
+            await adapter.submit([make_job("a", 1, b"\x01\x00" * 4)])
+        assert (await adapter.snapshot())["session_audio_samples"] == 0
+        with pytest.raises(RuntimeError, match="result count mismatch"):
+            await adapter.submit([make_job("a", 1, b"\x01\x00" * 2)])
+        retained = await adapter.snapshot()
+        await adapter.cancel("a:1")
+        await adapter.abort_session("a")
+        return retained, await adapter.snapshot()
+
+    retained, cleaned = asyncio.run(scenario())
+    assert retained["session_audio_samples"] == 2
+    assert cleaned["session_audio_samples"] == 0
+
+
+def test_abort_close_and_engine_observer_leave_no_session_audio():
+    async def scenario():
+        engine = RecordingEngine()
+        adapter = make_adapter(engine)
+        observed = []
+        adapter.set_engine_observer(lambda **values: observed.append(values))
+        await adapter.warmup()
+        await adapter.open_session("a", language="zh")
+        await adapter.submit([make_job("a", 1, b"\x01\x00" * 3)])
+        await adapter.abort_session("a")
+        await adapter.open_session("b", language="zh")
+        await adapter.close()
+        return observed, await adapter.snapshot(), engine.closed
+
+    observed, snapshot, closed = asyncio.run(scenario())
+    assert observed[0]["group_size"] == 1
+    assert observed[0]["accumulated_audio_seconds"] == 3 / 16000
+    assert snapshot["session_audio_samples"] == 0
+    assert closed == 1
+
+
+def test_warmup_verifies_manifest_before_constructing_engine(monkeypatch):
+    order = []
+    monkeypatch.setattr(
+        "app.asr_sensevoice.verify_model_manifest",
+        lambda *_args: order.append("manifest"),
+    )
+    engine = RecordingEngine()
+
+    async def scenario():
+        adapter = SenseVoiceAdapter(
+            lambda: (order.append("engine") or engine),
+            worker_id="local", model_id="/model", model_revision="rev",
+            gpu_id="cuda:0", session_capacity=1, batch_size=1,
+            max_segment_samples=10, model_manifest_path="/manifest.json",
+        )
+        await adapter.warmup()
+
+    asyncio.run(scenario())
+    assert order == ["manifest", "engine"]

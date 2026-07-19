@@ -64,6 +64,7 @@ class InferenceResult:
     tail_text: str = ""
     final: bool = False
     error: str | None = None
+    metadata: Mapping[str, Any] | None = None
 
     @classmethod
     def from_job(cls, job: InferenceJob, **values: Any) -> "InferenceResult":
