@@ -184,3 +184,22 @@ The conclusion distinguishes model inference saturation from scheduler,
 preprocessing, CPU, network, VAD, client pacing, or configured admission limits.
 Rollback selects the prior backend and its matching model, manifest, image, and
 configuration atomically.
+
+## 128-Session Admission Follow-up
+
+The first A10 sweep completed 64 of 64 strict real-time streams. At 64 streams,
+the serialized engine occupied 48.6% of wall time, peak VRAM remained below
+1.8 GiB, and all sessions reached terminal and release states. The observed
+limit was the configured `ASR_MAX_ACTIVE_STREAMS=64`, not a model, memory, CPU,
+or cleanup failure.
+
+The next evaluation raises only the validated configuration ceiling to 128 and
+sets the test environment admission limits to 128. SenseVoice batch size stays
+eight, rolling updates stay at two seconds, and all queue, lag, utterance, and
+cleanup bounds remain unchanged. This isolates admission capacity from model
+batch tuning.
+
+Configuration accepts values through 128 and rejects 129. The follow-up sweep
+runs at 80, 96, 112, and 128, stopping at the first failed threshold. Raising
+the ceiling is permission to test those levels; it is not evidence that 128 is
+stable or suitable for production.
