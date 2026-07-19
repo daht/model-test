@@ -81,16 +81,58 @@ def test_engine_result_contract_fails_closed_without_raw_output(monkeypatch, tmp
     assert repr(outputs) not in str(failure.value)
 
 
-def test_engine_warmup_requires_bundled_real_speech_and_recognized_language(monkeypatch, tmp_path):
+def test_engine_warmup_decodes_bundled_real_speech_to_pcm(monkeypatch, tmp_path):
     sample = tmp_path / "example" / "en.mp3"
     sample.parent.mkdir()
     sample.write_bytes(b"not-decoded-by-fake")
     model = install_fake_funasr(monkeypatch, [
         {"text": "<|en|><|NEUTRAL|><|Speech|>hello"},
     ])
+    librosa = types.ModuleType("librosa")
+    librosa.load = lambda *_args, **_kwargs: (
+        np.array([0.0, 0.25, -0.25], dtype=np.float32),
+        16_000,
+    )
+    monkeypatch.setitem(sys.modules, "librosa", librosa)
     engine = SenseVoiceEngine(str(tmp_path), device="cpu", use_itn=True)
-    engine.warmup()
-    assert model.generate_calls[0]["input"] == [str(sample)]
+    pcm = engine.warmup()
+    assert np.frombuffer(pcm, dtype="<i2").tolist() == [0, 8192, -8192]
+    assert model.generate_calls == []
+
+
+def test_adapter_warmup_runs_real_pcm_through_live_submit_path(monkeypatch, tmp_path):
+    sample = tmp_path / "example" / "en.mp3"
+    sample.parent.mkdir()
+    sample.write_bytes(b"decoded-by-fake-librosa")
+    model = install_fake_funasr(monkeypatch, [
+        {"text": "<|en|><|NEUTRAL|><|Speech|>hello"},
+    ])
+    librosa = types.ModuleType("librosa")
+    librosa.load = lambda *_args, **_kwargs: (
+        np.array([0.0, 0.25, -0.25], dtype=np.float32),
+        16_000,
+    )
+    monkeypatch.setitem(sys.modules, "librosa", librosa)
+    engine = SenseVoiceEngine(str(tmp_path), device="cpu", use_itn=True)
+
+    async def scenario():
+        adapter = SenseVoiceAdapter(
+            lambda: engine,
+            worker_id="local", model_id=str(tmp_path), model_revision="rev",
+            gpu_id="cpu", session_capacity=1, batch_size=1,
+            max_segment_samples=16_000,
+        )
+        await adapter.warmup()
+        return await adapter.snapshot()
+
+    snapshot = asyncio.run(scenario())
+    submitted = model.generate_calls[0]["input"][0]
+    assert isinstance(submitted, np.ndarray)
+    assert submitted.dtype == np.float32
+    assert submitted.tolist() == [0.0, 0.25, -0.25]
+    assert model.generate_calls[0]["language"] == "en"
+    assert snapshot["active_sessions"] == 0
+    assert snapshot["session_audio_samples"] == 0
 
 
 def test_engine_warmup_rejects_missing_sample(monkeypatch, tmp_path):
@@ -114,6 +156,7 @@ class RecordingEngine:
 
     def warmup(self):
         self.warmups += 1
+        return b"\x01\x00" * 2
 
     def transcribe_batch(self, audio, *, language):
         self.calls.append(EngineCall([len(item) for item in audio], language))
@@ -186,6 +229,7 @@ def test_partial_redecodes_full_accumulated_utterance_and_replaces_text():
         engine = RecordingEngine()
         adapter = make_adapter(engine)
         await adapter.warmup()
+        engine.calls.clear()
         await adapter.open_session("a", language="zh")
         first = await adapter.submit([make_job("a", 1, b"\x01\x00" * 3)])
         second = await adapter.submit([make_job("a", 2, b"\x02\x00" * 2, start=3)])
@@ -201,6 +245,7 @@ def test_cross_session_batch_preserves_identity_and_metadata():
         engine = RecordingEngine()
         adapter = make_adapter(engine)
         await adapter.warmup()
+        engine.calls.clear()
         await adapter.open_session("a", language="zh")
         await adapter.open_session("b", language="ja")
         return await adapter.submit([
@@ -218,6 +263,7 @@ def test_final_batch_is_cached_then_finish_clears_pcm_and_metadata():
         engine = RecordingEngine()
         adapter = make_adapter(engine)
         await adapter.warmup()
+        engine.calls.clear()
         await adapter.open_session("a", language="zh")
         final_result = (await adapter.submit([
             make_job("a", 1, b"\x01\x00" * 3, final=True),
@@ -238,6 +284,7 @@ def test_explicit_segment_fallback_decodes_full_audio_and_finish_removes_session
         engine = RecordingEngine()
         adapter = make_adapter(engine)
         await adapter.warmup()
+        engine.calls.clear()
         await adapter.open_session("a", language="en")
         await adapter.submit([make_job("a", 1, b"\x01\x00" * 4, language="en")])
         segment = await adapter.finish_segment("a")
@@ -257,7 +304,9 @@ def test_explicit_segment_fallback_decodes_full_audio_and_finish_removes_session
 def test_validation_failures_do_not_extend_pcm_and_count_mismatch_fails_closed():
     class WrongCountEngine(RecordingEngine):
         def transcribe_batch(self, audio, *, language):
-            super().transcribe_batch(audio, language=language)
+            warmup = super().transcribe_batch(audio, language=language)
+            if language == "en":
+                return warmup
             return []
 
     async def scenario():
@@ -292,6 +341,7 @@ def test_abort_close_and_engine_observer_leave_no_session_audio():
         observed = []
         adapter.set_engine_observer(lambda **values: observed.append(values))
         await adapter.warmup()
+        observed.clear()
         await adapter.open_session("a", language="zh")
         await adapter.submit([make_job("a", 1, b"\x01\x00" * 3)])
         await adapter.abort_session("a")

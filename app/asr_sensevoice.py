@@ -20,7 +20,7 @@ from app.asr_gateway_backends import (
     StreamingMode,
     VadMode,
 )
-from app.asr_gateway_scheduler import InferenceJob, InferenceResult
+from app.asr_gateway_scheduler import BatchKey, InferenceJob, InferenceResult
 from app.asr_observability import CapacityBufferError, events, maximum_character_run, stable_batch_id
 
 
@@ -71,13 +71,27 @@ class SenseVoiceEngine:
             return []
         return self._generate(list(audio), language=language or "auto")
 
-    def warmup(self) -> None:
+    def warmup(self) -> bytes:
         sample = Path(self._model_id) / "example" / "en.mp3"
         if not sample.is_file():
             raise RuntimeError("SenseVoice warmup speech sample is missing")
-        decoded = self._generate([str(sample)], language="en")
-        if not decoded[0].text or decoded[0].metadata.get("language") != "en":
-            raise RuntimeError("SenseVoice warmup speech result is invalid")
+        import librosa
+
+        waveform, sample_rate = librosa.load(
+            str(sample), sr=16_000, mono=True, dtype=np.float32
+        )
+        if (
+            sample_rate != 16_000
+            or waveform.ndim != 1
+            or not waveform.size
+            or not np.isfinite(waveform).all()
+            or float(np.max(np.abs(waveform))) == 0.0
+        ):
+            raise RuntimeError("SenseVoice warmup speech sample is invalid")
+        samples = np.clip(
+            np.rint(waveform * 32768.0), -32768, 32767
+        ).astype("<i2")
+        return samples.tobytes()
 
     def _generate(self, inputs: list[Any], *, language: str) -> list[SenseVoiceDecoded]:
         raw = self._model.generate(
@@ -176,8 +190,51 @@ class SenseVoiceAdapter:
             )
         if self._engine is None:
             self._engine = self._engine_factory()
-        await asyncio.to_thread(self._engine.warmup)
+        pcm = await asyncio.to_thread(self._engine.warmup)
+        if not isinstance(pcm, bytes) or not pcm or len(pcm) % 2:
+            raise RuntimeError("SenseVoice warmup PCM is invalid")
+        pcm = pcm[: self._max_segment_samples * 2]
+        session_id = "__sensevoice_warmup__"
         self._ready = True
+        try:
+            backend_session_id = await self.open_session(session_id, language="en")
+            samples = len(pcm) // 2
+            job = InferenceJob(
+                job_id="sensevoice-warmup",
+                session_id=session_id,
+                generation=0,
+                job_sequence=1,
+                worker_id=self.capabilities.worker_id,
+                backend_session_id=backend_session_id,
+                start_sample=0,
+                end_sample=samples,
+                pcm=pcm,
+                deadline=float("inf"),
+                batch_key=BatchKey(
+                    self.capabilities.worker_id,
+                    self.capabilities.model_revision,
+                    "en",
+                    "transcribe",
+                    False,
+                    "",
+                    "final:warmup",
+                    "pcm_s16le",
+                    0,
+                ),
+                final=True,
+            )
+            result = (await self.submit([job]))[0]
+            await self.finish_session(session_id)
+            if (
+                not result.text
+                or result.metadata is None
+                or result.metadata.get("language") != "en"
+            ):
+                raise RuntimeError("SenseVoice warmup speech result is invalid")
+        except Exception:
+            self._ready = False
+            self._sessions.pop(session_id, None)
+            raise
         self.capabilities = replace(self.capabilities, warmed=True)
 
     async def open_session(

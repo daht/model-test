@@ -886,8 +886,13 @@ class GatewayRuntime:
                 events.extend(self._apply_control_result(ctx, control.text, control_metadata))
             elif control_metadata is not None:
                 ctx.segment_metadata = dict(control_metadata)
-            events.extend(ctx.protocol.segment(metadata=ctx.segment_metadata))
-            ctx.segment_metadata = None
+            committed_metadata = ctx.segment_metadata
+            events.extend(ctx.protocol.segment(metadata=committed_metadata))
+            ctx.segment_metadata = (
+                dict(committed_metadata)
+                if ctx.session.finish_requested and committed_metadata is not None
+                else None
+            )
             ctx.utterance_samples = 0
             continuation_ready = ctx.session.buffer.buffered_samples > 0
             if ctx.endpoint_pending and ctx.vad is not None:

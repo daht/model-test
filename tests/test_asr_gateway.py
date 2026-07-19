@@ -1123,6 +1123,78 @@ def test_gateway_metadata_follows_segment_and_is_replaced_by_next_segment():
     assert any(event.get("metadata", {}).get("language") == "ja" for event in queued)
 
 
+def test_real_sensevoice_finish_preserves_metadata_through_terminal_final():
+    from app.asr_sensevoice import SenseVoiceAdapter, SenseVoiceDecoded
+
+    class Engine:
+        def warmup(self):
+            return b"\x01\x00" * 2
+
+        def transcribe_batch(self, audio, *, language):
+            return [
+                SenseVoiceDecoded(
+                    f"text-{len(item)}",
+                    {"language": language or "en", "emotion": "neutral"},
+                )
+                for item in audio
+            ]
+
+        def close(self):
+            pass
+
+    async def scenario():
+        adapter = SenseVoiceAdapter(
+            Engine,
+            worker_id="local", model_id="/models/SenseVoiceSmall",
+            model_revision="rev", gpu_id="cuda:0", session_capacity=2,
+            batch_size=2, max_segment_samples=16_000,
+        )
+        adapter.capabilities = replace(adapter.capabilities, vad_mode=VadMode.NONE)
+        settings = Settings(
+            _env_file=None, model_backend="mock", asr_backend="sensevoice",
+            asr_stream_mode="rolling", asr_model_id="/models/SenseVoiceSmall",
+            api_key="unit-test-only-not-a-production-secret-000000",
+            asr_gateway_schedule_max_wait_ms=0,
+        )
+        runtime = GatewayRuntime(settings, {"local": adapter})
+        await runtime.start()
+        session = await runtime.open_session("s", language="zh", options={})
+        await runtime.ingest(session, b"\x01\x00" * 3, force=True)
+        await runtime.scheduler.run_once("local", force=True)
+        assert await runtime.ingest(session, b"\x02\x00" * 2, force=False) is False
+
+        final_enqueued = asyncio.Event()
+        original_enqueue = runtime.scheduler.enqueue
+
+        def observe_enqueue(job):
+            original_enqueue(job)
+            if job.final:
+                final_enqueued.set()
+
+        runtime.scheduler.enqueue = observe_enqueue
+        finishing = asyncio.create_task(runtime.finish("s"))
+        await final_enqueued.wait()
+        await runtime.scheduler.run_once("local", force=True)
+        final = await finishing
+        payloads = []
+        while not runtime.event_queue("s").empty():
+            payloads.append((await runtime.event_queue("s").get()).payload)
+        await runtime.close()
+        return final, payloads
+
+    final, payloads = asyncio.run(scenario())
+    expected = {"language": "zh", "emotion": "neutral"}
+    assert any(
+        event["type"] == "partial" and event.get("metadata") == expected
+        for event in payloads
+    )
+    assert any(
+        event["type"] == "sentence_final" and event.get("metadata") == expected
+        for event in payloads
+    )
+    assert final["metadata"] == expected
+
+
 def test_rolling_route_and_endpoint_jobs_use_final_decode_batch_identity():
     async def scenario():
         adapter = FakeAdapter(dynamic=True, result_mode=ResultMode.REPLACEABLE_SEGMENT)
