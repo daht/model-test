@@ -231,7 +231,7 @@ Expected: all tests pass with zero unexpected conflict events.
 **Files:**
 
 - Modify: `scripts/analyze_asr_bottleneck.py`
-- Test: `tests/test_asr_monitoring.py`
+- Test: `tests/test_analyze_asr_bottleneck.py`
 
 - [ ] **Step 1: Add a monitoring regression for the new failure event**
 
@@ -245,7 +245,7 @@ Run:
 
 ```bash
 .venv/bin/pytest -q \
-  tests/test_asr_monitoring.py \
+  tests/test_analyze_asr_bottleneck.py \
   tests/test_asr_sensevoice.py \
   tests/test_asr_gateway_scheduler.py \
   tests/test_asr_gateway.py
@@ -266,7 +266,7 @@ git add -- \
   tests/test_asr_sensevoice.py \
   tests/test_asr_gateway_scheduler.py \
   tests/test_asr_gateway.py \
-  tests/test_asr_monitoring.py
+  tests/test_analyze_asr_bottleneck.py
 ```
 
 Run:
