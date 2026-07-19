@@ -1411,6 +1411,68 @@ def test_fatal_dynamic_batch_settles_all_sessions_once_without_conflicts(monkeyp
     )
 
 
+def test_connection_lag_cancels_continuation_before_adapter_submit(monkeypatch):
+    class Emitter:
+        def __init__(self):
+            self.records = []
+
+        def emit(self, event, *, component, **fields):
+            self.records.append({"event": event, "component": component, **fields})
+
+    async def scenario():
+        clock = FakeClock()
+        adapter = FakeAdapter()
+        settings = Settings(
+            _env_file=None,
+            model_backend="mock",
+            asr_backend="mock",
+            asr_stream_mode="stateful",
+            api_key="test-key",
+            asr_gateway_default_backend="fake",
+            asr_gateway_schedule_max_wait_ms=1_000,
+            asr_max_connection_lag_seconds=1,
+            asr_ws_max_queue=2,
+        )
+        runtime = GatewayRuntime(settings, {"fake": adapter}, clock=clock)
+        emitter = Emitter()
+        monkeypatch.setattr("app.asr_gateway.observability_events", lambda: emitter)
+        await adapter.warmup()
+        await runtime.registry.register(adapter.capabilities)
+        await runtime.registry.mark_ready("fake", True)
+        session = await runtime.open_session("s", language="zh", options={})
+        context = runtime._contexts[session.session_id]
+        await runtime.ingest(session, b"\x01\x00" * 4, force=True)
+        original_cleanup = runtime.scheduler.cleanup
+
+        async def cleanup_then_enqueue(job):
+            await original_cleanup(job)
+            await runtime.ingest(session, b"\x02\x00" * 4, force=True)
+
+        runtime.scheduler.cleanup = cleanup_then_enqueue
+        clock.advance(2)
+        await runtime.scheduler.run_once("fake", force=True)
+        await runtime.scheduler.run_once("fake", force=True)
+        snapshot = runtime.scheduler.snapshot()
+        accounting = context.session.sample_accounting
+        terminal = [
+            item for item in emitter.records
+            if item["event"] == "asr_session_terminal"
+        ]
+        conflicts = [
+            item for item in emitter.records
+            if item["event"] == "asr_cleanup_conflict"
+        ]
+        return adapter, snapshot, accounting, terminal, conflicts
+
+    adapter, snapshot, accounting, terminal, conflicts = asyncio.run(scenario())
+
+    assert len(adapter.calls) == 1
+    assert snapshot["ready_depth"] == snapshot["queued_samples"] == 0
+    assert accounting["buffered"] == accounting["reserved"] == 0
+    assert [item["reason"] for item in terminal] == ["connection_lag"]
+    assert conflicts == []
+
+
 def test_rolling_route_and_endpoint_jobs_use_final_decode_batch_identity():
     async def scenario():
         adapter = FakeAdapter(dynamic=True, result_mode=ResultMode.REPLACEABLE_SEGMENT)

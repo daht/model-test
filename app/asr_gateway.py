@@ -600,15 +600,18 @@ class GatewayRuntime:
             TerminalState.SUCCEEDED,
         }:
             return False
+        session_id = ctx.session.session_id
+        generation = ctx.session.generation
+        self.scheduler.cancel_session(session_id, generation=generation)
         ctx.session.fail()
         with suppress(Exception):
             await self.adapters[ctx.session.selected_worker_id].abort_session(
-                ctx.session.session_id
+                session_id
             )
         observability_events().emit(
             "asr_session_terminal",
             component="gateway",
-            session_id=ctx.session.session_id,
+            session_id=session_id,
             generation=ctx.session.generation,
             terminal_state="failed",
             reason=reason,
