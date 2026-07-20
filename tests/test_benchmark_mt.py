@@ -51,6 +51,7 @@ def test_load_corpus_ignores_empty_lines(tmp_path):
         (['{"source_lang":"zh","target_lang":1,"text":"你好"}'], "line 1: target_lang must be a string"),
         (['{"source_lang":"zh","target_lang":" ","text":"你好"}'], "line 1: target_lang must not be blank"),
         (['{"source_lang":"zh","target_lang":"en","text":1}'], "line 1: text must be a string"),
+        (["not-json"], "line 1: invalid JSON"),
     ],
 )
 def test_load_corpus_rejects_invalid_records(tmp_path, lines, message):
@@ -99,6 +100,9 @@ def test_project_gpu_cost_calculates_throughput_capacity_and_unit_cost():
         (float("nan"), 1, 1),
         (1, float("nan"), 1),
         (1, 1, float("nan")),
+        (float("inf"), 1, 1),
+        (1, float("inf"), 1),
+        (1, 1, float("inf")),
     ],
 )
 def test_project_gpu_cost_rejects_non_positive_inputs(

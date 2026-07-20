@@ -85,10 +85,9 @@ def project_gpu_cost(
     elapsed_seconds: float,
     monthly_gpu_cost_cny: float,
 ) -> CostProjection:
-    if not (
-        source_characters > 0 and elapsed_seconds > 0 and monthly_gpu_cost_cny > 0
-    ):
-        raise BenchmarkError("cost projection inputs must be positive")
+    inputs = (source_characters, elapsed_seconds, monthly_gpu_cost_cny)
+    if not all(math.isfinite(value) and value > 0 for value in inputs):
+        raise BenchmarkError("cost projection inputs must be positive and finite")
 
     source_characters_per_second = source_characters / elapsed_seconds
     monthly_source_character_capacity = source_characters_per_second * MONTH_SECONDS
