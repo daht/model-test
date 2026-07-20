@@ -1,13 +1,20 @@
 import json
+import asyncio
 
+import httpx
 import pytest
+from fastapi import FastAPI, Header
 
 from scripts.benchmark_mt import (
     BenchmarkError,
     CorpusRecord,
+    Observation,
+    aggregate_level,
     load_corpus,
     nearest_rank,
     project_gpu_cost,
+    run_level,
+    select_sustainable_level,
 )
 
 
@@ -110,3 +117,73 @@ def test_project_gpu_cost_rejects_non_positive_inputs(
 ):
     with pytest.raises(BenchmarkError):
         project_gpu_cost(source_characters, elapsed_seconds, monthly_gpu_cost_cny)
+
+
+def test_aggregate_level_calculates_capacity_cost_and_slo():
+    observations = [
+        Observation(0.2, 10, 4, "translated", None),
+        Observation(0.4, 20, 8, "more words", None),
+        Observation(0.5, 0, 0, None, "http_503"),
+    ]
+
+    result = aggregate_level(
+        concurrency=4,
+        measured_seconds=2.0,
+        observations=observations,
+        output_token_counts=[3, 5],
+        max_p95_seconds=1.0,
+        max_error_rate=0.5,
+        a10_monthly_cost_cny=2132.72,
+    )
+
+    assert (result.attempted_requests, result.successful_requests, result.failed_requests) == (3, 2, 1)
+    assert result.requests_per_second == 1.0
+    assert result.source_characters_per_second == 15.0
+    assert result.output_tokens_per_second == 4.0
+    assert result.error_categories == {"http_503": 1}
+    assert result.slo_passed is True
+
+
+def test_select_sustainable_level_uses_highest_passing_level():
+    passing_one = aggregate_level(1, 1.0, [Observation(0.1, 1, 1, "x", None)], [1], 1.0, 0.0, 1.0)
+    passing_four = aggregate_level(4, 1.0, [Observation(0.1, 1, 1, "x", None)], [1], 1.0, 0.0, 1.0)
+    failing_eight = aggregate_level(8, 1.0, [Observation(2.0, 1, 1, "x", None)], [1], 1.0, 0.0, 1.0)
+
+    assert select_sustainable_level([passing_one, failing_eight, passing_four]) == passing_four
+
+
+def test_run_level_uses_real_concurrent_http_requests():
+    asyncio.run(_assert_real_concurrent_http_requests())
+
+
+async def _assert_real_concurrent_http_requests():
+    app = FastAPI()
+    active = 0
+    maximum_active = 0
+    both_arrived = asyncio.Event()
+    payloads = []
+
+    @app.post("/v1/translate")
+    async def translate(payload: dict, x_api_key: str = Header()):
+        nonlocal active, maximum_active
+        assert x_api_key == "secret"
+        payloads.append(payload)
+        active += 1
+        maximum_active = max(maximum_active, active)
+        if active == 2:
+            both_arrived.set()
+        await asyncio.wait_for(both_arrived.wait(), timeout=1)
+        active -= 1
+        return {"translation": "ok"}
+
+    records = [CorpusRecord("zh", "en", "你好", 2)]
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport) as client:
+        observations, _ = await run_level(
+            client, "http://test/v1/translate", "secret", records, [1], 2, 0.05
+        )
+
+    assert maximum_active == 2
+    assert len(observations) >= 2
+    assert all(item.error_category is None for item in observations)
+    assert payloads[0] == {"source_lang": "zh", "target_lang": "en", "text": "你好"}
