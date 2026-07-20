@@ -86,6 +86,7 @@ and includes the upstream MIT license. Runtime startup never downloads VAD asset
 - `scripts/update_service.sh`: update/recreate the cloud Docker service.
 - `cloud/README-A10.md`: A10-specific deployment runbook.
 - `docs/mt-capacity-cost-benchmark.md`: real HTTP MT capacity and per-million-source-character GPU cost benchmark.
+- `docs/mt-cloud-monitor.md`: monitor-only cloud evidence collection for MT capacity benchmarks.
 
 ## Deploy to Your A10 Cloud Server
 
