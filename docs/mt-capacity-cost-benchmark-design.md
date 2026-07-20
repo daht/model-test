@@ -45,7 +45,7 @@ Create `scripts/benchmark_mt.py` with these inputs:
 
 - `--corpus`: required JSONL path.
 - `--api-key`: optional; otherwise read `API_KEY` from the environment. The key is never printed or written to reports.
-- `--url`: defaults to `http://127.0.0.1:8000/v1/translate`.
+- The endpoint is read from `MT_BENCHMARK_URL`; when absent it defaults to the local service URL. The endpoint value is never printed or written to reports.
 - `--tokenizer`: required model ID or local tokenizer path used before and after measurement for source and translated-text token counts.
 - `--concurrency`: comma-separated positive integers, default `1,2,4,8,16,32`.
 - `--duration-seconds`: measured duration for each level, default 30 seconds.
@@ -105,10 +105,10 @@ The report does not assume that passing levels are monotonic. It records every l
 
 Write stable files under `--output-dir`:
 
-- `mt-benchmark.json`: complete configuration without the API key, corpus summary, per-level measurements, and selected sustainable result.
+- `mt-benchmark.json`: non-sensitive configuration without the API key or endpoint, corpus summary, per-level measurements, and selected sustainable result.
 - `mt-benchmark.md`: human-readable methodology, exclusions, results table, selected result, formulas, and a warning that mock backends or shared GPUs cannot establish commercial A10 capacity.
 
-Reports include the endpoint URL but never include request/response text, translations, or credentials. This keeps business content and secrets out of benchmark artifacts.
+Reports never include the endpoint, request/response text, translations, or credentials. Normal terminal output also omits the endpoint. This keeps deployment topology, business content, and secrets out of benchmark artifacts and logs.
 
 ## Error Handling
 
@@ -135,14 +135,14 @@ Development follows test-first red-green cycles:
 2. Deterministic percentile, throughput, monthly capacity, and cost calculations.
 3. SLO pass/fail and highest sustainable level selection.
 4. Async HTTP workload against an in-process ASGI test application, proving real HTTP request construction, concurrency, successful translation parsing, and failure categorization without a GPU.
-5. JSON and Markdown report content and API-key redaction.
+5. JSON and Markdown report content plus API-key and endpoint redaction.
 6. CLI argument and environment validation.
 
 The focused test file and the full repository pytest suite must pass locally. Python compilation and `git diff --check` complete the local verification. Real A10 capacity remains an external benchmark and must be reported as unavailable until the command is run against the warmed production model on an independent A10.
 
 ## Acceptance Criteria
 
-- A user can point the CLI at the local `/v1/translate` HTTP endpoint and a real JSONL corpus.
+- A user can configure the benchmark process to call the target `/v1/translate` HTTP endpoint with a real JSONL corpus.
 - Every request goes through the deployed HTTP application rather than importing the translator.
 - Reports reproduce the confirmed per-million-source-character A10 GPU cost formula.
 - Reports provide enough latency, throughput, token, character, and error evidence to choose a sustainable concurrency level.
