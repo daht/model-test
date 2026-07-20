@@ -1,10 +1,13 @@
 import asyncio
+import argparse
 import json
 import math
+import os
 import statistics
+import sys
 import time
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Sequence
 
@@ -68,6 +71,46 @@ class LevelResult:
     monthly_source_character_capacity: float | None
     gpu_cost_per_million_source_characters_cny: float | None
     slo_passed: bool
+
+
+@dataclass(frozen=True)
+class BenchmarkConfig:
+    corpus_path: Path
+    tokenizer: str
+    output_dir: Path
+    endpoint: str
+    api_key: str
+    concurrency_levels: tuple[int, ...]
+    duration_seconds: float
+    warmup_requests: int
+    request_timeout_seconds: float
+    max_p95_seconds: float
+    max_error_rate: float
+    a10_monthly_cost_cny: float
+
+
+@dataclass(frozen=True)
+class CorpusSummary:
+    record_count: int
+    source_characters: int
+    language_pairs: dict[str, int]
+
+
+@dataclass(frozen=True)
+class BenchmarkReport:
+    tokenizer: str
+    duration_seconds: float
+    max_p95_seconds: float
+    max_error_rate: float
+    a10_monthly_cost_cny: float
+    corpus: CorpusSummary
+    levels: tuple[LevelResult, ...]
+    selected_sustainable: LevelResult | None
+
+
+class _ArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise BenchmarkError(message)
 
 
 def load_corpus(path: Path) -> list[CorpusRecord]:
@@ -342,3 +385,255 @@ def select_sustainable_level(
 ) -> LevelResult | None:
     passing = [level for level in levels if level.slo_passed]
     return max(passing, key=lambda level: level.concurrency) if passing else None
+
+
+def _positive_finite(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be positive and finite")
+    return parsed
+
+
+def _error_rate(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if not math.isfinite(parsed) or not 0 <= parsed <= 1:
+        raise argparse.ArgumentTypeError("must be between 0 and 1")
+    return parsed
+
+
+def _concurrency_levels(value: str) -> tuple[int, ...]:
+    try:
+        levels = tuple(int(item) for item in value.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("concurrency must contain integers") from exc
+    if not levels or any(level <= 0 for level in levels) or len(set(levels)) != len(levels):
+        raise argparse.ArgumentTypeError("concurrency levels must be unique positive integers")
+    return levels
+
+
+def parse_config(
+    argv: Sequence[str] | None = None,
+    environ: dict[str, str] | None = None,
+) -> BenchmarkConfig:
+    environment = os.environ if environ is None else environ
+    parser = _ArgumentParser(description="Benchmark the HY-MT HTTP translation service")
+    parser.add_argument("--corpus", required=True, type=Path)
+    parser.add_argument("--tokenizer", required=True)
+    parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--api-key")
+    parser.add_argument("--concurrency", default=(1, 2, 4, 8, 16, 32), type=_concurrency_levels)
+    parser.add_argument("--duration-seconds", default=30.0, type=_positive_finite)
+    parser.add_argument("--warmup-requests", default=3, type=int)
+    parser.add_argument("--request-timeout-seconds", default=30.0, type=_positive_finite)
+    parser.add_argument("--max-p95-seconds", default=1.0, type=_positive_finite)
+    parser.add_argument("--max-error-rate", default=0.001, type=_error_rate)
+    parser.add_argument("--a10-monthly-cost-cny", default=2132.72, type=_positive_finite)
+    args = parser.parse_args(argv)
+    if args.warmup_requests < 0:
+        raise BenchmarkError("warmup requests must not be negative")
+    api_key = args.api_key or environment.get("API_KEY")
+    if not api_key:
+        raise BenchmarkError("API key is required")
+    endpoint = environment.get(
+        "MT_BENCHMARK_URL", "http://127.0.0.1:8000/v1/translate"
+    )
+    if not endpoint.strip():
+        raise BenchmarkError("benchmark endpoint is required")
+    return BenchmarkConfig(
+        corpus_path=args.corpus,
+        tokenizer=args.tokenizer,
+        output_dir=args.output_dir,
+        endpoint=endpoint,
+        api_key=api_key,
+        concurrency_levels=args.concurrency,
+        duration_seconds=args.duration_seconds,
+        warmup_requests=args.warmup_requests,
+        request_timeout_seconds=args.request_timeout_seconds,
+        max_p95_seconds=args.max_p95_seconds,
+        max_error_rate=args.max_error_rate,
+        a10_monthly_cost_cny=args.a10_monthly_cost_cny,
+    )
+
+
+def summarize_corpus(records: Sequence[CorpusRecord]) -> CorpusSummary:
+    pairs = Counter(f"{record.source_lang}->{record.target_lang}" for record in records)
+    return CorpusSummary(
+        record_count=len(records),
+        source_characters=sum(record.source_characters for record in records),
+        language_pairs=dict(sorted(pairs.items())),
+    )
+
+
+def _report_payload(report: BenchmarkReport) -> dict[str, object]:
+    return {
+        "configuration": {
+            "tokenizer": report.tokenizer,
+            "duration_seconds": report.duration_seconds,
+            "max_p95_seconds": report.max_p95_seconds,
+            "max_error_rate": report.max_error_rate,
+            "a10_monthly_cost_cny": report.a10_monthly_cost_cny,
+            "month_seconds": MONTH_SECONDS,
+        },
+        "corpus": asdict(report.corpus),
+        "levels": [asdict(level) for level in report.levels],
+        "selected_sustainable": (
+            asdict(report.selected_sustainable)
+            if report.selected_sustainable is not None
+            else None
+        ),
+    }
+
+
+def render_json(report: BenchmarkReport) -> str:
+    return json.dumps(_report_payload(report), ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+
+
+def _display(value: float | None, digits: int = 3) -> str:
+    return "-" if value is None else f"{value:.{digits}f}"
+
+
+def render_markdown(report: BenchmarkReport) -> str:
+    lines = [
+        "# MT 容量与成本压测报告",
+        "",
+        "本报告仅计算独立单张 A10 的 GPU 成本，不包含 CPU、内存、存储、网络、负载均衡、冗余和运维。",
+        "Mock 后端或与 ASR/TTS 共用 GPU 的结果不能作为商业容量证据。",
+        "",
+        f"- 语料记录数：{report.corpus.record_count}",
+        f"- 语料源字符数：{report.corpus.source_characters}",
+        f"- A10 月成本：{report.a10_monthly_cost_cny:.2f} 元",
+        f"- SLO：P95 ≤ {report.max_p95_seconds:.3f} 秒，错误率 ≤ {report.max_error_rate:.4%}",
+        "",
+        "## 各并发档结果",
+        "",
+        "| 并发 | 成功/请求 | RPS | 源字符/秒 | 输入 Token/秒 | 输出 Token/秒 | P50/P95/P99 秒 | 错误率 | 每百万源字符 GPU 成本 | SLO |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | :---: |",
+    ]
+    for level in report.levels:
+        lines.append(
+            "| "
+            f"{level.concurrency} | {level.successful_requests}/{level.attempted_requests} | "
+            f"{level.requests_per_second:.3f} | {level.source_characters_per_second:.3f} | "
+            f"{level.source_tokens_per_second:.3f} | {level.output_tokens_per_second:.3f} | "
+            f"{level.latency_p50_seconds:.3f}/{level.latency_p95_seconds:.3f}/{level.latency_p99_seconds:.3f} | "
+            f"{level.error_rate:.4%} | {_display(level.gpu_cost_per_million_source_characters_cny, 4)} | "
+            f"{'通过' if level.slo_passed else '失败'} |"
+        )
+    lines.extend(["", "## 可持续容量", ""])
+    if report.selected_sustainable is None:
+        lines.append("没有并发档同时满足延迟与错误率门槛。")
+    else:
+        selected = report.selected_sustainable
+        lines.extend(
+            [
+                f"最高通过并发档：**{selected.concurrency}**。",
+                f"每百万源字符 GPU 成本：**{_display(selected.gpu_cost_per_million_source_characters_cny, 4)} 元**。",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "## 计算公式",
+            "",
+            "`月处理源字符 = 源字符/秒 × 2,592,000`",
+            "",
+            "`每百万源字符 GPU 成本 = A10 月成本 × 1,000,000 ÷ 月处理源字符`",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def write_reports(output_dir: Path, report: BenchmarkReport) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "mt-benchmark.json").write_text(render_json(report), encoding="utf-8")
+    (output_dir / "mt-benchmark.md").write_text(render_markdown(report), encoding="utf-8")
+
+
+def count_tokens(tokenizer: object, text: str) -> int:
+    token_ids = tokenizer.encode(text, add_special_tokens=False)
+    return len(token_ids)
+
+
+async def run_benchmark(
+    config: BenchmarkConfig,
+    records: Sequence[CorpusRecord],
+    tokenizer: object,
+) -> BenchmarkReport:
+    source_token_counts = [count_tokens(tokenizer, record.text) for record in records]
+    levels = []
+    async with httpx.AsyncClient(timeout=config.request_timeout_seconds) as client:
+        await warm_up(
+            client,
+            config.endpoint,
+            config.api_key,
+            records,
+            source_token_counts,
+            config.warmup_requests,
+        )
+        for concurrency in config.concurrency_levels:
+            observations, measured_seconds = await run_level(
+                client,
+                config.endpoint,
+                config.api_key,
+                records,
+                source_token_counts,
+                concurrency,
+                config.duration_seconds,
+            )
+            output_counts = [
+                count_tokens(tokenizer, item.translation)
+                for item in observations
+                if item.translation is not None
+            ]
+            levels.append(
+                aggregate_level(
+                    concurrency,
+                    measured_seconds,
+                    observations,
+                    output_counts,
+                    config.max_p95_seconds,
+                    config.max_error_rate,
+                    config.a10_monthly_cost_cny,
+                )
+            )
+    level_tuple = tuple(levels)
+    return BenchmarkReport(
+        tokenizer=config.tokenizer,
+        duration_seconds=config.duration_seconds,
+        max_p95_seconds=config.max_p95_seconds,
+        max_error_rate=config.max_error_rate,
+        a10_monthly_cost_cny=config.a10_monthly_cost_cny,
+        corpus=summarize_corpus(records),
+        levels=level_tuple,
+        selected_sustainable=select_sustainable_level(level_tuple),
+    )
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    try:
+        config = parse_config(argv)
+        records = load_corpus(config.corpus_path)
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(config.tokenizer)
+        report = asyncio.run(run_benchmark(config, records, tokenizer))
+        write_reports(config.output_dir, report)
+    except BenchmarkError as exc:
+        print(f"MT benchmark failed: {exc}", file=sys.stderr)
+        return 2
+    except (OSError, RuntimeError, ValueError):
+        print("MT benchmark failed: local configuration or artifact error", file=sys.stderr)
+        return 2
+    print("MT benchmark reports written: mt-benchmark.json, mt-benchmark.md")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

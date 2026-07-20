@@ -1,5 +1,6 @@
 import json
 import asyncio
+from pathlib import Path
 
 import httpx
 import pytest
@@ -7,12 +8,17 @@ from fastapi import FastAPI, Header
 
 from scripts.benchmark_mt import (
     BenchmarkError,
+    BenchmarkReport,
     CorpusRecord,
+    CorpusSummary,
     Observation,
     aggregate_level,
     load_corpus,
     nearest_rank,
     project_gpu_cost,
+    parse_config,
+    render_json,
+    render_markdown,
     run_level,
     select_sustainable_level,
 )
@@ -187,3 +193,72 @@ async def _assert_real_concurrent_http_requests():
     assert len(observations) >= 2
     assert all(item.error_category is None for item in observations)
     assert payloads[0] == {"source_lang": "zh", "target_lang": "en", "text": "你好"}
+
+
+def test_parse_config_uses_approved_defaults_and_environment(tmp_path):
+    config = parse_config(
+        ["--corpus", str(tmp_path / "input.jsonl"), "--tokenizer", "model", "--output-dir", str(tmp_path)],
+        {"API_KEY": "secret", "MT_BENCHMARK_URL": "http://sensitive.invalid/v1/translate"},
+    )
+
+    assert config.concurrency_levels == (1, 2, 4, 8, 16, 32)
+    assert config.duration_seconds == 30.0
+    assert config.max_p95_seconds == 1.0
+    assert config.max_error_rate == 0.001
+    assert config.a10_monthly_cost_cny == 2132.72
+    assert config.endpoint == "http://sensitive.invalid/v1/translate"
+    assert config.api_key == "secret"
+
+
+@pytest.mark.parametrize("value", ["0", "1,1", "a", "1,-2"])
+def test_parse_config_rejects_invalid_concurrency(tmp_path, value):
+    with pytest.raises(BenchmarkError):
+        parse_config(
+            [
+                "--corpus", str(tmp_path / "input.jsonl"),
+                "--tokenizer", "model",
+                "--output-dir", str(tmp_path),
+                "--concurrency", value,
+            ],
+            {"API_KEY": "secret"},
+        )
+
+
+def test_parse_config_requires_api_key(tmp_path):
+    with pytest.raises(BenchmarkError, match="API key is required"):
+        parse_config(
+            ["--corpus", str(tmp_path / "input.jsonl"), "--tokenizer", "model", "--output-dir", str(tmp_path)],
+            {},
+        )
+
+
+def test_reports_include_metrics_and_exclude_sensitive_values():
+    level = aggregate_level(
+        4,
+        2.0,
+        [Observation(0.2, 10, 4, "translated-secret", None)],
+        [3],
+        1.0,
+        0.001,
+        2132.72,
+    )
+    report = BenchmarkReport(
+        tokenizer="model",
+        duration_seconds=30.0,
+        max_p95_seconds=1.0,
+        max_error_rate=0.001,
+        a10_monthly_cost_cny=2132.72,
+        corpus=CorpusSummary(1, 10, {"zh->en": 1}),
+        levels=(level,),
+        selected_sustainable=level,
+    )
+
+    json_text = render_json(report)
+    markdown = render_markdown(report)
+    combined = json_text + markdown
+
+    assert "gpu_cost_per_million_source_characters_cny" in json_text
+    assert "每百万源字符 GPU 成本" in markdown
+    assert "http://sensitive.invalid" not in combined
+    assert "api-key-secret" not in combined
+    assert "translated-secret" not in combined
