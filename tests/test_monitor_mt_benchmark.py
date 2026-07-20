@@ -105,10 +105,23 @@ def wait_for_started(process: subprocess.Popen) -> str:
     raise AssertionError("monitor did not start: " + "".join(output))
 
 
+def wait_for_data_row(output_root: Path, filename: str) -> None:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        runs = [path for path in (output_root / "runs").iterdir() if path.is_dir()]
+        if len(runs) == 1:
+            evidence = runs[0] / filename
+            if evidence.is_file() and len(evidence.read_text().splitlines()) >= 2:
+                return
+        time.sleep(0.01)
+    raise AssertionError(f"monitor did not collect a data row for {filename}")
+
+
 def test_monitor_lifecycle_collects_reports_and_archive(tmp_path):
     process, output_root, call_log = start_monitor(tmp_path)
     started_output = wait_for_started(process)
-    time.sleep(0.15)
+    wait_for_data_row(output_root, "gpu.csv")
+    wait_for_data_row(output_root, "container.csv")
     process.send_signal(signal.SIGINT)
     stdout, _ = process.communicate(timeout=10)
 
@@ -185,7 +198,6 @@ def test_monitor_refuses_unmarked_nonempty_output_root(tmp_path):
 def test_monitor_reports_missing_gpu_samples_as_null(tmp_path):
     process, output_root, _ = start_monitor(tmp_path, FAKE_NO_GPU_SAMPLES="1")
     wait_for_started(process)
-    time.sleep(0.1)
     process.send_signal(signal.SIGINT)
     process.communicate(timeout=10)
 
