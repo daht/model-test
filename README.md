@@ -85,6 +85,7 @@ and includes the upstream MIT license. Runtime startup never downloads VAD asset
 - `scripts/verify_asr_release.sh`: layered commit, release, and live ASR verification. See `docs/asr-release-verification.md`.
 - `scripts/update_service.sh`: update/recreate the cloud Docker service.
 - `cloud/README-A10.md`: A10-specific deployment runbook.
+- `docs/mt-capacity-cost-benchmark.md`: real HTTP MT capacity and per-million-source-character GPU cost benchmark.
 
 ## Deploy to Your A10 Cloud Server
 

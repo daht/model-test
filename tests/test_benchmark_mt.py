@@ -1,5 +1,6 @@
 import json
 import asyncio
+import re
 from pathlib import Path
 
 import httpx
@@ -262,3 +263,30 @@ def test_reports_include_metrics_and_exclude_sensitive_values():
     assert "http://sensitive.invalid" not in combined
     assert "api-key-secret" not in combined
     assert "translated-secret" not in combined
+
+
+def test_documentation_describes_safe_commercial_benchmark():
+    documentation = (
+        Path(__file__).parents[1] / "docs" / "mt-capacity-cost-benchmark.md"
+    ).read_text(encoding="utf-8")
+
+    for required in (
+        "scripts/benchmark_mt.py",
+        "source_lang",
+        "target_lang",
+        "MT_BENCHMARK_URL",
+        "API_KEY",
+        "2132.72",
+        "1,000,000",
+        "mt-benchmark.json",
+        "mt-benchmark.md",
+        "mock",
+        "ASR/TTS",
+    ):
+        assert required in documentation
+    public_ips = [
+        match
+        for match in re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", documentation)
+        if not match.startswith(("127.", "10.", "192.168."))
+    ]
+    assert public_ips == []
