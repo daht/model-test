@@ -8,7 +8,8 @@ OUTPUT_ROOT="${MT_MONITOR_OUTPUT_ROOT:-/tmp/mt-monitor}"
 RUNS_DIR="${OUTPUT_ROOT}/runs"
 MARKER_PATH="${OUTPUT_ROOT}/.mt-monitor-owned"
 LOCK_DIR="${OUTPUT_ROOT}/.monitor.lock"
-SERVICE="${MT_MONITOR_SERVICE:-hy-mt-api}"
+GATEWAY_SERVICE="${MT_MONITOR_GATEWAY_SERVICE:-hy-mt-api}"
+VLLM_SERVICE="${MT_MONITOR_VLLM_SERVICE:-hy-mt-vllm}"
 GPU_INDEX="${MT_MONITOR_GPU_INDEX:-0}"
 GPU_INTERVAL="${MT_MONITOR_GPU_INTERVAL_SECONDS:-0.5}"
 CONTAINER_INTERVAL="${MT_MONITOR_CONTAINER_INTERVAL_SECONDS:-1}"
@@ -20,7 +21,8 @@ CURRENT_DIR=""
 ARCHIVE_PATH=""
 PARTIAL_ARCHIVE=""
 STARTED_UTC=""
-CONTAINER_ID=""
+GATEWAY_CONTAINER_ID=""
+VLLM_CONTAINER_ID=""
 PIDS=()
 FINALIZED=0
 
@@ -32,7 +34,8 @@ Starts a monitor-only evidence collector for the HY-MT Docker Compose service.
 Run the MT benchmark from another machine, then press Ctrl+C here.
 
 Optional environment variables:
-  MT_MONITOR_SERVICE
+  MT_MONITOR_GATEWAY_SERVICE
+  MT_MONITOR_VLLM_SERVICE
   MT_MONITOR_GPU_INDEX
   MT_MONITOR_OUTPUT_ROOT
   MT_MONITOR_GPU_INTERVAL_SECONDS
@@ -99,15 +102,15 @@ release_lock() {
 }
 
 resolve_container() {
-  local raw
-  raw="$(docker compose ps -q "${SERVICE}" 2>/dev/null || true)"
+  local service="$1" variable="$2" raw
+  raw="$(docker compose ps -q "${service}" 2>/dev/null || true)"
   mapfile -t container_ids < <(printf '%s\n' "${raw}" | sed '/^[[:space:]]*$/d')
   if [[ ${#container_ids[@]} -ne 1 ]]; then
-    echo "Expected exactly one running MT container: ${SERVICE}" >&2
+    echo "Expected exactly one running MT container: ${service}" >&2
     release_lock
     exit 2
   fi
-  CONTAINER_ID="${container_ids[0]}"
+  printf -v "${variable}" '%s' "${container_ids[0]}"
 }
 
 record_error() {
@@ -116,19 +119,31 @@ record_error() {
 }
 
 write_metadata() {
-  local image_id started_at gpu_name running restart_count oom_killed
-  image_id="$(docker inspect --format '{{.Image}}' "${CONTAINER_ID}" 2>/dev/null || true)"
-  started_at="$(docker inspect --format '{{.State.StartedAt}}' "${CONTAINER_ID}" 2>/dev/null || true)"
-  running="$(docker inspect --format '{{.State.Running}}' "${CONTAINER_ID}" 2>/dev/null || true)"
-  restart_count="$(docker inspect --format '{{.RestartCount}}' "${CONTAINER_ID}" 2>/dev/null || true)"
-  oom_killed="$(docker inspect --format '{{.State.OOMKilled}}' "${CONTAINER_ID}" 2>/dev/null || true)"
+  local gpu_name
+  local gateway_image_id gateway_started_at gateway_running gateway_restart_count gateway_oom_killed
+  local vllm_image_id vllm_started_at vllm_running vllm_restart_count vllm_oom_killed
+  gateway_image_id="$(docker inspect --format '{{.Image}}' "${GATEWAY_CONTAINER_ID}" 2>/dev/null || true)"
+  gateway_started_at="$(docker inspect --format '{{.State.StartedAt}}' "${GATEWAY_CONTAINER_ID}" 2>/dev/null || true)"
+  gateway_running="$(docker inspect --format '{{.State.Running}}' "${GATEWAY_CONTAINER_ID}" 2>/dev/null || true)"
+  gateway_restart_count="$(docker inspect --format '{{.RestartCount}}' "${GATEWAY_CONTAINER_ID}" 2>/dev/null || true)"
+  gateway_oom_killed="$(docker inspect --format '{{.State.OOMKilled}}' "${GATEWAY_CONTAINER_ID}" 2>/dev/null || true)"
+  vllm_image_id="$(docker inspect --format '{{.Image}}' "${VLLM_CONTAINER_ID}" 2>/dev/null || true)"
+  vllm_started_at="$(docker inspect --format '{{.State.StartedAt}}' "${VLLM_CONTAINER_ID}" 2>/dev/null || true)"
+  vllm_running="$(docker inspect --format '{{.State.Running}}' "${VLLM_CONTAINER_ID}" 2>/dev/null || true)"
+  vllm_restart_count="$(docker inspect --format '{{.RestartCount}}' "${VLLM_CONTAINER_ID}" 2>/dev/null || true)"
+  vllm_oom_killed="$(docker inspect --format '{{.State.OOMKilled}}' "${VLLM_CONTAINER_ID}" 2>/dev/null || true)"
   gpu_name="$(nvidia-smi --id="${GPU_INDEX}" --query-gpu=index,name --format=csv,noheader,nounits 2>/dev/null || true)"
   env META_PATH="${CURRENT_DIR}/metadata.json" RUN_ID="${RUN_ID}" STARTED_UTC="${STARTED_UTC}" \
     FINISHED_UTC="${1:-}" HOSTNAME_VALUE="$(hostname)" KERNEL_VALUE="$(uname -a)" \
-    REPOSITORY_SHA="$(git rev-parse HEAD 2>/dev/null || true)" SERVICE="${SERVICE}" \
-    CONTAINER_ID="${CONTAINER_ID}" IMAGE_ID="${image_id}" CONTAINER_STARTED_AT="${started_at}" \
-    CONTAINER_RUNNING="${running}" CONTAINER_RESTART_COUNT="${restart_count}" \
-    CONTAINER_OOM_KILLED="${oom_killed}" GPU_INDEX="${GPU_INDEX}" GPU_NAME="${gpu_name}" \
+    REPOSITORY_SHA="$(git rev-parse HEAD 2>/dev/null || true)" \
+    GATEWAY_SERVICE="${GATEWAY_SERVICE}" GATEWAY_CONTAINER_ID="${GATEWAY_CONTAINER_ID}" \
+    GATEWAY_IMAGE_ID="${gateway_image_id}" GATEWAY_STARTED_AT="${gateway_started_at}" \
+    GATEWAY_RUNNING="${gateway_running}" GATEWAY_RESTART_COUNT="${gateway_restart_count}" \
+    GATEWAY_OOM_KILLED="${gateway_oom_killed}" VLLM_SERVICE="${VLLM_SERVICE}" \
+    VLLM_CONTAINER_ID="${VLLM_CONTAINER_ID}" VLLM_IMAGE_ID="${vllm_image_id}" \
+    VLLM_STARTED_AT="${vllm_started_at}" VLLM_RUNNING="${vllm_running}" \
+    VLLM_RESTART_COUNT="${vllm_restart_count}" VLLM_OOM_KILLED="${vllm_oom_killed}" \
+    GPU_INDEX="${GPU_INDEX}" GPU_NAME="${gpu_name}" \
     python3 - <<'PY'
 import json, os
 from pathlib import Path
@@ -139,6 +154,17 @@ def integer(value):
     except (TypeError, ValueError):
         return None
 
+def service(prefix):
+    return {
+        "service": os.environ[f"{prefix}_SERVICE"],
+        "container_id": os.environ[f"{prefix}_CONTAINER_ID"],
+        "image_id": os.environ[f"{prefix}_IMAGE_ID"],
+        "container_started_at": os.environ[f"{prefix}_STARTED_AT"],
+        "container_running": os.environ[f"{prefix}_RUNNING"].lower() == "true",
+        "container_restart_count": integer(os.environ[f"{prefix}_RESTART_COUNT"]),
+        "container_oom_killed": os.environ[f"{prefix}_OOM_KILLED"].lower() == "true",
+    }
+
 payload = {
     "run_id": os.environ["RUN_ID"],
     "started_utc": os.environ["STARTED_UTC"],
@@ -146,13 +172,7 @@ payload = {
     "hostname": os.environ["HOSTNAME_VALUE"],
     "kernel": os.environ["KERNEL_VALUE"],
     "repository_sha": os.environ["REPOSITORY_SHA"],
-    "service": os.environ["SERVICE"],
-    "container_id": os.environ["CONTAINER_ID"],
-    "image_id": os.environ["IMAGE_ID"],
-    "container_started_at": os.environ["CONTAINER_STARTED_AT"],
-    "container_running": os.environ["CONTAINER_RUNNING"].lower() == "true",
-    "container_restart_count": integer(os.environ["CONTAINER_RESTART_COUNT"]),
-    "container_oom_killed": os.environ["CONTAINER_OOM_KILLED"].lower() == "true",
+    "services": {"gateway": service("GATEWAY"), "vllm": service("VLLM")},
     "gpu_index": integer(os.environ["GPU_INDEX"]),
     "gpu_name": os.environ["GPU_NAME"],
 }
@@ -193,26 +213,27 @@ gpu_process_collector() {
 }
 
 container_collector() {
-  local output="${CURRENT_DIR}/container.csv"
+  local label="$1" container_id="$2" output="${CURRENT_DIR}/$1-container.csv"
   echo 'sampled_at|cpu_percent|memory_usage|memory_percent|network_io|block_io|pids' >"${output}"
   while true; do
     local sampled_at value
     sampled_at="$(utc_now)"
-    if value="$(docker stats --no-stream --format '{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}|{{.NetIO}}|{{.BlockIO}}|{{.PIDs}}' "${CONTAINER_ID}" 2>/dev/null)"; then
+    if value="$(docker stats --no-stream --format '{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}|{{.NetIO}}|{{.BlockIO}}|{{.PIDs}}' "${container_id}" 2>/dev/null)"; then
       printf '%s|%s\n' "${sampled_at}" "${value}" >>"${output}"
     else
-      record_error container sample_failed
+      record_error "${label}_container" sample_failed
     fi
     sleep "${CONTAINER_INTERVAL}"
   done
 }
 
 service_log_collector() {
-  exec docker compose logs --follow --timestamps --since "${STARTED_UTC}" "${SERVICE}" >"${CURRENT_DIR}/service.log" 2>&1
+  local label="$1" service="$2"
+  exec docker compose logs --follow --timestamps --since "${STARTED_UTC}" "${service}" >"${CURRENT_DIR}/${label}-service.log" 2>&1
 }
 
 start_collector() {
-  "$1" &
+  "$@" &
   PIDS+=("$!")
 }
 
@@ -272,21 +293,23 @@ gpu = {
 }
 if not gpu_rows: warnings.append("missing GPU samples")
 
-with (run / "container.csv").open() as handle:
-    container_rows = list(csv.DictReader(handle, delimiter="|"))
-memory_values = []
-for row in container_rows:
-    usage = row["memory_usage"].split("/", 1)[0].strip()
-    parsed = bytes_value(usage)
-    if parsed is None: warnings.append("unparseable container memory unit")
-    memory_values.append(parsed)
-container = {
-    "sample_count": len(container_rows),
-    "cpu_percent": metric([number(row["cpu_percent"]) for row in container_rows]),
-    "memory_used_bytes": metric(memory_values),
-    "memory_percent": metric([number(row["memory_percent"]) for row in container_rows]),
-}
-if not container_rows: warnings.append("missing container samples")
+containers = {}
+for label in ("gateway", "vllm"):
+    with (run / f"{label}-container.csv").open() as handle:
+        container_rows = list(csv.DictReader(handle, delimiter="|"))
+    memory_values = []
+    for row in container_rows:
+        usage = row["memory_usage"].split("/", 1)[0].strip()
+        parsed = bytes_value(usage)
+        if parsed is None: warnings.append(f"unparseable {label} container memory unit")
+        memory_values.append(parsed)
+    containers[label] = {
+        "sample_count": len(container_rows),
+        "cpu_percent": metric([number(row["cpu_percent"]) for row in container_rows]),
+        "memory_used_bytes": metric(memory_values),
+        "memory_percent": metric([number(row["memory_percent"]) for row in container_rows]),
+    }
+    if not container_rows: warnings.append(f"missing {label} container samples")
 
 process_rows = list(csv.DictReader((run / "gpu-processes.csv").open()))
 process_peaks = defaultdict(list)
@@ -306,11 +329,15 @@ if metadata.get("started_utc") and metadata.get("finished_utc"):
 report = {
     "run_id": metadata["run_id"], "started_utc": metadata["started_utc"],
     "finished_utc": metadata.get("finished_utc"), "duration_seconds": duration,
-    "gpu": gpu, "container": container, "gpu_process_peak_memory_mib": dict(sorted(gpu_processes.items())),
+    "gpu": gpu, "containers": containers, "gpu_process_peak_memory_mib": dict(sorted(gpu_processes.items())),
     "collector_errors": {"count": len(error_lines), "categories": dict(sorted(categories.items()))},
     "container_final_state": {
-        "running": metadata.get("container_running"), "restart_count": metadata.get("container_restart_count"),
-        "oom_killed": metadata.get("container_oom_killed"),
+        label: {
+            "running": value.get("container_running"),
+            "restart_count": value.get("container_restart_count"),
+            "oom_killed": value.get("container_oom_killed"),
+        }
+        for label, value in metadata["services"].items()
     },
     "warnings": sorted(set(warnings)),
 }
@@ -321,11 +348,15 @@ lines = [
     "", "## GPU", "", f"- Samples: `{gpu['sample_count']}`",
     f"- Utilization average/P95/max: `{gpu['utilization_percent']['average']}` / `{gpu['utilization_percent']['p95']}` / `{gpu['utilization_percent']['maximum']}`",
     f"- Memory used max MiB: `{gpu['memory_used_mib']['maximum']}`",
-    "", "## Container", "", f"- Samples: `{container['sample_count']}`",
-    f"- CPU average/P95/max: `{container['cpu_percent']['average']}` / `{container['cpu_percent']['p95']}` / `{container['cpu_percent']['maximum']}`",
-    f"- Memory used max bytes: `{container['memory_used_bytes']['maximum']}`",
-    "", "## Warnings", "",
+    "", "## Containers", "",
 ]
+for label, container in containers.items():
+    lines.extend([
+        f"### {label}", "", f"- Samples: `{container['sample_count']}`",
+        f"- CPU average/P95/max: `{container['cpu_percent']['average']}` / `{container['cpu_percent']['p95']}` / `{container['cpu_percent']['maximum']}`",
+        f"- Memory used max bytes: `{container['memory_used_bytes']['maximum']}`", "",
+    ])
+lines.extend(["## Warnings", ""])
 lines.extend([f"- {warning}" for warning in report["warnings"]] or ["- None"])
 lines.extend(["", "Request throughput, latency, token rate, and cost remain in the separate local MT benchmark report.", ""])
 (run / "report.md").write_text("\n".join(lines))
@@ -400,7 +431,8 @@ validate_positive_integer MT_MONITOR_KEEP_DAYS "${KEEP_DAYS}"
 validate_positive_decimal MT_MONITOR_GPU_INTERVAL_SECONDS "${GPU_INTERVAL}"
 validate_positive_decimal MT_MONITOR_CONTAINER_INTERVAL_SECONDS "${CONTAINER_INTERVAL}"
 prepare_output
-resolve_container
+resolve_container "${GATEWAY_SERVICE}" GATEWAY_CONTAINER_ID
+resolve_container "${VLLM_SERVICE}" VLLM_CONTAINER_ID
 if ! nvidia-smi --id="${GPU_INDEX}" --query-gpu=index,name --format=csv,noheader,nounits >/dev/null 2>&1; then
   echo "Unable to query selected GPU index: ${GPU_INDEX}" >&2
   release_lock
@@ -414,15 +446,18 @@ PARTIAL_ARCHIVE="${ARCHIVE_PATH}.partial"
 STARTED_UTC="$(utc_now)"
 mkdir -- "${CURRENT_DIR}"
 : >"${CURRENT_DIR}/collector-errors.log"
-: >"${CURRENT_DIR}/service.log"
+: >"${CURRENT_DIR}/gateway-service.log"
+: >"${CURRENT_DIR}/vllm-service.log"
 write_metadata "" || { release_lock; exit 2; }
 
 trap 'finalize 0' INT TERM
 trap 'finalize $?' EXIT
 start_collector gpu_collector
 start_collector gpu_process_collector
-start_collector container_collector
-start_collector service_log_collector
+start_collector container_collector gateway "${GATEWAY_CONTAINER_ID}"
+start_collector container_collector vllm "${VLLM_CONTAINER_ID}"
+start_collector service_log_collector gateway "${GATEWAY_SERVICE}"
+start_collector service_log_collector vllm "${VLLM_SERVICE}"
 
 echo "MT benchmark monitor started."
 echo "Run ID: ${RUN_ID}"

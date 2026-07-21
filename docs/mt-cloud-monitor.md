@@ -1,11 +1,11 @@
 # MT 云端压测监控
 
-`scripts/monitor_mt_benchmark.sh` 在云服务器上观察现有 HY-MT 容器。它不会发送翻译请求，不会读取压测地址或密钥，也不会启动、重启、构建或修改服务。压测流量仍由另一台机器上的 `scripts/benchmark_mt.py` 产生。
+`scripts/monitor_mt_benchmark.sh` 在云服务器上同时观察 `hy-mt-api` 网关和 `hy-mt-vllm` 推理容器。它不会发送翻译请求，不会读取压测地址或密钥，也不会启动、重启、构建或修改服务。压测流量仍由另一台机器上的 `scripts/benchmark_mt.py` 产生。
 
 ## 前提
 
 - 在包含当前 Docker Compose 项目的仓库目录中执行。
-- Compose 服务默认名为 `hy-mt-api`，并且必须恰好有一个正在运行的容器。
+- Compose 服务默认名为 `hy-mt-api` 和 `hy-mt-vllm`，两者都必须已经运行，并且各自恰好有一个容器。
 - 主机已安装 Bash、Docker Compose v2、NVIDIA驱动工具、Python 3、tar和sha256sum。
 - 开始前确认应用的服务日志不会输出请求正文、译文或密钥。监控器会原样保存压测窗口内的服务日志，无法可靠清洗应用自行输出的敏感内容。
 
@@ -21,7 +21,8 @@ scripts/monitor_mt_benchmark.sh
 
 ## 默认配置
 
-- 服务：`hy-mt-api`
+- 网关服务：`hy-mt-api`
+- vLLM服务：`hy-mt-vllm`
 - GPU：`0`
 - 输出根目录：`/tmp/mt-monitor`
 - GPU和GPU进程采样：每`0.5`秒
@@ -31,7 +32,8 @@ scripts/monitor_mt_benchmark.sh
 
 可以在启动前设置以下环境变量覆盖默认值：
 
-- `MT_MONITOR_SERVICE`
+- `MT_MONITOR_GATEWAY_SERVICE`
+- `MT_MONITOR_VLLM_SERVICE`
 - `MT_MONITOR_GPU_INDEX`
 - `MT_MONITOR_OUTPUT_ROOT`
 - `MT_MONITOR_GPU_INTERVAL_SECONDS`
@@ -54,8 +56,10 @@ scripts/monitor_mt_benchmark.sh
 - `metadata.json`
 - `gpu.csv`
 - `gpu-processes.csv`
-- `container.csv`
-- `service.log`
+- `gateway-container.csv`
+- `vllm-container.csv`
+- `gateway-service.log`
+- `vllm-service.log`
 - `collector-errors.log`
 - `report.json`
 - `report.md`

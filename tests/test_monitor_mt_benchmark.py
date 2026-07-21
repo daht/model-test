@@ -24,8 +24,14 @@ def fake_tools(tmp_path: Path) -> tuple[Path, Path]:
 set -eu
 printf 'docker %s\n' "$*" >>"${FAKE_CALL_LOG}"
 if [[ "$1" == "compose" && "$2" == "ps" ]]; then
-  if [[ "${FAKE_CONTAINER_IDS:-mt-container}" != "__EMPTY__" ]]; then
-    printf '%b\n' "${FAKE_CONTAINER_IDS:-mt-container}"
+  service="${4:-}"
+  if [[ "${service}" == "hy-mt-api" ]]; then
+    ids="${FAKE_GATEWAY_IDS:-gateway-container}"
+  else
+    ids="${FAKE_VLLM_IDS:-vllm-container}"
+  fi
+  if [[ "${ids}" != "__EMPTY__" ]]; then
+    printf '%b\n' "${ids}"
   fi
 elif [[ "$1" == "inspect" ]]; then
   format="$3"
@@ -38,9 +44,13 @@ elif [[ "$1" == "inspect" ]]; then
     *) echo unknown ;;
   esac
 elif [[ "$1" == "stats" ]]; then
-  echo '12.5%|512MiB / 2GiB|25.0%|1kB / 2kB|3kB / 4kB|5'
+  if [[ "${@: -1}" == "gateway-container" ]]; then
+    echo '12.5%|512MiB / 2GiB|25.0%|1kB / 2kB|3kB / 4kB|5'
+  else
+    echo '75.0%|4GiB / 8GiB|50.0%|2kB / 4kB|6kB / 8kB|10'
+  fi
 elif [[ "$1" == "compose" && "$2" == "logs" ]]; then
-  echo '2026-07-20T00:00:01Z mt service log'
+  echo '2026-07-20T00:00:01Z service log'
   while true; do sleep 1; done
 else
   exit 1
@@ -121,7 +131,8 @@ def test_monitor_lifecycle_collects_reports_and_archive(tmp_path):
     process, output_root, call_log = start_monitor(tmp_path)
     started_output = wait_for_started(process)
     wait_for_data_row(output_root, "gpu.csv")
-    wait_for_data_row(output_root, "container.csv")
+    wait_for_data_row(output_root, "gateway-container.csv")
+    wait_for_data_row(output_root, "vllm-container.csv")
     process.send_signal(signal.SIGINT)
     stdout, _ = process.communicate(timeout=10)
 
@@ -133,8 +144,10 @@ def test_monitor_lifecycle_collects_reports_and_archive(tmp_path):
         "metadata.json",
         "gpu.csv",
         "gpu-processes.csv",
-        "container.csv",
-        "service.log",
+        "gateway-container.csv",
+        "vllm-container.csv",
+        "gateway-service.log",
+        "vllm-service.log",
         "collector-errors.log",
         "report.json",
         "report.md",
@@ -149,8 +162,13 @@ def test_monitor_lifecycle_collects_reports_and_archive(tmp_path):
     assert report["gpu"]["sample_count"] >= 1
     assert report["gpu"]["utilization_percent"]["maximum"] == 60.0
     assert report["gpu"]["memory_used_mib"]["maximum"] == 12000.0
-    assert report["container"]["cpu_percent"]["maximum"] == 12.5
-    assert report["container"]["memory_used_bytes"]["maximum"] == 512 * 1024**2
+    assert report["containers"]["gateway"]["cpu_percent"]["maximum"] == 12.5
+    assert report["containers"]["gateway"]["memory_used_bytes"]["maximum"] == 512 * 1024**2
+    assert report["containers"]["vllm"]["cpu_percent"]["maximum"] == 75.0
+    assert report["containers"]["vllm"]["memory_used_bytes"]["maximum"] == 4 * 1024**3
+    metadata = json.loads((run / "metadata.json").read_text())
+    assert metadata["services"]["gateway"]["service"] == "hy-mt-api"
+    assert metadata["services"]["vllm"]["service"] == "hy-mt-vllm"
 
     calls = call_log.read_text()
     assert "curl" not in calls
@@ -161,6 +179,7 @@ def test_monitor_lifecycle_collects_reports_and_archive(tmp_path):
     evidence = "".join(path.read_text(errors="replace") for path in run.iterdir() if path.is_file())
     assert "API_KEY" not in evidence
     assert "MT_BENCHMARK_URL" not in evidence
+    assert "118.195." not in evidence
     manifest = (run / "manifest.sha256").read_text()
     assert "report.json" in manifest
     assert "metadata.json" in manifest
@@ -168,7 +187,7 @@ def test_monitor_lifecycle_collects_reports_and_archive(tmp_path):
 
 
 def test_monitor_rejects_missing_container(tmp_path):
-    process, _, _ = start_monitor(tmp_path, FAKE_CONTAINER_IDS="__EMPTY__")
+    process, _, _ = start_monitor(tmp_path, FAKE_VLLM_IDS="__EMPTY__")
     stdout, _ = process.communicate(timeout=5)
 
     assert process.returncode == 2
@@ -176,7 +195,7 @@ def test_monitor_rejects_missing_container(tmp_path):
 
 
 def test_monitor_rejects_multiple_containers(tmp_path):
-    process, _, _ = start_monitor(tmp_path, FAKE_CONTAINER_IDS="one\\ntwo")
+    process, _, _ = start_monitor(tmp_path, FAKE_GATEWAY_IDS="one\\ntwo")
     stdout, _ = process.communicate(timeout=5)
 
     assert process.returncode == 2
@@ -213,8 +232,10 @@ def test_monitor_documentation_is_safe_and_complete():
     for value in (
         "scripts/monitor_mt_benchmark.sh",
         "hy-mt-api",
+        "hy-mt-vllm",
         "/tmp/mt-monitor",
-        "MT_MONITOR_SERVICE",
+        "MT_MONITOR_GATEWAY_SERVICE",
+        "MT_MONITOR_VLLM_SERVICE",
         "MT_MONITOR_GPU_INDEX",
         "MT_MONITOR_OUTPUT_ROOT",
         "MT_MONITOR_GPU_INTERVAL_SECONDS",
@@ -227,9 +248,12 @@ def test_monitor_documentation_is_safe_and_complete():
         "tar.gz",
         "不会发送翻译请求",
         "服务日志",
+        "gateway-container.csv",
+        "vllm-container.csv",
     ):
         assert value in documentation
     assert "API_KEY=" not in documentation
     assert "MT_BENCHMARK_URL=" not in documentation
     assert "http://" not in documentation
     assert "https://" not in documentation
+    assert "118.195." not in documentation
