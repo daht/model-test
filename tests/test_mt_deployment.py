@@ -11,8 +11,15 @@ def test_dockerfile_runs_two_uvicorn_workers():
     )
     command = json.loads(cmd_line.removeprefix("CMD "))
 
-    assert command[:3] == ["python", "-m", "uvicorn"]
-    assert command[3] == "app.main:app"
-    assert command.count("--workers") == 1
-    workers_index = command.index("--workers")
-    assert command[workers_index + 1] == "2"
+    assert command == [
+        "python",
+        "-m",
+        "uvicorn",
+        "app.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "--workers",
+        "2",
+    ]
