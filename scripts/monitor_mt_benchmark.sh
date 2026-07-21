@@ -244,6 +244,16 @@ stop_collectors() {
   PIDS=()
 }
 
+sanitize_service_logs() {
+  local label input temporary
+  for label in gateway vllm; do
+    input="${CURRENT_DIR}/${label}-service.log"
+    temporary="${input}.sanitized"
+    sed -E 's/([0-9]{1,3}\.){3}[0-9]{1,3}/[redacted-ip]/g' "${input}" >"${temporary}"
+    mv -- "${temporary}" "${input}"
+  done
+}
+
 generate_reports() {
   env RUN_DIR="${CURRENT_DIR}" python3 - <<'PY'
 import csv, json, math, re
@@ -396,9 +406,10 @@ finalize() {
   [[ ${FINALIZED} -eq 0 ]] || return 0
   FINALIZED=1
   trap - INT TERM EXIT
-  stop_collectors
-  finished_utc="$(utc_now)"
   final_status="${requested_status}"
+  stop_collectors
+  sanitize_service_logs || { record_error finalize log_sanitization_failed; final_status=1; }
+  finished_utc="$(utc_now)"
   write_metadata "${finished_utc}" || { record_error finalize metadata_failed; final_status=1; }
   generate_reports || { record_error finalize report_failed; final_status=1; }
   if [[ ${final_status} -eq 0 ]]; then

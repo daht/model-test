@@ -19,6 +19,16 @@ if [[ ! -f ".env" ]]; then
   exit 1
 fi
 
+if ! grep -qx 'MODEL_BACKEND=vllm' .env; then
+  echo "The deployment .env must contain MODEL_BACKEND=vllm."
+  exit 1
+fi
+
+if ! grep -Eq '^API_KEY=.+$' .env; then
+  echo "The deployment .env must contain a nonempty API_KEY."
+  exit 1
+fi
+
 if docker compose version >/dev/null 2>&1; then
   DOCKER=(docker)
 elif sudo docker compose version >/dev/null 2>&1; then

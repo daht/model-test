@@ -82,7 +82,9 @@ def _write_executable(path: Path, content: str) -> None:
 def _run_deploy_script(tmp_path: Path, include_env: bool = True):
     (tmp_path / "docker-compose.yml").write_text("services: {}\n")
     if include_env:
-        (tmp_path / ".env").write_text("API_KEY=test-only\n")
+        (tmp_path / ".env").write_text(
+            "API_KEY=test-only\nMODEL_BACKEND=vllm\n"
+        )
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     call_log = tmp_path / "calls.log"
@@ -157,3 +159,19 @@ def test_deploy_script_requires_environment_file(tmp_path):
     assert result.returncode != 0
     assert "Missing .env" in result.stdout
     assert not call_log.exists()
+
+
+def test_deploy_script_rejects_non_vllm_environment(tmp_path):
+    (tmp_path / "docker-compose.yml").write_text("services: {}\n")
+    (tmp_path / ".env").write_text(
+        "API_KEY=test-only\nMODEL_BACKEND=transformers\n"
+    )
+    result = subprocess.run(
+        ["bash", str(ROOT / "scripts" / "deploy_mt_vllm.sh")],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "MODEL_BACKEND=vllm" in result.stdout
