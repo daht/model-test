@@ -24,8 +24,9 @@ if ! grep -qx 'MODEL_BACKEND=vllm' .env; then
   exit 1
 fi
 
-if ! grep -Eq '^API_KEY=.+$' .env; then
-  echo "The deployment .env must contain a nonempty API_KEY."
+API_KEY_VALUE="$(sed -n 's/^API_KEY=//p' .env | tail -n 1)"
+if [[ ${#API_KEY_VALUE} -lt 32 ]]; then
+  echo "The deployment API_KEY must contain at least 32 characters."
   exit 1
 fi
 

@@ -83,7 +83,7 @@ def _run_deploy_script(tmp_path: Path, include_env: bool = True):
     (tmp_path / "docker-compose.yml").write_text("services: {}\n")
     if include_env:
         (tmp_path / ".env").write_text(
-            "API_KEY=test-only\nMODEL_BACKEND=vllm\n"
+            "API_KEY=0123456789abcdef0123456789abcdef\nMODEL_BACKEND=vllm\n"
         )
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -164,7 +164,7 @@ def test_deploy_script_requires_environment_file(tmp_path):
 def test_deploy_script_rejects_non_vllm_environment(tmp_path):
     (tmp_path / "docker-compose.yml").write_text("services: {}\n")
     (tmp_path / ".env").write_text(
-        "API_KEY=test-only\nMODEL_BACKEND=transformers\n"
+        "API_KEY=0123456789abcdef0123456789abcdef\nMODEL_BACKEND=transformers\n"
     )
     result = subprocess.run(
         ["bash", str(ROOT / "scripts" / "deploy_mt_vllm.sh")],
@@ -175,3 +175,17 @@ def test_deploy_script_rejects_non_vllm_environment(tmp_path):
 
     assert result.returncode != 0
     assert "MODEL_BACKEND=vllm" in result.stdout
+
+
+def test_deploy_script_rejects_short_api_key(tmp_path):
+    (tmp_path / "docker-compose.yml").write_text("services: {}\n")
+    (tmp_path / ".env").write_text("API_KEY=short\nMODEL_BACKEND=vllm\n")
+    result = subprocess.run(
+        ["bash", str(ROOT / "scripts" / "deploy_mt_vllm.sh")],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "at least 32 characters" in result.stdout
