@@ -25,8 +25,11 @@ class Settings(BaseSettings):
     app_name: str = "hy-mt-rest-api"
     model_name: str = "HY-MT1.5-1.8B"
     model_id: str = Field(default="HY-MT1.5-1.8B", description="Hugging Face id or local path")
-    model_backend: Literal["transformers", "mock"] = "transformers"
+    model_backend: Literal["transformers", "vllm", "mock"] = "transformers"
     model_task: Literal["causal-lm", "seq2seq-lm"] = "causal-lm"
+    vllm_base_url: str = Field(default="http://hy-mt-vllm:8000", min_length=1)
+    vllm_timeout_seconds: float = Field(default=120.0, gt=0, le=600)
+    vllm_model: str = Field(default="/models/Hy-MT2-1.8B", min_length=1)
     asr_model_name: str = "Qwen3-ASR-1.7B"
     asr_model_id: str = "/models/Qwen3-ASR-1.7B-hf"
     asr_require_model_manifest: bool = False
@@ -122,6 +125,14 @@ class Settings(BaseSettings):
         if value % 2:
             raise ValueError("asr_max_frame_bytes must be even for pcm_s16le")
         return value
+
+    @field_validator("vllm_base_url", "vllm_model")
+    @classmethod
+    def require_nonempty_vllm_setting(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("vLLM setting must not be empty")
+        return normalized
 
     @field_validator("asr_vad_model_sha256")
     @classmethod

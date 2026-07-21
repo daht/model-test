@@ -4,6 +4,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from threading import Lock
 
+import httpx
+
 from app.config import Settings
 from app.schemas import TranslateRequest
 
@@ -53,6 +55,67 @@ LANGUAGE_NAMES = {
 class Translator:
     def translate(self, request: TranslateRequest) -> str:
         raise NotImplementedError
+
+    def check_health(self) -> None:
+        return None
+
+
+class TranslationBackendTimeout(RuntimeError):
+    def __init__(self) -> None:
+        super().__init__("Translation backend timed out")
+
+
+class TranslationBackendUnavailable(RuntimeError):
+    def __init__(self) -> None:
+        super().__init__("Translation backend is unavailable")
+
+
+class VllmTranslator(Translator):
+    def __init__(self, settings: Settings, client: httpx.Client | None = None) -> None:
+        self.settings = settings
+        self._base_url = settings.vllm_base_url.rstrip("/")
+        self._client = client or httpx.Client(timeout=settings.vllm_timeout_seconds)
+
+    def translate(self, request: TranslateRequest) -> str:
+        payload = {
+            "model": self.settings.vllm_model,
+            "messages": [{"role": "user", "content": _build_prompt(request)}],
+            "max_tokens": self.settings.max_new_tokens,
+            "temperature": 0.7,
+            "top_p": 0.6,
+        }
+        try:
+            response = self._client.post(
+                f"{self._base_url}/v1/chat/completions",
+                json=payload,
+                timeout=self.settings.vllm_timeout_seconds,
+            )
+            response.raise_for_status()
+            content = response.json()["choices"][0]["message"]["content"]
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError
+            return content.strip()
+        except httpx.TimeoutException:
+            raise TranslationBackendTimeout() from None
+        except (
+            httpx.RequestError,
+            httpx.HTTPStatusError,
+            ValueError,
+            KeyError,
+            IndexError,
+            TypeError,
+        ):
+            raise TranslationBackendUnavailable() from None
+
+    def check_health(self) -> None:
+        try:
+            response = self._client.get(
+                f"{self._base_url}/health",
+                timeout=self.settings.vllm_timeout_seconds,
+            )
+            response.raise_for_status()
+        except Exception:
+            raise TranslationBackendUnavailable() from None
 
 
 @dataclass
@@ -109,7 +172,7 @@ class TransformersTranslator(Translator):
             assert self._tokenizer is not None
             assert self._model is not None
 
-            prompt = self._build_prompt(request)
+            prompt = _build_prompt(request)
             messages = [{"role": "user", "content": prompt}]
             model_inputs = self._tokenizer.apply_chat_template(
                 messages,
@@ -136,29 +199,30 @@ class TransformersTranslator(Translator):
             generated_ids = outputs[0][prompt_length:]
             return self._tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
 
-    @staticmethod
-    def _build_prompt(request: TranslateRequest) -> str:
-        target_english_name, target_chinese_name = _language_names(request.target_lang)
-
-        if request.source_lang.startswith("zh"):
-            lines = [
-                f"将以下文本翻译为{target_chinese_name}，注意只需要输出翻译后的结果，不要额外解释：",
-            ]
-        else:
-            lines = [
-                f"Translate the following segment into {target_english_name}, without additional explanation.",
-            ]
-        if request.glossary:
-            for source, target in request.glossary.items():
-                lines.append(f"{source} => {target}")
-        lines.extend(["", request.text])
-        return "\n".join(lines)
-
-
 def create_translator(settings: Settings) -> Translator:
     if settings.model_backend == "mock":
         return MockTranslator()
+    if settings.model_backend == "vllm":
+        return VllmTranslator(settings)
     return TransformersTranslator(settings)
+
+
+def _build_prompt(request: TranslateRequest) -> str:
+    target_english_name, target_chinese_name = _language_names(request.target_lang)
+
+    if request.source_lang.startswith("zh"):
+        lines = [
+            f"将以下文本翻译为{target_chinese_name}，注意只需要输出翻译后的结果，不要额外解释：",
+        ]
+    else:
+        lines = [
+            f"Translate the following segment into {target_english_name}, without additional explanation.",
+        ]
+    if request.glossary:
+        for source, target in request.glossary.items():
+            lines.append(f"{source} => {target}")
+    lines.extend(["", request.text])
+    return "\n".join(lines)
 
 
 def _language_names(language_code: str) -> tuple[str, str]:

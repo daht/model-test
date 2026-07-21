@@ -1,8 +1,13 @@
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException, status
 
 from app.auth import require_api_key
 from app.config import Settings, get_settings
-from app.model import Translator, create_translator
+from app.model import (
+    TranslationBackendTimeout,
+    TranslationBackendUnavailable,
+    Translator,
+    create_translator,
+)
 from app.schemas import HealthResponse, TranslateRequest, TranslateResponse
 
 settings = get_settings()
@@ -20,7 +25,17 @@ def get_translator() -> Translator:
 
 
 @app.get("/health", response_model=HealthResponse)
-def health(current_settings: Settings = Depends(get_settings)) -> HealthResponse:
+def health(
+    current_settings: Settings = Depends(get_settings),
+    current_translator: Translator = Depends(get_translator),
+) -> HealthResponse:
+    try:
+        current_translator.check_health()
+    except TranslationBackendUnavailable:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Translation backend is not ready",
+        ) from None
     return HealthResponse(
         status="ok",
         model=current_settings.model_name,
@@ -38,7 +53,18 @@ def translate(
     current_settings: Settings = Depends(get_settings),
     current_translator: Translator = Depends(get_translator),
 ) -> TranslateResponse:
-    translated_text = current_translator.translate(request)
+    try:
+        translated_text = current_translator.translate(request)
+    except TranslationBackendTimeout:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="Translation backend timed out",
+        ) from None
+    except TranslationBackendUnavailable:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Translation backend is unavailable",
+        ) from None
     return TranslateResponse(
         translation=translated_text,
         source_lang=request.source_lang,
