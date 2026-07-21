@@ -2,6 +2,10 @@
 
 `scripts/benchmark_mt.py` 从本机发起真实 HTTP 请求，经过翻译服务的鉴权、FastAPI、排队和模型推理链路。它用于确定独立单张 A10 在指定延迟与错误率门槛下的可持续容量，并计算每 1,000,000 个源文本 Unicode 字符的 GPU 成本。
 
+## 实测报告
+
+- [HY-MT1.5-1.8B 双 Worker A10 容量与成本评估（Markdown）](mt-a10-dual-worker-capacity-evaluation-2026-07-21.md)
+
 ## 前提
 
 - 目标服务运行真实 HY-MT 模型，不能使用 `mock` 后端作为商业容量证据。
