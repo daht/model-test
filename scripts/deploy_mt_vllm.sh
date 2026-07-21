@@ -47,7 +47,7 @@ wait_for_vllm() {
   local deadline=$((SECONDS + HEALTH_TIMEOUT_SECONDS))
   echo "Waiting for ${VLLM_SERVICE} readiness..."
   while (( SECONDS < deadline )); do
-    if compose exec -T "${VLLM_SERVICE}" python -c \
+    if compose exec -T "${VLLM_SERVICE}" python3 -c \
       "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).read()" \
       >/dev/null 2>&1; then
       return 0

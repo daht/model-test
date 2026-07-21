@@ -45,6 +45,8 @@ def test_compose_uses_a10_vllm_limits_and_healthcheck():
     ]
     healthcheck = " ".join(service["healthcheck"]["test"])
     assert "127.0.0.1:8000/health" in healthcheck
+    assert "python3 -c" in healthcheck
+    assert "python -c" not in healthcheck
 
 
 def test_gateway_dependency_is_optional_outside_vllm_profile():
@@ -143,6 +145,8 @@ def test_deploy_script_starts_vllm_before_rebuilding_gateway(tmp_path):
         positions.append(next(index for index, call in enumerate(calls) if expected in call))
     assert positions == sorted(positions)
     evidence = "\n".join(calls)
+    assert "exec -T hy-mt-vllm python3 -c" in evidence
+    assert "exec -T hy-mt-vllm python -c" not in evidence
     for forbidden in (
         "qwen-asr-api",
         "cosyvoice-tts-api",
