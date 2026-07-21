@@ -69,7 +69,7 @@ def test_mt_vllm_environment_example_is_safe_and_focused():
         assert expected in content
     api_key_line = next(line for line in content.splitlines() if line.startswith("API_KEY="))
     assert api_key_line == "API_KEY="
-    assert "118.195." not in content
+    assert "198.51.100." not in content
     assert "ASR_" not in content
     assert "TTS_" not in content
 

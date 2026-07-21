@@ -50,7 +50,7 @@ elif [[ "$1" == "stats" ]]; then
     echo '75.0%|4GiB / 8GiB|50.0%|2kB / 4kB|6kB / 8kB|10'
   fi
 elif [[ "$1" == "compose" && "$2" == "logs" ]]; then
-  echo '2026-07-20T00:00:01Z 118.195.185.141:54321 service log'
+  echo '2026-07-20T00:00:01Z 198.51.100.42:54321 service log'
   while true; do sleep 1; done
 else
   exit 1
@@ -179,7 +179,7 @@ def test_monitor_lifecycle_collects_reports_and_archive(tmp_path):
     evidence = "".join(path.read_text(errors="replace") for path in run.iterdir() if path.is_file())
     assert "API_KEY" not in evidence
     assert "MT_BENCHMARK_URL" not in evidence
-    assert "118.195." not in evidence
+    assert "198.51.100." not in evidence
     assert "[redacted-ip]" in evidence
     manifest = (run / "manifest.sha256").read_text()
     assert "report.json" in manifest
@@ -257,4 +257,4 @@ def test_monitor_documentation_is_safe_and_complete():
     assert "MT_BENCHMARK_URL=" not in documentation
     assert "http://" not in documentation
     assert "https://" not in documentation
-    assert "118.195." not in documentation
+    assert "198.51.100." not in documentation

@@ -436,7 +436,7 @@ transport chunks, HY-MT resident, and environment-only credentials:
 PATH="/tmp/asr-validation-tools:$PATH" \
 PYTHON_BIN="$PWD/.venv/bin/python" \
 CONCURRENCY=2 AUDIO_FILE="$PWD/123.wav" \
-WS_URL=ws://118.195.185.141:8002/v1/transcribe/stream \
+WS_URL="${WS_URL:?set the test WebSocket URL in the environment}" \
 LANGUAGE=zh CHUNK_MS=200 REALTIME=1 VERIFY_PROTOCOL=0 \
 OUTPUT_DIR=/tmp/asr-fw-coalescing-c2 \
 scripts/test_asr_concurrency.sh
