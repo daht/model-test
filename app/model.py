@@ -114,7 +114,7 @@ class VllmTranslator(Translator):
                 timeout=self.settings.vllm_timeout_seconds,
             )
             response.raise_for_status()
-        except Exception:
+        except httpx.HTTPError:
             raise TranslationBackendUnavailable() from None
 
 

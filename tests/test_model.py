@@ -236,3 +236,13 @@ def test_vllm_health_classifies_network_errors_as_unavailable():
         translator.check_health()
 
     assert str(exc_info.value) == "Translation backend is unavailable"
+
+
+def test_vllm_health_does_not_hide_programming_errors():
+    def handler(request):
+        raise RuntimeError("test programming error")
+
+    translator = _vllm_translator(handler)
+
+    with pytest.raises(RuntimeError, match="test programming error"):
+        translator.check_health()
