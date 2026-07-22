@@ -86,6 +86,7 @@ and includes the upstream MIT license. Runtime startup never downloads VAD asset
 - `scripts/update_service.sh`: update/recreate the cloud Docker service.
 - `cloud/README-A10.md`: A10-specific deployment runbook.
 - `docs/mt-capacity-cost-benchmark.md`: real HTTP MT capacity and per-million-source-character GPU cost benchmark.
+- `docs/mt-vllm-a10-capacity-evaluation-2026-07-22.md`: Hy-MT2/vLLM A10 capacity boundary, bottleneck, cost, and one-hour soak evidence.
 - `docs/mt-cloud-monitor.md`: monitor-only cloud evidence collection for MT capacity benchmarks.
 
 ## Deploy to Your A10 Cloud Server
@@ -95,7 +96,7 @@ Assumptions:
 - Server OS: Ubuntu 22.04 LTS
 - GPU: NVIDIA A10 24GB
 - SSH user can run `sudo`
-- The firewall/security group allows inbound `22` and `8000`
+- The firewall/security group allows inbound `22`; expose `8000` only to an approved load generator or reverse proxy, never broadly to the public internet
 
 On the server, install Docker, NVIDIA driver, and NVIDIA Container Toolkit:
 
