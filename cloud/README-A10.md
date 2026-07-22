@@ -272,6 +272,8 @@ ASR_SHUTDOWN_GRACE_SECONDS=10.0
 TTS_BACKEND=cosyvoice
 TTS_MODEL_ID=/models/CosyVoice
 TTS_COSYVOICE_REPO=/opt/CosyVoice
+TTS_PROMPT_TEXT=You are a helpful assistant.<|endofprompt|>希望你以后能够做的比我还好呦。
+TTS_PROMPT_WAV=/opt/CosyVoice/asset/zero_shot_prompt.wav
 TTS_SAMPLE_RATE=24000
 ```
 

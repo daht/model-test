@@ -86,6 +86,7 @@ and includes the upstream MIT license. Runtime startup never downloads VAD asset
 - `scripts/update_service.sh`: update/recreate the cloud Docker service.
 - `cloud/README-A10.md`: A10-specific deployment runbook.
 - `docs/mt-capacity-cost-benchmark.md`: real HTTP MT capacity and per-million-source-character GPU cost benchmark.
+- `docs/tts-capacity-cost-benchmark.md`: real HTTP TTS capacity and per-million-audio-second GPU cost benchmark.
 - `docs/mt-vllm-a10-capacity-evaluation-2026-07-22.md`: Hy-MT2/vLLM A10 capacity boundary, bottleneck, cost, and one-hour soak evidence.
 - `docs/mt-cloud-monitor.md`: monitor-only cloud evidence collection for MT capacity benchmarks.
 - `docs/asr-mt-commercial-cost-report-2026-07-22.md`: million-user ASR + MT capacity, deployment count, and GPU-only cost report (Markdown).
@@ -227,6 +228,8 @@ ASR_VAD_PRE_ROLL_MS=200
 TTS_MODEL_ID=/models/CosyVoice
 TTS_BACKEND=cosyvoice
 TTS_COSYVOICE_REPO=/opt/CosyVoice
+TTS_PROMPT_TEXT=You are a helpful assistant.<|endofprompt|>希望你以后能够做的比我还好呦。
+TTS_PROMPT_WAV=/opt/CosyVoice/asset/zero_shot_prompt.wav
 TTS_SAMPLE_RATE=24000
 ```
 

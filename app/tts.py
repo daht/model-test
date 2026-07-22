@@ -53,12 +53,18 @@ class CosyVoiceTTSSynthesizer(TTSSynthesizer):
                 if repo_path not in sys.path:
                     sys.path.insert(0, repo_path)
 
-            try:
-                from cosyvoice.cli.cosyvoice import CosyVoice2 as CosyVoiceModel
-            except ImportError:
-                from cosyvoice.cli.cosyvoice import CosyVoice as CosyVoiceModel
+            from cosyvoice.cli.cosyvoice import AutoModel
 
-            self._model = CosyVoiceModel(self.settings.tts_model_id)
+            self._model = AutoModel(model_dir=self.settings.tts_model_id)
+            if not hasattr(self._model, "add_zero_shot_spk"):
+                raise RuntimeError("CosyVoice model does not support zero-shot speakers")
+            added = self._model.add_zero_shot_spk(
+                self.settings.tts_prompt_text,
+                self.settings.tts_prompt_wav,
+                self.settings.tts_default_voice,
+            )
+            if added is not True:
+                raise RuntimeError("failed to register the default zero-shot speaker")
         except Exception as exc:
             self._load_error = exc
             raise RuntimeError(f"CosyVoice backend is unavailable: {exc}") from exc
@@ -72,9 +78,17 @@ class CosyVoiceTTSSynthesizer(TTSSynthesizer):
             return _cosyvoice_result_to_wav(inference, sample_rate=self.settings.tts_sample_rate)
 
     def _select_inference(self, text: str, voice: str):
-        if not hasattr(self._model, "inference_sft"):
-            raise RuntimeError("CosyVoice model does not expose inference_sft")
-        return self._model.inference_sft(text, voice, stream=False)
+        if voice != self.settings.tts_default_voice:
+            raise RuntimeError(f"unknown TTS voice: {voice}")
+        if not hasattr(self._model, "inference_zero_shot"):
+            raise RuntimeError("CosyVoice model does not expose zero-shot inference")
+        return self._model.inference_zero_shot(
+            text,
+            "",
+            "",
+            zero_shot_spk_id=voice,
+            stream=False,
+        )
 
 
 def create_tts_synthesizer(settings: Settings) -> TTSSynthesizer:
@@ -99,13 +113,24 @@ def _cosyvoice_result_to_wav(result, sample_rate: int) -> bytes:
             return result
         return _wav_bytes(result, sample_rate=sample_rate)
 
+    pcm_chunks = []
     for chunk in result:
         audio = chunk.get("tts_speech") if isinstance(chunk, dict) else chunk
         if hasattr(audio, "detach"):
             audio = audio.detach().cpu().numpy()
-        if hasattr(audio, "tobytes"):
-            return _wav_bytes(audio.tobytes(), sample_rate=sample_rate)
         if isinstance(audio, bytes):
-            return _wav_bytes(audio, sample_rate=sample_rate)
+            pcm_chunks.append(audio)
+            continue
+        if hasattr(audio, "dtype"):
+            import numpy as np
 
-    raise RuntimeError("CosyVoice did not return audio")
+            samples = np.asarray(audio).reshape(-1)
+            if samples.dtype.kind == "f":
+                samples = (np.clip(samples, -1.0, 1.0) * 32767).astype("<i2")
+            else:
+                samples = samples.astype("<i2")
+            pcm_chunks.append(samples.tobytes())
+
+    if not pcm_chunks:
+        raise RuntimeError("CosyVoice did not return audio")
+    return _wav_bytes(b"".join(pcm_chunks), sample_rate=sample_rate)

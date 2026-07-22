@@ -117,6 +117,10 @@ class Settings(BaseSettings):
     tts_max_text_chars: int = 1000
     tts_default_voice: str = "default"
     tts_cosyvoice_repo: str | None = "/opt/CosyVoice"
+    tts_prompt_text: str = (
+        "You are a helpful assistant.<|endofprompt|>希望你以后能够做的比我还好呦。"
+    )
+    tts_prompt_wav: str = "/opt/CosyVoice/asset/zero_shot_prompt.wav"
     trust_remote_code: bool = True
 
     @field_validator("asr_max_frame_bytes")
