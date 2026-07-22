@@ -46,6 +46,15 @@ target/
 /.worktrees/
 /sony-member-trade-starter/src/main/resources/application-local.yml
 /docs/superpowers/
+
+# Commercial capacity/cost reports are local deliverables, not repository artifacts.
+/docs/asr-mt-commercial-cost-report-2026-07-22.*
+/docs/asr-mt-commercial-cost-report-design.md
+/docs/asr-mt-commercial-cost-report-implementation-plan.md
+/docs/mt-a10-dual-worker-capacity-evaluation-2026-07-21.*
+/docs/mt-capacity-cost-benchmark*.md
+/docs/mt-capacity-cost-benchmark*.html
+/docs/million-user-cost-report.html
 /.test/
 /.venv/
 
