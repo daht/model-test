@@ -88,6 +88,7 @@ and includes the upstream MIT license. Runtime startup never downloads VAD asset
 - `docs/mt-capacity-cost-benchmark.md`: real HTTP MT capacity and per-million-source-character GPU cost benchmark.
 - `docs/mt-vllm-a10-capacity-evaluation-2026-07-22.md`: Hy-MT2/vLLM A10 capacity boundary, bottleneck, cost, and one-hour soak evidence.
 - `docs/mt-cloud-monitor.md`: monitor-only cloud evidence collection for MT capacity benchmarks.
+- `docs/asr-mt-commercial-cost-report-2026-07-22.md`: million-user ASR + MT capacity, deployment count, and GPU-only cost report (Markdown).
 
 ## Deploy to Your A10 Cloud Server
 
