@@ -28,6 +28,12 @@ RUN python -m pip install --upgrade pip \
 
 COPY CosyVoice /opt/CosyVoice
 RUN python -m pip install \
+      "setuptools<81" \
+      wheel \
+      --index-url "${PIP_INDEX_URL}" \
+      --trusted-host "${PIP_TRUSTED_HOST}" \
+    && python -m pip install \
+      --no-build-isolation \
       --index-url "${PIP_INDEX_URL}" \
       --trusted-host "${PIP_TRUSTED_HOST}" \
       -r /opt/CosyVoice/requirements.txt
