@@ -11,6 +11,7 @@ ARG PIP_TRUSTED_HOST=mirrors.aliyun.com
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+      build-essential \
       ffmpeg \
       git \
       libsndfile1 \
