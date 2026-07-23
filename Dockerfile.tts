@@ -33,6 +33,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     python -m pip install \
       "setuptools<81" \
       wheel \
+      numpy==1.26.4 \
       --index-url "${PIP_INDEX_URL}" \
       --trusted-host "${PIP_TRUSTED_HOST}" \
     && python -m pip install \
