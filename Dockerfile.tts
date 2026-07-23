@@ -2,7 +2,6 @@ FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
     PYTHONPATH=/opt/CosyVoice:/opt/CosyVoice/third_party/Matcha-TTS
 
 WORKDIR /app
@@ -19,15 +18,18 @@ RUN apt-get update \
       sox \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt requirements-tts-cosyvoice.txt ./
-RUN python -m pip install --upgrade pip \
+COPY requirements.txt requirements-tts-cosyvoice.txt requirements-tts-constraints.txt ./
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m pip install --upgrade pip \
     && python -m pip install \
       --index-url "${PIP_INDEX_URL}" \
       --trusted-host "${PIP_TRUSTED_HOST}" \
+      --constraint requirements-tts-constraints.txt \
       -r requirements.txt
 
 COPY CosyVoice /opt/CosyVoice
-RUN python -m pip install \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m pip install \
       "setuptools<81" \
       wheel \
       --index-url "${PIP_INDEX_URL}" \
@@ -36,7 +38,14 @@ RUN python -m pip install \
       --no-build-isolation \
       --index-url "${PIP_INDEX_URL}" \
       --trusted-host "${PIP_TRUSTED_HOST}" \
-      -r requirements-tts-cosyvoice.txt
+      --constraint requirements-tts-constraints.txt \
+      -r requirements-tts-cosyvoice.txt \
+    && python -m pip install \
+      --no-build-isolation \
+      --no-deps \
+      --index-url "${PIP_INDEX_URL}" \
+      --trusted-host "${PIP_TRUSTED_HOST}" \
+      openai-whisper==20231117
 
 COPY app ./app
 
