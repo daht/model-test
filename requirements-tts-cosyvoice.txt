@@ -1,3 +1,4 @@
+conformer==0.3.2
 HyperPyYAML==1.2.3
 inflect==7.3.1
 modelscope==1.20.0
