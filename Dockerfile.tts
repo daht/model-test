@@ -49,6 +49,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
       --trusted-host "${PIP_TRUSTED_HOST}" \
       openai-whisper==20231117
 
+RUN python -c "import cosyvoice.cli.cosyvoice; import cosyvoice.dataset.processor; import cosyvoice.flow.flow; import cosyvoice.flow.flow_matching; import cosyvoice.flow.DiT.dit; import cosyvoice.hifigan.discriminator; import cosyvoice.hifigan.f0_predictor; import cosyvoice.hifigan.generator; import cosyvoice.llm.llm; import cosyvoice.tokenizer.tokenizer; import matcha.hifigan.models; import matcha.utils.audio"
+
 COPY app ./app
 
 EXPOSE 8000
