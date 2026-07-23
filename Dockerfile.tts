@@ -3,12 +3,12 @@ FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PYTHONPATH=/opt/CosyVoice
+    PYTHONPATH=/opt/CosyVoice:/opt/CosyVoice/third_party/Matcha-TTS
 
 WORKDIR /app
 
-ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
-ARG PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
+ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
+ARG PIP_TRUSTED_HOST=mirrors.aliyun.com
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -19,7 +19,7 @@ RUN apt-get update \
       sox \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
+COPY requirements.txt requirements-tts-cosyvoice.txt ./
 RUN python -m pip install --upgrade pip \
     && python -m pip install \
       --index-url "${PIP_INDEX_URL}" \
@@ -27,8 +27,6 @@ RUN python -m pip install --upgrade pip \
       -r requirements.txt
 
 COPY CosyVoice /opt/CosyVoice
-RUN sed '/^tensorrt-cu12/d' /opt/CosyVoice/requirements.txt \
-      > /tmp/cosyvoice-requirements.txt
 RUN python -m pip install \
       "setuptools<81" \
       wheel \
@@ -38,7 +36,7 @@ RUN python -m pip install \
       --no-build-isolation \
       --index-url "${PIP_INDEX_URL}" \
       --trusted-host "${PIP_TRUSTED_HOST}" \
-      -r /tmp/cosyvoice-requirements.txt
+      -r requirements-tts-cosyvoice.txt
 
 COPY app ./app
 

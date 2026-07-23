@@ -1,0 +1,14 @@
+HyperPyYAML==1.2.3
+inflect==7.3.1
+modelscope==1.20.0
+numpy==1.26.4
+omegaconf==2.3.0
+onnxruntime==1.18.0
+openai-whisper==20231117
+pyarrow==18.1.0
+pyworld==0.3.4
+torchaudio==2.5.1
+tqdm==4.67.1
+transformers==4.51.3
+wetext==0.0.4
+x-transformers==2.11.24
