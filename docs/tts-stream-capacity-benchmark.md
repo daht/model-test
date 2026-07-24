@@ -2,6 +2,8 @@
 
 本轮先评估 `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` 在 A10 单卡上的真实流式容量。测试分为客户端负载和 A10 服务端监控，两端时间范围必须重叠。
 
+2026-07-24 首轮闭环/开环扫描与服务端瓶颈分析已完成，结果见 [CosyVoice 3 在 NVIDIA A10 上的 WebSocket 流式容量与瓶颈评估](tts-cosyvoice3-a10-capacity-evaluation-2026-07-24.md)。当前实现因全局推理锁和约 4 秒模型输出块，尚未达到临时交互 SLO；本文保留为优化后复测的执行入口。
+
 ## 工具
 
 - `scripts/benchmark_tts_stream.py`：从独立客户端发送 MiniMax 风格 WebSocket 请求，支持闭环并发和开环泊松到达率。
