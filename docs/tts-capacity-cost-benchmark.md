@@ -1,5 +1,7 @@
 # TTS 容量与成本压测
 
+> 本文只覆盖 HTTP 完整 WAV 基线。WS/WSS 真流式协议、TTFA、分块平滑度和 A10 三模型容量评估见 [A10 单卡 TTS WebSocket 流式容量测试方案](tts-a10-websocket-streaming-test-plan.md)。
+
 脚本 `scripts/benchmark_tts.py` 对已部署的 TTS HTTP 接口
 `POST /v1/tts` 做真实并发压测。每条语料是一行 JSON：
 

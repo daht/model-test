@@ -34,9 +34,10 @@ HTTP APIs require this header:
 X-API-Key: <your-api-key>
 ```
 
-ASR WebSocket streaming authenticates the HTTP upgrade with `X-API-Key`; do
-not put credentials in the ASR `start` JSON. The TTS WebSocket protocol retains
-its separate authentication and completion semantics documented below.
+ASR WebSocket streaming authenticates the HTTP upgrade with `X-API-Key`. TTS
+WebSocket streaming authenticates the upgrade with `Authorization: Bearer
+<your-api-key>` and also accepts `X-API-Key`. Do not put credentials in a
+WebSocket JSON message.
 
 Production `qwen` and `qwen_vllm` configuration fails closed unless `API_KEY`
 is at least 32 characters and is not a known placeholder. Generate it with
@@ -424,50 +425,46 @@ Use this endpoint when the client wants to send text incrementally and receive a
 wss://tts-api.example.com/v1/tts/stream
 ```
 
-First client message must be JSON:
+Authenticate the WebSocket upgrade with `Authorization: Bearer <your-api-key>`.
+The server first returns `connected_success`. Start the task with JSON:
 
 ```json
 {
-  "type": "start",
-  "api_key": "<your-api-key>",
-  "voice": "default",
-  "sample_rate": 24000,
-  "format": "wav"
+  "event": "task_start",
+  "model": "Fun-CosyVoice3-0.5B-2512",
+  "voice_setting": {"voice_id": "default"},
+  "audio_setting": {
+    "sample_rate": 24000,
+    "format": "pcm",
+    "channel": 1
+  },
+  "stream_options": {"audio_transport": "hex"}
 }
 ```
 
-Server ready response:
+The server responds with `task_started`. Send one or more text events:
 
 ```json
-{
-  "type": "ready"
-}
+{"event":"task_continue","text":"你好，欢迎使用我们的产品。"}
 ```
 
-Then send text as JSON:
+Each `task_continued` response contains a PCM chunk as hex in
+`data.audio`. Finish the input with:
 
 ```json
-{
-  "type": "text",
-  "text": "你好，欢迎使用我们的产品。"
-}
+{"event":"task_finish"}
 ```
 
-The server returns a binary WAV audio chunk for each text message. End the stream:
+The server returns `task_finished` after all audio chunks, then closes normally.
+For lower transport and decoding overhead, request binary mode:
 
 ```json
-{
-  "type": "end"
-}
+{"stream_options":{"audio_transport":"binary"}}
 ```
 
-Server done response:
-
-```json
-{
-  "type": "done"
-}
-```
+Each binary message is `TTS1` + little-endian uint32 chunk sequence +
+little-endian uint64 sample offset + mono 24 kHz pcm_s16le. See
+`docs/tts-a10-websocket-streaming-test-plan.md` for the complete protocol.
 
 ## Python Examples
 

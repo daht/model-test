@@ -514,31 +514,30 @@ TTS WebSocket streaming protocol:
 WS ws://localhost:8003/v1/tts/stream
 ```
 
-Client sends a JSON start message:
+Authenticate the WebSocket upgrade with `Authorization: Bearer
+your-production-api-key`. The server returns `connected_success`; then start a
+task:
 
 ```json
 {
-  "type": "start",
-  "api_key": "your-production-api-key",
-  "voice": "default",
-  "sample_rate": 24000,
-  "format": "wav"
+  "event": "task_start",
+  "model": "Fun-CosyVoice3-0.5B-2512",
+  "voice_setting": {"voice_id": "default"},
+  "audio_setting": {"sample_rate": 24000, "format": "pcm", "channel": 1},
+  "stream_options": {"audio_transport": "binary"}
 }
 ```
 
-The server returns `{"type":"ready"}`. Send text messages as either plain text or JSON:
+After `task_started`, send one or more text events followed by `task_finish`:
 
 ```json
-{"type":"text","text":"你好，欢迎使用我们的产品。"}
+{"event":"task_continue","text":"你好，欢迎使用我们的产品。"}
+{"event":"task_finish"}
 ```
 
-For each text message, the server returns one binary WAV audio chunk. End the stream with:
-
-```json
-{"type":"end"}
-```
-
-The server sends `{"type":"done"}` and closes the WebSocket.
+Binary mode returns true streaming mono 24 kHz pcm_s16le frames as they are
+generated. Hex compatibility mode returns `task_continued.data.audio`. The
+server sends `task_finished` after all audio and closes the WebSocket.
 
 ## Local Test Mode
 

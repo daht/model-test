@@ -96,8 +96,9 @@ class TTSHealthResponse(BaseModel):
 class TTSInfoResponse(BaseModel):
     websocket_url: str
     http_endpoint: str
-    audio_format: dict[str, int | str]
-    start_message: dict[str, int | str]
-    text_message: dict[str, str]
-    end_message: dict[str, str]
-    server_messages: list[dict[str, str]]
+    authentication: dict[str, str]
+    task_start: dict[str, object]
+    task_continue: dict[str, str]
+    task_finish: dict[str, str]
+    server_events: list[str]
+    audio_transports: list[str]

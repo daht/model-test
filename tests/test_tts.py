@@ -43,7 +43,32 @@ def test_cosyvoice3_is_selected_by_official_automodel_and_zero_shot_registered(m
     assert calls["model_dir"] == {"model_dir": "/models/CosyVoice"}
     assert calls["speaker"][2] == "default"
     assert calls["inference"][3]["zero_shot_spk_id"] == "default"
+    assert calls["inference"][3]["stream"] is True
     assert audio.startswith(b"RIFF")
+
+
+def test_cosyvoice_stream_pcm_yields_before_inference_finishes(tmp_path):
+    events = []
+
+    class FakeModel:
+        def inference_zero_shot(self, *args, **kwargs):
+            assert kwargs["stream"] is True
+            events.append("started")
+            yield {"tts_speech": np.array([[0.25]], dtype=np.float32)}
+            events.append("continued")
+            yield {"tts_speech": np.array([[-0.25]], dtype=np.float32)}
+            events.append("finished")
+
+    synthesizer = CosyVoiceTTSSynthesizer(_settings(tmp_path))
+    synthesizer._model = FakeModel()
+    stream = synthesizer.stream_pcm("hello")
+
+    first = next(stream)
+
+    assert first == np.array([0.25 * 32767], dtype="<i2").tobytes()
+    assert events == ["started"]
+    assert list(stream)
+    assert events == ["started", "continued", "finished"]
 
 
 def test_unknown_voice_is_rejected():

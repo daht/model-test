@@ -1,8 +1,13 @@
+import asyncio
+import json
 import os
+import struct
+from threading import Event
 
 from fastapi.testclient import TestClient
 
 os.environ["API_KEY"] = "test-key"
+os.environ["ASR_BACKEND"] = "mock"
 os.environ["TTS_BACKEND"] = "mock"
 os.environ["TTS_MAX_TEXT_CHARS"] = "12"
 
@@ -10,23 +15,40 @@ from app.config import get_settings  # noqa: E402
 
 get_settings.cache_clear()
 
-from app.tts_api import app  # noqa: E402
+from app.tts_api import _stream_pcm_in_thread, app  # noqa: E402
 
 
 client = TestClient(app)
 
 
-def _start_stream(websocket, api_key: str = "test-key") -> dict:
+def _connect(api_key: str = "test-key"):
+    return client.websocket_connect(
+        "/v1/tts/stream",
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+
+
+def _start_task(websocket, transport: str = "hex") -> None:
+    connected = websocket.receive_json()
+    assert connected["event"] == "connected_success"
+    assert connected["base_resp"] == {"status_code": 0, "status_msg": "success"}
+
     websocket.send_json(
         {
-            "type": "start",
-            "api_key": api_key,
-            "voice": "default",
-            "sample_rate": 24000,
-            "format": "wav",
+            "event": "task_start",
+            "model": "CosyVoice",
+            "voice_setting": {"voice_id": "default"},
+            "audio_setting": {
+                "sample_rate": 24000,
+                "format": "pcm",
+                "channel": 1,
+            },
+            "stream_options": {"audio_transport": transport},
         }
     )
-    return websocket.receive_json()
+    started = websocket.receive_json()
+    assert started["event"] == "task_started"
+    assert started["base_resp"] == {"status_code": 0, "status_msg": "success"}
 
 
 def test_tts_health_reports_model_name():
@@ -71,43 +93,109 @@ def test_tts_rejects_text_that_exceeds_configured_limit():
 
 
 def test_tts_stream_rejects_bad_api_key():
-    with client.websocket_connect("/v1/tts/stream") as websocket:
-        ready = _start_stream(websocket, api_key="bad-key")
+    with _connect(api_key="bad-key") as websocket:
+        failed = websocket.receive_json()
 
-        assert ready == {
-            "type": "error",
-            "message": "Invalid or missing API key",
-        }
-
-
-def test_tts_stream_text_returns_binary_audio_chunk():
-    with client.websocket_connect("/v1/tts/stream") as websocket:
-        assert _start_stream(websocket) == {"type": "ready"}
-
-        websocket.send_json({"type": "text", "text": "hello"})
-        chunk = websocket.receive_bytes()
-
-        assert chunk.startswith(b"RIFF")
-        assert b"WAVE" in chunk[:16]
-        assert len(chunk) > 44
+        assert failed["event"] == "task_failed"
+        assert failed["base_resp"]["status_code"] == 1001
+        assert failed["base_resp"]["status_msg"] == "Invalid or missing API key"
 
 
-def test_tts_stream_rejects_blank_text():
-    with client.websocket_connect("/v1/tts/stream") as websocket:
-        assert _start_stream(websocket) == {"type": "ready"}
+def test_tts_stream_hex_mode_returns_multiple_pcm_chunks():
+    with _connect() as websocket:
+        _start_task(websocket, transport="hex")
+        websocket.send_json({"event": "task_continue", "text": "hello"})
+        websocket.send_json({"event": "task_finish"})
 
-        websocket.send_json({"type": "text", "text": "   "})
+        chunks = []
+        sequences = []
+        while True:
+            message = websocket.receive_json()
+            if message["event"] == "task_finished":
+                finished = message
+                break
+            assert message["event"] == "task_continued"
+            chunks.append(bytes.fromhex(message["data"]["audio"]))
+            sequences.append(message["extra_info"]["chunk_sequence"])
 
-        assert websocket.receive_json() == {
-            "type": "error",
-            "message": "text cannot be blank",
-        }
+        assert len(chunks) > 1
+        assert all(chunks)
+        assert sequences == list(range(len(chunks)))
+        assert finished["extra_info"]["chunks"] == len(chunks)
+        assert finished["extra_info"]["total_samples"] == sum(len(chunk) for chunk in chunks) // 2
 
 
-def test_tts_stream_end_sends_done_and_closes():
-    with client.websocket_connect("/v1/tts/stream") as websocket:
-        assert _start_stream(websocket) == {"type": "ready"}
+def test_tts_stream_binary_mode_uses_tts1_header_and_contiguous_offsets():
+    with _connect() as websocket:
+        _start_task(websocket, transport="binary")
+        websocket.send_json({"event": "task_continue", "text": "hello"})
+        websocket.send_json({"event": "task_finish"})
 
-        websocket.send_json({"type": "end"})
+        chunks = []
+        expected_offset = 0
+        while True:
+            message = websocket.receive()
+            if message.get("text") is not None:
+                finished = json.loads(message["text"])
+                assert finished["event"] == "task_finished"
+                break
+            payload = message["bytes"]
+            magic, sequence, sample_offset = struct.unpack("<4sIQ", payload[:16])
+            pcm = payload[16:]
+            assert magic == b"TTS1"
+            assert sequence == len(chunks)
+            assert sample_offset == expected_offset
+            assert len(pcm) % 2 == 0
+            chunks.append(pcm)
+            expected_offset += len(pcm) // 2
 
-        assert websocket.receive_json() == {"type": "done"}
+        assert len(chunks) > 1
+        assert finished["extra_info"]["total_samples"] == expected_offset
+
+
+def test_tts_stream_rejects_blank_text_with_task_failed():
+    with _connect() as websocket:
+        _start_task(websocket)
+        websocket.send_json({"event": "task_continue", "text": "   "})
+
+        failed = websocket.receive_json()
+        assert failed["event"] == "task_failed"
+        assert failed["base_resp"]["status_code"] == 1004
+        assert failed["base_resp"]["status_msg"] == "text cannot be blank"
+
+
+def test_tts_stream_rejects_unsupported_audio_settings():
+    with _connect() as websocket:
+        connected = websocket.receive_json()
+        assert connected["event"] == "connected_success"
+        websocket.send_json(
+            {
+                "event": "task_start",
+                "model": "CosyVoice",
+                "voice_setting": {"voice_id": "default"},
+                "audio_setting": {"sample_rate": 32000, "format": "mp3", "channel": 2},
+            }
+        )
+
+        failed = websocket.receive_json()
+        assert failed["event"] == "task_failed"
+        assert failed["base_resp"]["status_code"] == 1003
+
+
+def test_thread_bridge_releases_first_chunk_without_waiting_for_second():
+    allow_second = Event()
+
+    class ControlledSynthesizer:
+        def stream_pcm(self, text, voice=None):
+            yield b"\x01\x00"
+            assert allow_second.wait(timeout=1)
+            yield b"\x02\x00"
+
+    async def consume():
+        stream = _stream_pcm_in_thread(ControlledSynthesizer(), "hello", "default")
+        first = await anext(stream)
+        assert first == b"\x01\x00"
+        allow_second.set()
+        assert [chunk async for chunk in stream] == [b"\x02\x00"]
+
+    asyncio.run(consume())
