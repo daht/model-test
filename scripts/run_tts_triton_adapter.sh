@@ -10,7 +10,7 @@ TRITON_HTTP_PORT="${TTS_TRITON_HTTP_PORT:-18000}"
 TRITON_GRPC_URL="${TTS_TRITON_URL:-127.0.0.1:18001}"
 MODEL_NAME="${TTS_MODEL_NAME:-Fun-CosyVoice3-0.5B-2512}"
 TRITON_MODEL_NAME="${TTS_TRITON_MODEL_NAME:-cosyvoice3}"
-PROMPT_WAV="${TTS_PROMPT_WAV:-/workspace/CosyVoice/asset/zero_shot_prompt.wav}"
+PROMPT_WAV="${TTS_PROMPT_WAV:-}"
 API_KEY_VALUE="${API_KEY:-}"
 ENV_FILE="${TTS_API_ENV_FILE:-${ROOT_DIR}/.env}"
 
@@ -130,7 +130,6 @@ run_args=(
   -e "TTS_MODEL_NAME=${MODEL_NAME}"
   -e "TTS_TRITON_URL=${TRITON_GRPC_URL}"
   -e "TTS_TRITON_MODEL_NAME=${TRITON_MODEL_NAME}"
-  -e "TTS_PROMPT_WAV=${PROMPT_WAV}"
   "${api_key_args[@]}"
   -v "${ROOT_DIR}:/workspace/model-test:ro"
   -v "${ROOT_DIR}/CosyVoice:/workspace/CosyVoice:ro"
@@ -139,6 +138,12 @@ run_args=(
   sh -ec
   "pip3 install --disable-pip-version-check -i https://mirrors.aliyun.com/pypi/simple -r /workspace/model-test/requirements-tts-adapter.txt; cd /workspace/model-test; exec python -m uvicorn app.tts_api:app --host 0.0.0.0 --port ${API_PORT}"
 )
+
+if [[ -n "${PROMPT_WAV}" ]]; then
+  run_args+=( -e "TTS_PROMPT_WAV=${PROMPT_WAV}" )
+elif ! grep -Eq '^[[:space:]]*TTS_PROMPT_WAV[[:space:]]*=' "${ENV_FILE}" 2>/dev/null; then
+  run_args+=( -e "TTS_PROMPT_WAV=/workspace/CosyVoice/asset/zero_shot_prompt.wav" )
+fi
 
 container_id="$(docker "${run_args[@]}" | tr -d '\n')"
 echo "TTS adapter started: ${API_CONTAINER} (${container_id})"
