@@ -48,11 +48,8 @@ fi
 
 command -v docker >/dev/null 2>&1 || { echo "docker is required" >&2; exit 2; }
 command -v curl >/dev/null 2>&1 || { echo "curl is required" >&2; exit 2; }
+docker info >/dev/null 2>&1 || { echo "Docker daemon is not reachable" >&2; exit 2; }
 [[ -d "${ROOT_DIR}/app" ]] || { echo "app directory not found: ${ROOT_DIR}/app" >&2; exit 2; }
-[[ -f "${ROOT_DIR}/requirements-tts-triton.txt" ]] || {
-  echo "requirements-tts-triton.txt not found" >&2
-  exit 2
-}
 [[ -f "${ROOT_DIR}/requirements-tts-adapter.txt" ]] || {
   echo "requirements-tts-adapter.txt not found" >&2
   exit 2
@@ -88,7 +85,24 @@ if [[ "${ready}" != "true" ]]; then
   exit 2
 fi
 
-if command -v ss >/dev/null 2>&1 && ss -ltn | awk '{print $4}' | grep -Eq "(^|:)${API_PORT}$"; then
+port_in_use=false
+if command -v ss >/dev/null 2>&1; then
+  ss_output="$(ss -ltn 2>/dev/null || true)"
+  if awk '{print $4}' <<<"${ss_output}" | grep -Eq "(^|:)${API_PORT}$"; then
+    port_in_use=true
+  fi
+elif command -v netstat >/dev/null 2>&1; then
+  if netstat -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${API_PORT}$"; then
+    port_in_use=true
+  fi
+elif command -v lsof >/dev/null 2>&1; then
+  if lsof -nP -iTCP:"${API_PORT}" -sTCP:LISTEN >/dev/null 2>&1; then
+    port_in_use=true
+  fi
+else
+  echo "Warning: no ss, netstat, or lsof; cannot preflight API port ${API_PORT}" >&2
+fi
+if [[ "${port_in_use}" == "true" ]]; then
   echo "API port ${API_PORT} is already in use; stop the existing service or set TTS_API_PORT" >&2
   exit 2
 fi
@@ -120,14 +134,34 @@ run_args=(
   "${api_key_args[@]}"
   -v "${ROOT_DIR}:/workspace/model-test:ro"
   -v "${ROOT_DIR}/CosyVoice:/workspace/CosyVoice:ro"
+  --mount "type=volume,source=tts-adapter-pip-cache,target=/root/.cache/pip"
   "${API_IMAGE}"
-  bash -lc
-  "set -e; pip3 install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple -r /workspace/model-test/requirements-tts-adapter.txt; cd /workspace/model-test; exec uvicorn app.tts_api:app --host 0.0.0.0 --port ${API_PORT}"
+  sh -ec
+  "pip3 install --disable-pip-version-check -i https://mirrors.aliyun.com/pypi/simple -r /workspace/model-test/requirements-tts-adapter.txt; cd /workspace/model-test; exec python -m uvicorn app.tts_api:app --host 0.0.0.0 --port ${API_PORT}"
 )
 
 container_id="$(docker "${run_args[@]}" | tr -d '\n')"
 echo "TTS adapter started: ${API_CONTAINER} (${container_id})"
 echo "WebSocket endpoint: ws://<host>:${API_PORT}/v1/tts/stream"
+
+api_ready=false
+for _ in $(seq 1 90); do
+  if curl -fsS --max-time 2 "http://127.0.0.1:${API_PORT}/health" >/dev/null; then
+    api_ready=true
+    break
+  fi
+  if [[ "$(docker inspect --format '{{.State.Running}}' "${API_CONTAINER}" 2>/dev/null || true)" != "true" ]]; then
+    break
+  fi
+  sleep 2
+done
+if [[ "${api_ready}" != "true" ]]; then
+  echo "TTS adapter did not become ready on port ${API_PORT}" >&2
+  docker ps -a --filter "name=^/${API_CONTAINER}$" >&2 || true
+  docker logs --tail 80 "${API_CONTAINER}" >&2 || true
+  exit 1
+fi
+echo "TTS adapter health: http://127.0.0.1:${API_PORT}/health"
 
 if [[ "${foreground}" == "true" ]]; then
   exec docker logs -f "${API_CONTAINER}"
