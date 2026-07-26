@@ -146,7 +146,7 @@ Recommended VM:
 - GPU: 1 x NVIDIA A10, 24GB VRAM
 - OS: Ubuntu 22.04 LTS
 - Disk: 80GB minimum, 150GB+ recommended if storing model weights locally
-- Open ports: `22`, `8000`; use `80/443` only if you add Nginx or a load balancer
+- Open port `22`; allow `8000` only from an approved load generator or reverse proxy, and use `80/443` only when Nginx or a load balancer terminates public traffic
 
 ## 1. Bootstrap the server
 

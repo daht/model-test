@@ -91,6 +91,9 @@ release_lock() {
 resolve_container() {
   local raw
   raw="$(docker compose ps -q "${SERVICE}" 2>/dev/null || true)"
+  if [[ -z "${raw}" ]]; then
+    raw="$(docker ps -q --filter name="${SERVICE}" 2>/dev/null || true)"
+  fi
   mapfile -t container_ids < <(printf '%s\n' "${raw}" | sed '/^[[:space:]]*$/d')
   if [[ ${#container_ids[@]} -ne 1 ]]; then
     echo "Expected exactly one running TTS container: ${SERVICE}" >&2
