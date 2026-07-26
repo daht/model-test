@@ -160,3 +160,33 @@ API key 不会写入上述报告。服务日志中的 IPv4 地址会在归档前
 
 3. **验证 gRPC 服务就绪**：
    当前官方脚本使用 HTTP `18000`、gRPC `18001`、metrics `18002`。观察 `docker logs -f cosyvoice-triton-server`，确认 Triton 已启动后，再让 FastAPI/WS gRPC adapter 连接 `127.0.0.1:18001`。不要把 Triton gRPC 端口误当成外部 WebSocket 压测地址；压测仍应访问 adapter 的 `/v1/tts/stream`。
+
+### 7.2 使用本项目的 Triton WebSocket adapter
+
+本项目的统一协议层通过 `TTS_BACKEND=triton` 连接官方 `cosyvoice3` decoupled gRPC 模型。运行 API 进程的环境需要安装 `requirements-tts-triton.txt`，并使用独立端口，避免与 Triton 的 `trtllm-serve` 内部 `8000` 冲突：
+
+```bash
+cd /opt/model-test
+pip install -r requirements-tts-triton.txt
+TTS_BACKEND=triton \
+TTS_MODEL_NAME=Fun-CosyVoice3-0.5B-2512 \
+TTS_TRITON_URL=127.0.0.1:18001 \
+TTS_TRITON_MODEL_NAME=cosyvoice3 \
+TTS_PROMPT_WAV=/opt/model-test/CosyVoice/asset/zero_shot_prompt.wav \
+API_KEY='<部署密钥>' \
+uvicorn app.tts_api:app --host 0.0.0.0 --port 8003
+```
+
+然后从负载机执行预检，目标必须是 `8003/v1/tts/stream`，不是 Triton `18001`：
+
+```bash
+export API_KEY='<部署密钥>'
+export TTS_STREAM_BENCHMARK_URL='ws://<adapter-host>:8003/v1/tts/stream'
+.venv/bin/python scripts/benchmark_tts_stream.py \
+  --corpus docs/tts-stream-benchmark.jsonl \
+  --output-dir log/tts-triton-preflight \
+  --concurrency 1 \
+  --duration-seconds 30 \
+  --warmup-requests 1 \
+  --request-timeout-seconds 180
+```

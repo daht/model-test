@@ -1,0 +1,1 @@
+tritonclient[grpc]==2.59.0

@@ -1,11 +1,14 @@
 import sys
+import threading
 import types
+import wave
 from pathlib import Path
 
 import numpy as np
 import pytest
 
 from app.tts import CosyVoiceTTSSynthesizer, _cosyvoice_result_to_wav
+from app.tts_triton import TritonTTSSynthesizer, _float_audio_to_pcm
 
 
 def _settings(tmp_path: Path):
@@ -16,6 +19,8 @@ def _settings(tmp_path: Path):
         tts_prompt_wav=str(tmp_path / "prompt.wav"),
         tts_default_voice="default",
         tts_sample_rate=24000,
+        tts_triton_url="127.0.0.1:18001",
+        tts_triton_model_name="cosyvoice3",
     )
 
 
@@ -89,3 +94,96 @@ def test_cosyvoice_float_chunks_are_converted_to_pcm_and_concatenated():
     )
     assert audio.startswith(b"RIFF")
     assert len(audio) == 48
+
+
+def test_triton_float_audio_is_converted_to_pcm_s16le():
+    assert _float_audio_to_pcm(np.array([1.0, -1.0, 0.5], dtype=np.float32)) == np.array(
+        [32767, -32767, 16383], dtype="<i2"
+    ).tobytes()
+
+
+def test_triton_inputs_match_cosyvoice_model_contract(tmp_path):
+    class FakeInput:
+        def __init__(self, name, shape, dtype):
+            self.value = (name, shape, dtype, None)
+
+        def set_data_from_numpy(self, value):
+            self.value = (*self.value[:3], value)
+
+    class FakeGrpc:
+        InferInput = FakeInput
+
+    settings = _settings(tmp_path)
+    synthesizer = TritonTTSSynthesizer(settings)
+    inputs = synthesizer._inputs(FakeGrpc, np.array([0.1, -0.1], dtype=np.float32), "hello")
+
+    assert [item.value[:3] for item in inputs] == [
+        ("reference_wav", (1, 2), "FP32"),
+        ("reference_wav_len", (1, 1), "INT32"),
+        ("reference_text", [1, 1], "BYTES"),
+        ("target_text", [1, 1], "BYTES"),
+    ]
+    assert inputs[1].value[3].tolist() == [[2]]
+    assert inputs[3].value[3].tolist() == [["hello"]]
+
+
+def test_triton_stream_consumes_decoupled_chunks_until_final_response(tmp_path):
+    with wave.open(str(tmp_path / "prompt.wav"), "wb") as prompt:
+        prompt.setnchannels(1)
+        prompt.setsampwidth(2)
+        prompt.setframerate(16000)
+        prompt.writeframes(b"\0\0" * 160)
+
+    class FakeInput:
+        def __init__(self, name, shape, dtype):
+            self.name = name
+
+        def set_data_from_numpy(self, value):
+            pass
+
+    class FakeResponse:
+        def __init__(self, audio=None, final=False):
+            self._audio = audio
+            self.parameters = {
+                "triton_final_response": type("Flag", (), {"bool_param": final})()
+            }
+
+        def get_response(self):
+            return self
+
+        def as_numpy(self, name):
+            return self._audio
+
+    class FakeClient:
+        def __init__(self, url):
+            self.callback = None
+
+        def start_stream(self, callback):
+            self.callback = callback
+
+        def async_stream_infer(self, **kwargs):
+            threading.Thread(
+                target=lambda: (
+                    self.callback(FakeResponse(np.array([0.25], dtype=np.float32)), None),
+                    self.callback(FakeResponse(np.array([-0.25], dtype=np.float32)), None),
+                    self.callback(FakeResponse(final=True), None),
+                ),
+                daemon=True,
+            ).start()
+
+        def stop_stream(self, cancel_requests=True):
+            pass
+
+    class FakeGrpc:
+        InferInput = FakeInput
+        InferRequestedOutput = lambda name: name
+        InferenceServerClient = FakeClient
+
+    settings = _settings(tmp_path)
+    synthesizer = TritonTTSSynthesizer(settings)
+    synthesizer._grpcclient = lambda: FakeGrpc
+
+    assert list(synthesizer.stream_pcm("hello")) == [
+        np.array([0.25 * 32767], dtype="<i2").tobytes(),
+        np.array([-0.25 * 32767], dtype="<i2").tobytes(),
+    ]

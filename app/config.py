@@ -110,7 +110,9 @@ class Settings(BaseSettings):
     asr_gateway_default_backend: str = Field(default="local", min_length=1, max_length=128)
     asr_gateway_max_active_sessions: int = Field(default=2, gt=0, le=1024)
     tts_model_name: str = "CosyVoice"
-    tts_backend: Literal["mock", "cosyvoice"] = "mock"
+    tts_backend: Literal["mock", "cosyvoice", "triton"] = "mock"
+    tts_triton_url: str = "127.0.0.1:18001"
+    tts_triton_model_name: str = "cosyvoice3"
     tts_model_id: str = "/models/CosyVoice"
     tts_device: str = "auto"
     tts_sample_rate: int = 24000

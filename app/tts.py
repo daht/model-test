@@ -125,6 +125,10 @@ class CosyVoiceTTSSynthesizer(TTSSynthesizer):
 def create_tts_synthesizer(settings: Settings) -> TTSSynthesizer:
     if settings.tts_backend == "mock":
         return MockTTSSynthesizer(sample_rate=settings.tts_sample_rate)
+    if settings.tts_backend == "triton":
+        from app.tts_triton import TritonTTSSynthesizer
+
+        return TritonTTSSynthesizer(settings)
     return CosyVoiceTTSSynthesizer(settings)
 
 

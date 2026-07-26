@@ -20,6 +20,11 @@ from app.tts import TTSSynthesizer, create_tts_synthesizer
 
 settings = get_settings()
 tts_synthesizer = create_tts_synthesizer(settings)
+tts_synthesizers = {
+    settings.tts_model_name: tts_synthesizer,
+    Path(settings.tts_model_id).name: tts_synthesizer,
+    settings.tts_triton_model_name: tts_synthesizer,
+}
 
 app = FastAPI(
     title="CosyVoice TTS REST API",
@@ -37,6 +42,10 @@ class _StreamFailure:
 
 def get_tts_synthesizer() -> TTSSynthesizer:
     return tts_synthesizer
+
+
+def get_tts_synthesizers() -> dict[str, TTSSynthesizer]:
+    return tts_synthesizers
 
 
 @app.get("/health", response_model=TTSHealthResponse)
@@ -126,7 +135,10 @@ async def synthesize_tts_stream(websocket: WebSocket) -> None:
         start = await _receive_json(websocket)
         if start.get("event") != "task_start":
             raise ValueError("Expected task_start event")
-        voice, transport = _validate_task_start(start, current_settings)
+        model, voice, transport = _validate_task_start(start, current_settings)
+        current_synthesizer = tts_synthesizers.get(model)
+        if current_synthesizer is None:
+            raise ValueError(f"unknown TTS model: {model}")
     except (ValueError, TypeError, json.JSONDecodeError) as exc:
         await _fail_websocket(
             websocket,
@@ -191,7 +203,7 @@ async def synthesize_tts_stream(websocket: WebSocket) -> None:
             synthesis_started = time.perf_counter()
             encode_before = encode_ms
             returned_audio = False
-            async for pcm in _stream_pcm_in_thread(tts_synthesizer, text, voice):
+            async for pcm in _stream_pcm_in_thread(current_synthesizer, text, voice):
                 returned_audio = True
                 encode_started = time.perf_counter()
                 if transport == "binary":
@@ -236,9 +248,13 @@ def _websocket_api_key(websocket: WebSocket) -> str | None:
     return websocket.headers.get("x-api-key")
 
 
-def _validate_task_start(payload: dict, settings: Settings) -> tuple[str, str]:
+def _validate_task_start(payload: dict, settings: Settings) -> tuple[str, str, str]:
     model = payload.get("model")
-    model_names = {settings.tts_model_name, Path(settings.tts_model_id).name}
+    model_names = {
+        settings.tts_model_name,
+        Path(settings.tts_model_id).name,
+        settings.tts_triton_model_name,
+    }
     if model not in model_names:
         raise ValueError(f"unknown TTS model: {model}")
 
@@ -268,7 +284,7 @@ def _validate_task_start(payload: dict, settings: Settings) -> tuple[str, str]:
     transport = stream_options.get("audio_transport", "hex")
     if transport not in {"hex", "binary"}:
         raise ValueError("audio_transport must be hex or binary")
-    return voice, transport
+    return model, voice, transport
 
 
 async def _receive_json(websocket: WebSocket) -> dict:
