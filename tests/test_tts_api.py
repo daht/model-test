@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 os.environ["API_KEY"] = "test-key"
 os.environ["ASR_BACKEND"] = "mock"
 os.environ["TTS_BACKEND"] = "mock"
+os.environ["TTS_MODEL_NAME"] = "CosyVoice"
 os.environ["TTS_MAX_TEXT_CHARS"] = "12"
 
 from app.config import get_settings  # noqa: E402

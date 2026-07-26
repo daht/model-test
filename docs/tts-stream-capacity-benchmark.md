@@ -163,19 +163,14 @@ API key 不会写入上述报告。服务日志中的 IPv4 地址会在归档前
 
 ### 7.2 使用本项目的 Triton WebSocket adapter
 
-本项目的统一协议层通过 `TTS_BACKEND=triton` 连接官方 `cosyvoice3` decoupled gRPC 模型。运行 API 进程的环境需要安装 `requirements-tts-triton.txt`，并使用独立端口，避免与 Triton 的 `trtllm-serve` 内部 `8000` 冲突：
+本项目的统一协议层通过 `TTS_BACKEND=triton` 连接官方 `cosyvoice3` decoupled gRPC 模型。使用一键脚本启动 adapter；它会检查 Triton ready、挂载项目、注入配置并监听独立的 `8003`，避免与 Triton 的 `trtllm-serve` 内部 `8000` 冲突：
 
 ```bash
 cd /opt/model-test
-pip install -r requirements-tts-triton.txt
-TTS_BACKEND=triton \
-TTS_MODEL_NAME=Fun-CosyVoice3-0.5B-2512 \
-TTS_TRITON_URL=127.0.0.1:18001 \
-TTS_TRITON_MODEL_NAME=cosyvoice3 \
-TTS_PROMPT_WAV=/opt/model-test/CosyVoice/asset/zero_shot_prompt.wav \
-API_KEY='<部署密钥>' \
-uvicorn app.tts_api:app --host 0.0.0.0 --port 8003
+scripts/run_tts_triton_adapter.sh --foreground
 ```
+
+脚本默认读取 `/opt/model-test/.env` 中的 `API_KEY`，也支持用 shell 环境变量覆盖；默认使用容器 `cosyvoice-triton-server`、adapter 容器 `cosyvoice-tts-api`，并把依赖安装到 adapter 容器内。可通过 `TTS_API_ENV_FILE`、`TTS_API_CONTAINER`、`TTS_API_PORT`、`TTS_TRITON_CONTAINER` 等环境变量覆盖默认值。
 
 然后从负载机执行预检，目标必须是 `8003/v1/tts/stream`，不是 Triton `18001`：
 
