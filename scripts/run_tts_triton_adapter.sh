@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TRITON_IMAGE="${TTS_TRITON_IMAGE:-soar97/triton-cosyvoice:25.06}"
+API_IMAGE="${TTS_API_IMAGE:-python:3.12-slim}"
 TRITON_CONTAINER="${TTS_TRITON_CONTAINER:-cosyvoice-triton-server}"
 API_CONTAINER="${TTS_API_CONTAINER:-cosyvoice-tts-api}"
 API_PORT="${TTS_API_PORT:-8003}"
@@ -27,7 +27,7 @@ Environment overrides:
   TTS_API_CONTAINER          Adapter container name
   TTS_API_PORT               Adapter WebSocket port (default: 8003)
   TTS_TRITON_CONTAINER       Triton container name
-  TTS_TRITON_IMAGE           Adapter image (default: soar97/triton-cosyvoice:25.06)
+  TTS_API_IMAGE              Adapter image (default: python:3.12-slim)
   TTS_MODEL_NAME             Public model name
   TTS_TRITON_MODEL_NAME      Triton model name
   TTS_PROMPT_WAV             Prompt path inside adapter container
@@ -51,6 +51,10 @@ command -v curl >/dev/null 2>&1 || { echo "curl is required" >&2; exit 2; }
 [[ -d "${ROOT_DIR}/app" ]] || { echo "app directory not found: ${ROOT_DIR}/app" >&2; exit 2; }
 [[ -f "${ROOT_DIR}/requirements-tts-triton.txt" ]] || {
   echo "requirements-tts-triton.txt not found" >&2
+  exit 2
+}
+[[ -f "${ROOT_DIR}/requirements-tts-adapter.txt" ]] || {
+  echo "requirements-tts-adapter.txt not found" >&2
   exit 2
 }
 if [[ -z "${API_KEY_VALUE}" && ! -f "${ENV_FILE}" ]]; then
@@ -84,6 +88,11 @@ if [[ "${ready}" != "true" ]]; then
   exit 2
 fi
 
+if command -v ss >/dev/null 2>&1 && ss -ltn | awk '{print $4}' | grep -Eq "(^|:)${API_PORT}$"; then
+  echo "API port ${API_PORT} is already in use; stop the existing service or set TTS_API_PORT" >&2
+  exit 2
+fi
+
 docker rm -f "${API_CONTAINER}" >/dev/null 2>&1 || true
 
 env_args=()
@@ -111,9 +120,9 @@ run_args=(
   "${api_key_args[@]}"
   -v "${ROOT_DIR}:/workspace/model-test:ro"
   -v "${ROOT_DIR}/CosyVoice:/workspace/CosyVoice:ro"
-  "${TRITON_IMAGE}"
+  "${API_IMAGE}"
   bash -lc
-  "set -e; pip3 install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple -r /workspace/model-test/requirements.txt -r /workspace/model-test/requirements-tts-triton.txt; cd /workspace/model-test; exec uvicorn app.tts_api:app --host 0.0.0.0 --port ${API_PORT}"
+  "set -e; pip3 install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple -r /workspace/model-test/requirements-tts-adapter.txt; cd /workspace/model-test; exec uvicorn app.tts_api:app --host 0.0.0.0 --port ${API_PORT}"
 )
 
 container_id="$(docker "${run_args[@]}" | tr -d '\n')"

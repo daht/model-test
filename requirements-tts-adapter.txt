@@ -1,0 +1,5 @@
+fastapi==0.139.0
+uvicorn[standard]==0.38.0
+pydantic-settings==2.14.2
+numpy==1.26.4
+tritonclient[grpc]==2.59.0
