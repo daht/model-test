@@ -131,3 +131,32 @@ API key 不会写入上述报告。服务日志中的 IPv4 地址会在归档前
 - 播放断流总时长为 0。
 
 这些门槛尚待产品确认。当前已观察到 CosyVoice 单请求 TTFA 约 3–4 秒、chunk gap 约 2.4–3.1 秒，因此预计功能正确但会暂时判定 SLO 失败；这正是本轮瓶颈定位需要量化的问题。
+
+## 7. 方案 B：官方 Triton + TensorRT-LLM 引擎部署与复测路径
+
+为了打破 Python 进程内全局锁造成的串行推理瓶颈，服务后端确定采用 **NVIDIA 官方 CosyVoice3 Triton + TensorRT-LLM 部署方案**（官方来源：[CosyVoice runtime/triton_trtllm](https://github.com/FunAudioLLM/CosyVoice/tree/main/runtime/triton_trtllm)）。
+
+### 7.1 服务端部署命令
+
+1. **拉取官方预建 Triton+TRT-LLM 镜像**：
+   ```bash
+   docker pull soar97/triton-cosyvoice:25.06
+   ```
+
+2. **启动容器并自动完成阶段 0~3 (权重转换、TRT 引擎编译与 Triton 服务拉起)**。
+   依赖通过阿里云 PyPI 镜像安装，模型下载通过 Hugging Face 镜像；生成的权重、引擎和 model repository 会保存在宿主机挂载的 CosyVoice 目录：
+   ```bash
+   docker run -d --name "cosyvoice-triton-server" \
+     --gpus all \
+     --net host \
+     -e HF_ENDPOINT="https://hf-mirror.com" \
+     -e PIP_INDEX_URL="https://mirrors.aliyun.com/pypi/simple" \
+     -e PIP_TRUSTED_HOST="mirrors.aliyun.com" \
+     -v /opt/model-test:/workspace/model-test \
+     --shm-size=4g \
+     soar97/triton-cosyvoice:25.06 \
+     bash -lc "set -e; pip3 install --no-cache-dir x_transformers s3tokenizer; cd /workspace/CosyVoice/runtime/triton_trtllm; bash run_cosyvoice3.sh 0 3"
+   ```
+
+3. **验证 gRPC 服务就绪**：
+   当前官方脚本使用 HTTP `18000`、gRPC `18001`、metrics `18002`。观察 `docker logs -f cosyvoice-triton-server`，确认 Triton 已启动后，再让 FastAPI/WS gRPC adapter 连接 `127.0.0.1:18001`。不要把 Triton gRPC 端口误当成外部 WebSocket 压测地址；压测仍应访问 adapter 的 `/v1/tts/stream`。

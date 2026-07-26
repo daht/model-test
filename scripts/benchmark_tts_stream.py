@@ -74,6 +74,9 @@ class Observation:
     max_chunk_gap_seconds: float | None
     playback_underrun_seconds: float | None
     error_category: str | None
+    server_queue_ms: float | None = None
+    server_synthesis_ms: float | None = None
+    server_encode_ms: float | None = None
 
 
 @dataclass(frozen=True)
@@ -213,6 +216,9 @@ async def send_request(
     expected_sequence = 0
     expected_offset = 0
     error_category = None
+    server_queue_ms = None
+    server_synthesis_ms = None
+    server_encode_ms = None
 
     try:
         async with asyncio.timeout(config.request_timeout_seconds):
@@ -269,6 +275,15 @@ async def send_request(
                                 raise BenchmarkError("server chunk count mismatch")
                             if extra.get("total_samples") != expected_offset:
                                 raise BenchmarkError("server sample count mismatch")
+                            server_queue_ms = _optional_nonnegative_number(
+                                extra.get("queue_ms"), "queue_ms"
+                            )
+                            server_synthesis_ms = _optional_nonnegative_number(
+                                extra.get("synthesis_ms"), "synthesis_ms"
+                            )
+                            server_encode_ms = _optional_nonnegative_number(
+                                extra.get("encode_ms"), "encode_ms"
+                            )
                             break
                         _require_event(payload, "task_continued")
                         extra = payload.get("extra_info")
@@ -323,6 +338,9 @@ async def send_request(
             None,
             None,
             error_category or "no_audio",
+            server_queue_ms,
+            server_synthesis_ms,
+            server_encode_ms,
         )
 
     gaps = [right - left for left, right in zip(arrivals, arrivals[1:])]
@@ -343,6 +361,9 @@ async def send_request(
         max(gaps, default=0.0),
         playback_underrun_seconds(arrivals, durations),
         None,
+        server_queue_ms,
+        server_synthesis_ms,
+        server_encode_ms,
     )
 
 
@@ -362,6 +383,20 @@ def _require_event(payload: dict, expected: str) -> None:
         raise BenchmarkError(f"server_{status}")
     if event != expected:
         raise BenchmarkError(f"expected_{expected}")
+
+
+def _optional_nonnegative_number(value: object, field: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise BenchmarkError(f"invalid server {field}")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise BenchmarkError(f"invalid server {field}") from exc
+    if not math.isfinite(number) or number < 0:
+        raise BenchmarkError(f"invalid server {field}")
+    return number
 
 
 async def run_closed_level(
@@ -391,7 +426,7 @@ async def run_closed_level(
         return observations
 
     groups = await asyncio.gather(*(worker() for _ in range(concurrency)))
-    return [item for group in groups for item in group], time.perf_counter() - benchmark_started
+    return [item for group in groups for item in group], deadline - benchmark_started
 
 
 async def run_open_level(
@@ -418,8 +453,9 @@ async def run_open_level(
             )
         )
         index += 1
+    load_finished = time.perf_counter()
     observations = await asyncio.gather(*tasks) if tasks else []
-    return list(observations), time.perf_counter() - benchmark_started
+    return list(observations), load_finished - benchmark_started
 
 
 def aggregate_level(
@@ -555,16 +591,23 @@ def parse_config(
         raise BenchmarkError("benchmark durations and SLO thresholds must be positive")
     if args.sample_rate <= 0 or args.warmup_requests < 0 or args.random_seed < 0:
         raise BenchmarkError("invalid integer option")
-    if not 0 <= args.max_error_rate <= 1 or args.max_underrun_seconds < 0:
+    if (
+        not math.isfinite(args.max_error_rate)
+        or not 0 <= args.max_error_rate <= 1
+        or not math.isfinite(args.max_underrun_seconds)
+        or args.max_underrun_seconds < 0
+    ):
         raise BenchmarkError("invalid SLO option")
 
-    endpoint = args.url or env.get(
+    endpoint = (args.url or env.get(
         "TTS_STREAM_BENCHMARK_URL",
         "ws://127.0.0.1:8003/v1/tts/stream",
-    )
-    api_key = args.api_key or env.get("API_KEY")
+    )).strip()
+    api_key = (args.api_key or env.get("API_KEY") or "").strip()
     model = args.model or env.get("TTS_MODEL_NAME", "Fun-CosyVoice3-0.5B-2512")
-    if not api_key or not endpoint.strip() or not model.strip() or not args.voice.strip():
+    voice = args.voice.strip()
+    model = model.strip() if model else ""
+    if not api_key or not endpoint or not model or not voice:
         raise BenchmarkError("URL, API key, model, and voice are required")
     return BenchmarkConfig(
         corpus_path=args.corpus,
@@ -572,7 +615,7 @@ def parse_config(
         endpoint=endpoint,
         api_key=api_key,
         model=model,
-        voice=args.voice,
+        voice=voice,
         sample_rate=args.sample_rate,
         transport=args.transport,
         concurrency_levels=concurrency,
@@ -664,7 +707,9 @@ def render_markdown(report: BenchmarkReport) -> str:
     lines.extend(
         [
             "",
-            "`audio RTFx = 成功音频总秒数 / 测量墙钟秒数`；在途均值由请求总占用时间除以测量墙钟时间估算。",
+            "`audio RTFx = 成功音频总秒数 / 负载窗口秒数`；RPS 和 RTFx 使用停止发起请求的负载窗口，",
+            "排空尾部仍计入请求 E2E，但不会稀释吞吐；在途均值由请求总占用时间除以负载窗口估算。",
+            "逐请求 JSONL 还会保存服务端 `queue_ms`、`synthesis_ms`、`encode_ms`（服务未提供时为 null）。",
             "",
         ]
     )

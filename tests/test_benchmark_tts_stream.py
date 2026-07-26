@@ -14,6 +14,7 @@ from scripts.benchmark_tts_stream import (
     parse_config,
     playback_underrun_seconds,
     render_markdown,
+    _optional_nonnegative_number,
 )
 
 
@@ -73,6 +74,15 @@ def test_parse_binary_chunk_validates_header_and_pcm():
         parse_binary_chunk(struct.pack("<4sIQ", b"NOPE", 0, 0) + b"\0\0")
     with pytest.raises(BenchmarkError, match="odd-length"):
         parse_binary_chunk(struct.pack("<4sIQ", b"TTS1", 0, 0) + b"\0\0\0")
+
+
+def test_server_timing_accepts_optional_nonnegative_values():
+    assert _optional_nonnegative_number(None, "queue_ms") is None
+    assert _optional_nonnegative_number(1.25, "queue_ms") == pytest.approx(1.25)
+    with pytest.raises(BenchmarkError, match="queue_ms"):
+        _optional_nonnegative_number(-1, "queue_ms")
+    with pytest.raises(BenchmarkError, match="queue_ms"):
+        _optional_nonnegative_number(float("nan"), "queue_ms")
 
 
 def test_load_corpus_preserves_id_language_and_bucket(tmp_path):
@@ -159,6 +169,15 @@ def test_parse_config_reads_websocket_environment(tmp_path):
     assert parsed.model == "model"
     assert parsed.concurrency_levels == (1, 3)
     assert parsed.arrival_rates == (0.1, 0.25)
+
+
+def test_parse_config_strips_endpoint_and_model(tmp_path):
+    parsed = parse_config(
+        ["--corpus", str(tmp_path / "corpus"), "--output-dir", str(tmp_path / "out")],
+        {"API_KEY": "secret", "TTS_STREAM_BENCHMARK_URL": " ws://example/stream ", "TTS_MODEL_NAME": " model "},
+    )
+    assert parsed.endpoint == "ws://example/stream"
+    assert parsed.model == "model"
 
 
 @pytest.mark.parametrize(
