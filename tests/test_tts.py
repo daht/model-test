@@ -234,6 +234,42 @@ def test_qwen_model_load_falls_back_to_auto_on_meta_tensor_error():
     ]
 
 
+def test_qwen_model_load_falls_back_to_cpu_then_moves_model_after_meta_errors(monkeypatch):
+    fake_torch = types.ModuleType("torch")
+    fake_torch.cuda = types.SimpleNamespace(is_available=lambda: True)
+    fake_torch.device = lambda value: value
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    calls = []
+
+    class FakeInnerModel:
+        def to(self, device):
+            calls.append(("move", device))
+
+    class FakeWrapper:
+        def __init__(self):
+            self.model = FakeInnerModel()
+            self.device = "cpu"
+
+    class FakeModel:
+        @classmethod
+        def from_pretrained(cls, model_id, device_map, dtype, **kwargs):
+            calls.append((model_id, device_map, dtype, kwargs))
+            if device_map in {"cuda:0", "auto"}:
+                raise RuntimeError("Cannot copy out of meta tensor; no data!")
+            return FakeWrapper()
+
+    loaded = _load_qwen_model(FakeModel, "/models/qwen", device_map="cuda:0", dtype="bf16")
+
+    assert loaded.device == "cuda:0"
+    assert calls == [
+        ("/models/qwen", "cuda:0", "bf16", {}),
+        ("/models/qwen", "auto", "bf16", {}),
+        ("/models/qwen", None, "bf16", {"low_cpu_mem_usage": False}),
+        ("move", "cuda:0"),
+    ]
+
+
 def test_qwen_model_load_falls_back_on_runtime_meta_tensor_error():
     calls = []
 

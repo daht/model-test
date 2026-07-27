@@ -90,13 +90,40 @@ def _load_qwen_model(model_class, model_id: str, *, device_map: str, dtype):
     except Exception as exc:
         if "Cannot copy out of meta tensor" not in str(exc):
             raise
-        if device_map == "auto":
-            raise
-        return model_class.from_pretrained(
-            model_id,
-            device_map="auto",
-            dtype=dtype,
-        )
+        if device_map != "auto":
+            try:
+                return model_class.from_pretrained(
+                    model_id,
+                    device_map="auto",
+                    dtype=dtype,
+                )
+            except Exception as auto_exc:
+                if "Cannot copy out of meta tensor" not in str(auto_exc):
+                    raise
+                exc = auto_exc
+
+        try:
+            import torch
+
+            loaded = model_class.from_pretrained(
+                model_id,
+                device_map=None,
+                dtype=dtype,
+                low_cpu_mem_usage=False,
+            )
+            target = device_map
+            if target == "auto":
+                target = "cuda:0" if torch.cuda.is_available() else "cpu"
+            if target not in (None, "cpu"):
+                model = getattr(loaded, "model", loaded)
+                model.to(target)
+                if hasattr(loaded, "device"):
+                    loaded.device = torch.device(target)
+            return loaded
+        except Exception as fallback_exc:
+            raise RuntimeError(
+                "Qwen3-TTS meta-tensor fallback failed after CPU loading"
+            ) from fallback_exc
 
 
 def _float_audio_to_pcm(audio) -> bytes:
