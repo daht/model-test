@@ -36,23 +36,23 @@ Qwen3TTSModel.from_pretrained(
 
 wrapper 的 `from_pretrained()` 将收到的 kwargs 原样转发给 `AutoModel.from_pretrained()`，然后再独立加载 `AutoProcessor`；它没有官方定义的 `device_map="auto"` 或 CPU fallback。见：
 
-- [qwen3_tts_model.py](https://github.com/QwenLM/Qwen3-TTS/blob/022e286b98fb8e1e916cb940cdf532cd9f488e/qwen_tts/inference/qwen3_tts_model.py#L82-L121)
+- [qwen3_tts_model.py](https://github.com/QwenLM/Qwen3-TTS/blob/022e286b98fbec7e1e916cb940cdf532cd9f488e/qwen_tts/inference/qwen3_tts_model.py#L82-L121)
 
 因此，当前项目为了捕获 `Cannot copy out of meta tensor` 而在 `app/tts_qwen.py` 中尝试 `device_map="auto"`、再 CPU 加载后 `.to(cuda)`，属于项目自有兼容性 workaround，不是 Qwen 官方推荐流程。它可能掩盖真正的运行时兼容性问题（Torch/Transformers/Accelerate/权重格式或 checkpoint 配置），不能替代在官方依赖组合下验证原始 `device_map="cuda:0"` 加载。
 
 ### CustomVoice 与 batch
 
-Qwen README 说明 CustomVoice 的参数是 `text`、`language`、`speaker` 和可选 `instruct`，并展示了单请求和 list batch 两种调用。来源：[README](https://github.com/QwenLM/Qwen3-TTS/blob/022e286b98fb8e1e916cb940cdf532cd9f488e/README.md#L148-L184)。
+Qwen README 说明 CustomVoice 的参数是 `text`、`language`、`speaker` 和可选 `instruct`，并展示了单请求和 list batch 两种调用。来源：[README](https://github.com/QwenLM/Qwen3-TTS/blob/022e286b98fbec7e1e916cb940cdf532cd9f488e/README.md#L148-L184)。
 
 官方 wrapper 的实现会把 scalar 归一化成 list，检查四个列表长度一致，随后一次调用底层 `self.model.generate(...)`，最后一次性调用 speech tokenizer 解码完整 waveform：
 
-- [generate_custom_voice() 参数和 batch 校验](https://github.com/QwenLM/Qwen3-TTS/blob/022e286b98fb8e1e916cb940cdf532cd9f488e/qwen_tts/inference/qwen3_tts_model.py#L732-L839)
+- [generate_custom_voice() 参数和 batch 校验](https://github.com/QwenLM/Qwen3-TTS/blob/022e286b98fbec7e1e916cb940cdf532cd9f488e/qwen_tts/inference/qwen3_tts_model.py#L732-L839)
 
 其中源码文档明确写出：
 
 > `non_streaming_mode=False` currently only simulates streaming text input, rather than enabling true streaming input or streaming generation.
 
-来源：[qwen3_tts_model.py](https://github.com/QwenLM/Qwen3-TTS/blob/022e286b98fb8e1e916cb940cdf532cd9f488e/qwen_tts/inference/qwen3_tts_model.py#L738-L755)。
+来源：[qwen3_tts_model.py](https://github.com/QwenLM/Qwen3-TTS/blob/022e286b98fbec7e1e916cb940cdf532cd9f488e/qwen_tts/inference/qwen3_tts_model.py#L738-L755)。
 
 Qwen README 虽然宣称模型具备低延迟 streaming generation，但 Python wrapper 的 `generate_custom_voice()` 返回类型仍是 `(List[np.ndarray], sample_rate)`，并在返回前完成完整 decode；因此“模型架构支持 streaming”和“当前 Python API 可向 HTTP 客户端逐 chunk 输出”是两个不同层次。
 
@@ -116,4 +116,3 @@ Qwen 官方 README 则明确列出 `Qwen3-TTS-12Hz-0.6B-CustomVoice` 并说明�
 
 1. **保留 qwen-tts Python backend（0.6B 可行性优先）**：固定官方示例的依赖组合、固定 `device_map="cuda:0"`、在容器启动时做一次显式 model-load smoke test；并接受该路径是单进程/单请求生成，需在应用层另行设计受控并发或显式 list batch。
 2. **采用 vLLM-Omni online serving（continuous batching/低 TTFA 优先）**：使用 vLLM-Omni 的 Qwen3-TTS deploy config 和 `/v1/audio/speech`/`/v1/audio/speech/batch` API。先用官方 supported 的 1.7B checkpoint 验证，再单独验证 0.6B；不能直接把当前 Python adapter 的 `stream_pcm()` 改名为 continuous batching。
-

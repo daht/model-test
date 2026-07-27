@@ -104,8 +104,10 @@ elif [[ "${BACKEND}" != "qwen" ]]; then
   exit 2
 fi
 
-if [[ -z "${TTS_API_IMAGE:-}" ]] && ! docker image inspect "${API_IMAGE}" >/dev/null 2>&1; then
-  echo "TTS adapter image not found; building ${API_IMAGE} once..."
+if [[ -z "${TTS_API_IMAGE:-}" ]]; then
+  # Docker reuses unchanged dependency layers, while rebuilding here ensures
+  # Dockerfile/requirements fixes (for example the SoX runtime) reach deploys.
+  echo "Ensuring TTS adapter image ${API_IMAGE} is up to date..."
   docker build \
     --file "${ROOT_DIR}/Dockerfile.tts-adapter" \
     --tag "${API_IMAGE}" \

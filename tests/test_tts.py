@@ -1,5 +1,6 @@
 import sys
 import threading
+import time
 import types
 import wave
 from pathlib import Path
@@ -22,6 +23,10 @@ def _settings(tmp_path: Path):
         tts_sample_rate=24000,
         tts_triton_url="127.0.0.1:18001",
         tts_triton_model_name="cosyvoice3",
+        tts_qwen_batch_size=4,
+        tts_qwen_batch_wait_ms=50,
+        tts_qwen_queue_size=8,
+        tts_qwen_request_timeout_seconds=2.0,
     )
 
 
@@ -199,7 +204,7 @@ def test_qwen_custom_voice_uses_deployment_settings(tmp_path):
     class FakeModel:
         def generate_custom_voice(self, **kwargs):
             assert kwargs == {
-                "text": "hello",
+                "text": ["hello"],
                 "language": "Chinese",
                 "speaker": "Vivian",
                 "instruct": None,
@@ -208,86 +213,105 @@ def test_qwen_custom_voice_uses_deployment_settings(tmp_path):
 
     synthesizer = Qwen3TTSSynthesizer(settings)
     synthesizer._model = FakeModel()
+    try:
+        assert list(synthesizer.stream_pcm("hello", "default")) == [
+            np.array([8191, -8191], dtype="<i2").tobytes()
+        ]
+    finally:
+        synthesizer.close()
 
-    assert list(synthesizer.stream_pcm("hello", "default")) == [
-        np.array([8191, -8191], dtype="<i2").tobytes()
-    ]
 
-
-def test_qwen_model_load_falls_back_to_auto_on_meta_tensor_error():
+def test_qwen_model_load_uses_official_device_map():
     calls = []
 
     class FakeModel:
         @classmethod
         def from_pretrained(cls, model_id, device_map, dtype):
             calls.append((model_id, device_map, dtype))
-            if device_map != "auto":
-                raise NotImplementedError("Cannot copy out of meta tensor; no data!")
-            return {"model_id": model_id, "device_map": device_map, "dtype": dtype}
+            return object()
 
     loaded = _load_qwen_model(FakeModel, "/models/qwen", device_map="cuda:0", dtype="bf16")
 
-    assert loaded == {"model_id": "/models/qwen", "device_map": "auto", "dtype": "bf16"}
-    assert calls == [
-        ("/models/qwen", "cuda:0", "bf16"),
-        ("/models/qwen", "auto", "bf16"),
-    ]
+    assert loaded is not None
+    assert calls == [("/models/qwen", "cuda:0", "bf16")]
 
 
-def test_qwen_model_load_falls_back_to_cpu_then_moves_model_after_meta_errors(monkeypatch):
+def test_qwen_concurrent_requests_share_one_explicit_batch(tmp_path):
+    settings = _settings(tmp_path)
+    settings.tts_qwen_language = "Chinese"
+    settings.tts_qwen_speaker = "Vivian"
+    settings.tts_qwen_instruct = ""
+    settings.tts_qwen_batch_wait_ms = 200
+    calls = []
+
+    class FakeModel:
+        def generate_custom_voice(self, **kwargs):
+            calls.append(kwargs)
+            return [
+                np.array([0.1 if text == "one" else 0.2], dtype=np.float32)
+                for text in kwargs["text"]
+            ], 24000
+
+    synthesizer = Qwen3TTSSynthesizer(settings)
+    synthesizer._model = FakeModel()
+    barrier = threading.Barrier(3)
+    results = {}
+
+    def synthesize(text):
+        barrier.wait()
+        results[text] = list(synthesizer.stream_pcm(text, "default"))
+
+    threads = [threading.Thread(target=synthesize, args=(text,)) for text in ("one", "two")]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    try:
+        assert all(not thread.is_alive() for thread in threads)
+        assert len(calls) == 1
+        assert sorted(calls[0]["text"]) == ["one", "two"]
+        assert set(results) == {"one", "two"}
+    finally:
+        synthesizer.close()
+
+
+def test_qwen_model_load_is_single_owner_under_concurrency(monkeypatch, tmp_path):
+    settings = _settings(tmp_path)
+    settings.tts_qwen_language = "Chinese"
+    settings.tts_qwen_speaker = "Vivian"
+    settings.tts_qwen_instruct = ""
+    settings.tts_device = "cuda:0"
+    settings.torch_dtype = "bfloat16"
+    calls = []
+
     fake_torch = types.ModuleType("torch")
-    fake_torch.cuda = types.SimpleNamespace(is_available=lambda: True)
-    fake_torch.device = lambda value: value
+    fake_torch.float16 = "float16"
+    fake_torch.bfloat16 = "bfloat16"
+    fake_torch.float32 = "float32"
+
+    class FakeQwenModel:
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            calls.append((args, kwargs))
+            time.sleep(0.05)
+            return object()
+
+    fake_qwen = types.ModuleType("qwen_tts")
+    fake_qwen.Qwen3TTSModel = FakeQwenModel
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "qwen_tts", fake_qwen)
 
-    calls = []
+    synthesizer = Qwen3TTSSynthesizer(settings)
+    threads = [threading.Thread(target=synthesizer._load_model) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=1)
 
-    class FakeInnerModel:
-        def to(self, device):
-            calls.append(("move", device))
-
-    class FakeWrapper:
-        def __init__(self):
-            self.model = FakeInnerModel()
-            self.device = "cpu"
-
-    class FakeModel:
-        @classmethod
-        def from_pretrained(cls, model_id, device_map, dtype, **kwargs):
-            calls.append((model_id, device_map, dtype, kwargs))
-            if device_map in {"cuda:0", "auto"}:
-                raise RuntimeError("Cannot copy out of meta tensor; no data!")
-            return FakeWrapper()
-
-    loaded = _load_qwen_model(FakeModel, "/models/qwen", device_map="cuda:0", dtype="bf16")
-
-    assert loaded.device == "cuda:0"
-    assert calls == [
-        ("/models/qwen", "cuda:0", "bf16", {}),
-        ("/models/qwen", "auto", "bf16", {}),
-        ("/models/qwen", None, "bf16", {"low_cpu_mem_usage": False}),
-        ("move", "cuda:0"),
-    ]
-
-
-def test_qwen_model_load_falls_back_on_runtime_meta_tensor_error():
-    calls = []
-
-    class FakeModel:
-        @classmethod
-        def from_pretrained(cls, model_id, device_map, dtype):
-            calls.append((model_id, device_map, dtype))
-            if device_map != "auto":
-                raise RuntimeError("Cannot copy out of meta tensor; no data!")
-            return {"model_id": model_id, "device_map": device_map, "dtype": dtype}
-
-    loaded = _load_qwen_model(FakeModel, "/models/qwen", device_map="cuda:0", dtype="bf16")
-
-    assert loaded == {"model_id": "/models/qwen", "device_map": "auto", "dtype": "bf16"}
-    assert calls == [
-        ("/models/qwen", "cuda:0", "bf16"),
-        ("/models/qwen", "auto", "bf16"),
-    ]
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(calls) == 1
 
 
 def test_factory_selects_qwen_without_loading_model(tmp_path):

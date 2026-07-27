@@ -126,6 +126,10 @@ class Settings(BaseSettings):
     tts_qwen_speaker: str = "Vivian"
     tts_qwen_language: str = "Chinese"
     tts_qwen_instruct: str = ""
+    tts_qwen_batch_size: int = Field(default=4, gt=0, le=32)
+    tts_qwen_batch_wait_ms: int = Field(default=20, ge=0, le=1000)
+    tts_qwen_queue_size: int = Field(default=32, gt=0, le=1024)
+    tts_qwen_request_timeout_seconds: float = Field(default=300.0, gt=0, le=3600)
     trust_remote_code: bool = True
 
     @field_validator("asr_max_frame_bytes")

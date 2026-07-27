@@ -7,6 +7,7 @@ import struct
 import time
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from threading import Event
 
@@ -23,18 +24,36 @@ tts_synthesizers = {
     settings.tts_model_name: tts_synthesizer,
 }
 
-app = FastAPI(
-    title="TTS REST API",
-    version="0.3.0",
-    description="REST and MiniMax-style WebSocket API for streaming text-to-speech.",
-)
-
 _STREAM_END = object()
 
 
 @dataclass(frozen=True)
 class _StreamFailure:
     error: Exception
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    starter = getattr(tts_synthesizer, "start", None)
+    if callable(starter):
+        await asyncio.to_thread(starter)
+    warmer = getattr(tts_synthesizer, "warmup", None)
+    if callable(warmer):
+        await asyncio.to_thread(warmer)
+    try:
+        yield
+    finally:
+        closer = getattr(tts_synthesizer, "close", None)
+        if callable(closer):
+            await asyncio.to_thread(closer)
+
+
+app = FastAPI(
+    title="TTS REST API",
+    version="0.3.0",
+    description="REST and MiniMax-style WebSocket API for streaming text-to-speech.",
+    lifespan=lifespan,
+)
 
 
 def get_tts_synthesizer() -> TTSSynthesizer:
