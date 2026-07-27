@@ -138,7 +138,7 @@ fi
 
 requirements="/workspace/model-test/requirements-tts-adapter.txt"
 if [[ "${BACKEND}" == "qwen" ]]; then
-  requirements="${requirements} /workspace/model-test/requirements-tts-qwen.txt"
+  requirements="${requirements} -r /workspace/model-test/requirements-tts-qwen.txt"
 fi
 
 cosyvoice_mount=()
