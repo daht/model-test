@@ -15,6 +15,15 @@ TRITON_MODEL_NAME="${TTS_TRITON_MODEL_NAME:-cosyvoice3}"
 PROMPT_WAV="${TTS_PROMPT_WAV:-}"
 API_KEY_VALUE="${API_KEY:-}"
 ENV_FILE="${TTS_API_ENV_FILE:-${ROOT_DIR}/.env}"
+VLLM_OMNI_BASE_URL="${TTS_VLLM_OMNI_BASE_URL:-}"
+VLLM_OMNI_MODEL="${TTS_VLLM_OMNI_MODEL:-}"
+VLLM_OMNI_ROOT="${TTS_VLLM_OMNI_ROOT:-/opt/vllm-omni}"
+VLLM_OMNI_BIN="${TTS_VLLM_OMNI_BIN:-vllm-omni}"
+VLLM_OMNI_PORT="${TTS_VLLM_OMNI_PORT:-8091}"
+VLLM_OMNI_LOG="${TTS_VLLM_OMNI_LOG:-/tmp/vllm-omni-qwen-tts.log}"
+VLLM_OMNI_PID="${TTS_VLLM_OMNI_PID:-/tmp/vllm-omni-qwen-tts.pid}"
+VLLM_OMNI_START_TIMEOUT="${TTS_VLLM_OMNI_START_TIMEOUT_SECONDS:-900}"
+VLLM_OMNI_API_KEY_VALUE="${TTS_VLLM_OMNI_API_KEY:-}"
 
 env_file_value() {
   local key="$1"
@@ -26,6 +35,16 @@ BACKEND="${BACKEND:-$(env_file_value TTS_BACKEND)}"
 MODEL_NAME="${MODEL_NAME:-$(env_file_value TTS_MODEL_NAME)}"
 BACKEND="${BACKEND:-triton}"
 MODEL_NAME="${MODEL_NAME:-Fun-CosyVoice3-0.5B-2512}"
+VLLM_OMNI_BASE_URL="${VLLM_OMNI_BASE_URL:-$(env_file_value TTS_VLLM_OMNI_BASE_URL)}"
+VLLM_OMNI_MODEL="${VLLM_OMNI_MODEL:-$(env_file_value TTS_VLLM_OMNI_MODEL)}"
+VLLM_OMNI_BASE_URL="${VLLM_OMNI_BASE_URL:-http://127.0.0.1:8091}"
+VLLM_OMNI_MODEL="${VLLM_OMNI_MODEL:-Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice}"
+VLLM_OMNI_API_KEY_VALUE="${VLLM_OMNI_API_KEY_VALUE:-$(env_file_value TTS_VLLM_OMNI_API_KEY)}"
+vllm_url_port="${VLLM_OMNI_BASE_URL##*:}"
+vllm_url_port="${vllm_url_port%%/*}"
+if [[ "${vllm_url_port}" =~ ^[0-9]+$ ]]; then
+  VLLM_OMNI_PORT="${vllm_url_port}"
+fi
 
 usage() {
   cat <<'EOF'
@@ -45,6 +64,10 @@ Environment overrides:
   TTS_MODEL_NAME             Public model name
   TTS_TRITON_MODEL_NAME      Triton model name
   TTS_PROMPT_WAV             Prompt path inside adapter container
+  TTS_VLLM_OMNI_ROOT         vLLM-Omni checkout (default: /opt/vllm-omni)
+  TTS_VLLM_OMNI_BIN          vLLM-Omni executable (default: vllm-omni)
+  TTS_VLLM_OMNI_LOG          vLLM-Omni log path (default: /tmp/vllm-omni-qwen-tts.log)
+  TTS_VLLM_OMNI_START_TIMEOUT_SECONDS  Startup wait (default: 900)
 EOF
 }
 
@@ -102,6 +125,78 @@ if [[ "${BACKEND}" == "triton" ]]; then
 elif [[ "${BACKEND}" != "qwen" && "${BACKEND}" != "vllm_omni" ]]; then
   echo "Unsupported TTS_BACKEND: ${BACKEND}; expected triton, qwen, or vllm_omni" >&2
   exit 2
+fi
+
+if [[ "${BACKEND}" == "vllm_omni" ]]; then
+  vllm_ready=false
+  if curl -fsS --max-time 2 "${VLLM_OMNI_BASE_URL}/health" >/dev/null 2>&1; then
+    vllm_ready=true
+    echo "Reusing ready vLLM-Omni at ${VLLM_OMNI_BASE_URL}"
+  fi
+
+  if [[ "${vllm_ready}" != "true" ]]; then
+    vllm_host="${VLLM_OMNI_BASE_URL#*://}"
+    vllm_host="${vllm_host%%/*}"
+    vllm_host="${vllm_host%%:*}"
+    if [[ "${vllm_host}" == "127.0.0.1" || "${vllm_host}" == "localhost" || "${vllm_host}" == "::1" ]]; then
+      if [[ -f "${VLLM_OMNI_PID}" ]] && kill -0 "$(cat "${VLLM_OMNI_PID}")" 2>/dev/null; then
+        echo "vLLM-Omni is starting (pid $(cat "${VLLM_OMNI_PID}")); waiting..."
+      else
+        command -v "${VLLM_OMNI_BIN}" >/dev/null 2>&1 || {
+          echo "${VLLM_OMNI_BIN} is required to auto-start vLLM-Omni" >&2
+          exit 2
+        }
+        [[ -d "${VLLM_OMNI_ROOT}" ]] || {
+          echo "vLLM-Omni root not found: ${VLLM_OMNI_ROOT}" >&2
+          exit 2
+        }
+        deploy_config="${TTS_VLLM_OMNI_DEPLOY_CONFIG:-${VLLM_OMNI_ROOT}/vllm_omni/deploy/qwen3_tts.yaml}"
+        [[ -f "${deploy_config}" ]] || {
+          echo "vLLM-Omni deploy config not found: ${deploy_config}" >&2
+          exit 2
+        }
+        vllm_args=(
+          serve "${VLLM_OMNI_MODEL}"
+          --deploy-config "${deploy_config}"
+          --host 0.0.0.0
+          --port "${VLLM_OMNI_PORT}"
+          --gpu-memory-utilization "${TTS_VLLM_OMNI_GPU_MEMORY_UTILIZATION:-0.9}"
+          --trust-remote-code
+          --omni
+        )
+        if [[ -n "${VLLM_OMNI_API_KEY_VALUE}" ]]; then
+          vllm_args+=(--api-key "${VLLM_OMNI_API_KEY_VALUE}")
+        fi
+        echo "Starting vLLM-Omni ${VLLM_OMNI_MODEL}; log: ${VLLM_OMNI_LOG}"
+        (
+          cd "${VLLM_OMNI_ROOT}"
+          nohup "${VLLM_OMNI_BIN}" "${vllm_args[@]}" >"${VLLM_OMNI_LOG}" 2>&1 &
+          echo $! >"${VLLM_OMNI_PID}"
+        )
+      fi
+    else
+      echo "Waiting for remote vLLM-Omni at ${VLLM_OMNI_BASE_URL}"
+    fi
+  fi
+
+  if [[ "${vllm_ready}" != "true" ]]; then
+    for _ in $(seq 1 "${VLLM_OMNI_START_TIMEOUT}"); do
+      if curl -fsS --max-time 2 "${VLLM_OMNI_BASE_URL}/health" >/dev/null 2>&1; then
+        vllm_ready=true
+        break
+      fi
+      if [[ -f "${VLLM_OMNI_PID}" ]] && ! kill -0 "$(cat "${VLLM_OMNI_PID}")" 2>/dev/null; then
+        echo "vLLM-Omni exited during startup; see ${VLLM_OMNI_LOG}" >&2
+        tail -n 80 "${VLLM_OMNI_LOG}" >&2 2>/dev/null || true
+        exit 1
+      fi
+      sleep 1
+    done
+  fi
+  if [[ "${vllm_ready}" != "true" ]]; then
+    echo "vLLM-Omni did not become ready: ${VLLM_OMNI_BASE_URL}/health" >&2
+    exit 1
+  fi
 fi
 
 if [[ -z "${TTS_API_IMAGE:-}" ]]; then

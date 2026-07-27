@@ -74,3 +74,7 @@ TTS_SAMPLE_RATE=24000
 
 三种后端都使用同一个 `/v1/tts` 和 `/v1/tts/stream` 协议，压测脚本只需要替换
 `TTS_MODEL_NAME` 和输出目录。
+
+配置 `TTS_BACKEND=vllm_omni` 后，直接运行
+`scripts/run_tts_triton_adapter.sh --foreground` 即可一键启动或复用 vLLM-Omni，
+等待其健康后再启动 adapter。

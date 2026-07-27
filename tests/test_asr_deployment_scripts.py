@@ -130,6 +130,16 @@ def test_tts_adapter_dependencies_are_baked_into_image():
     assert "pip3 install" not in script_content
 
 
+def test_tts_adapter_script_auto_starts_vllm_omni_backend():
+    content = script("run_tts_triton_adapter.sh")
+
+    assert 'vllm-omni' in content
+    assert 'TTS_VLLM_OMNI_ROOT' in content
+    assert '--deploy-config' in content
+    assert 'TTS_VLLM_OMNI_START_TIMEOUT_SECONDS' in content
+    assert 'Reusing ready vLLM-Omni' in content
+
+
 def test_a10_sensevoice_release_contract_and_evaluation_runbook():
     example = Path("cloud/A10.sensevoice.env.example").read_text()
     verifier = Path("scripts/verify_asr_release.sh").read_text()
