@@ -170,7 +170,7 @@ cd /opt/model-test
 scripts/run_tts_triton_adapter.sh --foreground
 ```
 
-脚本默认读取 `/opt/model-test/.env` 中的 `API_KEY`，也支持用 shell 环境变量覆盖；默认使用容器 `cosyvoice-triton-server`、adapter 容器 `cosyvoice-tts-api`，并在独立的 `python:3.12-slim` adapter 容器内安装 `requirements-tts-adapter.txt`，不会修改 Triton 镜像中的 TensorRT-LLM 依赖。可通过 `TTS_API_ENV_FILE`、`TTS_API_CONTAINER`、`TTS_API_PORT`、`TTS_API_IMAGE`、`TTS_TRITON_CONTAINER` 等环境变量覆盖默认值。
+脚本默认读取 `/opt/model-test/.env` 中的 `API_KEY`，也支持用 shell 环境变量覆盖；默认使用容器 `cosyvoice-triton-server`、adapter 容器 `cosyvoice-tts-api`，并使用首次运行时自动构建的 `cosyvoice-tts-adapter:latest` 镜像。依赖在镜像构建阶段安装，重建 adapter 容器不会再次下载，且不会修改 Triton 镜像中的 TensorRT-LLM 依赖。可通过 `TTS_API_ENV_FILE`、`TTS_API_CONTAINER`、`TTS_API_PORT`、`TTS_API_IMAGE`、`TTS_TRITON_CONTAINER` 等环境变量覆盖默认值。
 
 然后从负载机执行预检，目标必须是 `8003/v1/tts/stream`，不是 Triton `18001`：
 

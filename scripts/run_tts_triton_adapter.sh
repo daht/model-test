@@ -2,7 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-API_IMAGE="${TTS_API_IMAGE:-python:3.12-slim}"
+DEFAULT_API_IMAGE="cosyvoice-tts-adapter:latest"
+API_IMAGE="${TTS_API_IMAGE:-${DEFAULT_API_IMAGE}}"
 TRITON_CONTAINER="${TTS_TRITON_CONTAINER:-cosyvoice-triton-server}"
 API_CONTAINER="${TTS_API_CONTAINER:-cosyvoice-tts-api}"
 API_PORT="${TTS_API_PORT:-8003}"
@@ -39,7 +40,7 @@ Environment overrides:
   TTS_API_CONTAINER          Adapter container name
   TTS_API_PORT               Adapter WebSocket port (default: 8003)
   TTS_TRITON_CONTAINER       Triton container name
-  TTS_API_IMAGE              Adapter image (default: python:3.12-slim)
+  TTS_API_IMAGE              Adapter image (default: cosyvoice-tts-adapter:latest)
   TTS_BACKEND                Deployment backend: triton or qwen
   TTS_MODEL_NAME             Public model name
   TTS_TRITON_MODEL_NAME      Triton model name
@@ -103,6 +104,14 @@ elif [[ "${BACKEND}" != "qwen" ]]; then
   exit 2
 fi
 
+if [[ -z "${TTS_API_IMAGE:-}" ]] && ! docker image inspect "${API_IMAGE}" >/dev/null 2>&1; then
+  echo "TTS adapter image not found; building ${API_IMAGE} once..."
+  docker build \
+    --file "${ROOT_DIR}/Dockerfile.tts-adapter" \
+    --tag "${API_IMAGE}" \
+    "${ROOT_DIR}"
+fi
+
 port_in_use=false
 if command -v ss >/dev/null 2>&1; then
   ss_output="$(ss -ltn 2>/dev/null || true)"
@@ -136,11 +145,6 @@ if [[ -n "${API_KEY_VALUE}" ]]; then
   api_key_args+=(-e "API_KEY=${API_KEY_VALUE}")
 fi
 
-requirements="/workspace/model-test/requirements-tts-adapter.txt"
-if [[ "${BACKEND}" == "qwen" ]]; then
-  requirements="${requirements} -r /workspace/model-test/requirements-tts-qwen.txt"
-fi
-
 cosyvoice_mount=()
 if [[ -d "${ROOT_DIR}/CosyVoice" ]]; then
   cosyvoice_mount=(-v "${ROOT_DIR}/CosyVoice:/workspace/CosyVoice:ro")
@@ -149,13 +153,6 @@ fi
 gpu_args=()
 if [[ "${BACKEND}" == "qwen" ]]; then
   gpu_args=(--gpus all)
-fi
-
-compiler_env_args=()
-compiler_setup_cmd=""
-if [[ "${BACKEND}" == "qwen" ]]; then
-  compiler_env_args=(-e "CC=gcc" -e "CXX=g++")
-  compiler_setup_cmd="if [ -f /etc/apt/sources.list.d/debian.sources ]; then sed -i 's|http://deb.debian.org/debian|http://mirrors.aliyun.com/debian|g; s|http://deb.debian.org/debian-security|http://mirrors.aliyun.com/debian-security|g' /etc/apt/sources.list.d/debian.sources; fi && if [ -f /etc/apt/sources.list ]; then sed -i 's|http://deb.debian.org/debian|http://mirrors.aliyun.com/debian|g; s|http://security.debian.org/debian-security|http://mirrors.aliyun.com/debian-security|g' /etc/apt/sources.list; fi && export DEBIAN_FRONTEND=noninteractive && apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=30 && apt-get install -y --no-install-recommends build-essential && rm -rf /var/lib/apt/lists/* && "
 fi
 
 run_args=(
@@ -171,7 +168,6 @@ run_args=(
   -e "TTS_MODEL_NAME=${MODEL_NAME}"
   -e "TTS_TRITON_URL=${TRITON_GRPC_URL}"
   -e "TTS_TRITON_MODEL_NAME=${TRITON_MODEL_NAME}"
-  "${compiler_env_args[@]}"
   "${api_key_args[@]}"
   -v "${ROOT_DIR}:/workspace/model-test:ro"
   "${cosyvoice_mount[@]}"
@@ -179,7 +175,7 @@ run_args=(
   --mount "type=volume,source=tts-model-cache,target=/root/.cache/huggingface"
   "${API_IMAGE}"
   sh -ec
-  "${compiler_setup_cmd}pip3 install --disable-pip-version-check -i https://mirrors.aliyun.com/pypi/simple -r ${requirements}; cd /workspace/model-test; exec python -m uvicorn app.tts_api:app --host 0.0.0.0 --port ${API_PORT}"
+  "cd /workspace/model-test; exec python -m uvicorn app.tts_api:app --host 0.0.0.0 --port ${API_PORT}"
 )
 
 if [[ -n "${PROMPT_WAV}" ]]; then

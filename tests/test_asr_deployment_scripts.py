@@ -116,6 +116,20 @@ def test_sensevoice_runtime_is_pinned_and_installed_in_asr_image():
     assert "-r requirements-asr-sensevoice.txt" in dockerfile
 
 
+def test_tts_adapter_dependencies_are_baked_into_image():
+    script_content = script("run_tts_triton_adapter.sh")
+    dockerfile = Path("Dockerfile.tts-adapter").read_text()
+
+    assert 'DEFAULT_API_IMAGE="cosyvoice-tts-adapter:latest"' in script_content
+    assert 'API_IMAGE="${TTS_API_IMAGE:-${DEFAULT_API_IMAGE}}"' in script_content
+    assert 'docker build' in script_content
+    assert "Dockerfile.tts-adapter" in script_content
+    assert "-r requirements-tts-adapter.txt" in dockerfile
+    assert "-r requirements-tts-qwen.txt" in dockerfile
+    assert "sox" in dockerfile
+    assert "pip3 install" not in script_content
+
+
 def test_a10_sensevoice_release_contract_and_evaluation_runbook():
     example = Path("cloud/A10.sensevoice.env.example").read_text()
     verifier = Path("scripts/verify_asr_release.sh").read_text()

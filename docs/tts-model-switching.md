@@ -44,8 +44,10 @@ docker rm -f cosyvoice-tts-api 2>/dev/null || true
 scripts/run_tts_triton_adapter.sh --foreground
 ```
 
-脚本检测到 `TTS_BACKEND=qwen` 时不会要求 Triton 容器，并会安装
-`requirements-tts-qwen.txt`。Qwen Python 包当前的 `non_streaming_mode=False`
+脚本首次运行时会自动构建 `cosyvoice-tts-adapter:latest` 镜像，将 adapter 和
+Qwen 依赖预装进去；后续重建容器不会再次执行 pip 安装。也可以通过
+`TTS_API_IMAGE` 指定已经构建好的兼容镜像。脚本检测到 `TTS_BACKEND=qwen` 时不会要求
+Triton 容器。Qwen Python 包当前的 `non_streaming_mode=False`
 仍是模拟增量文本输入，不能视为真正的增量音频生成；测试报告必须标注这一差异。
 
 两种后端都使用同一个 `/v1/tts` 和 `/v1/tts/stream` 协议，压测脚本只需要替换

@@ -1,0 +1,33 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
+ARG PIP_TRUSTED_HOST=mirrors.aliyun.com
+
+WORKDIR /workspace/model-test
+
+RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+      sed -i \
+        -e 's|http://deb.debian.org/debian|http://mirrors.aliyun.com/debian|g' \
+        -e 's|http://deb.debian.org/debian-security|http://mirrors.aliyun.com/debian-security|g' \
+        /etc/apt/sources.list.d/debian.sources; \
+    fi \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+      build-essential \
+      ffmpeg \
+      libsndfile1 \
+      libsox-fmt-all \
+      sox \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements-tts-adapter.txt requirements-tts-qwen.txt ./
+
+RUN python -m pip install \
+      --index-url "${PIP_INDEX_URL}" \
+      --trusted-host "${PIP_TRUSTED_HOST}" \
+      -r requirements-tts-adapter.txt \
+      -r requirements-tts-qwen.txt
