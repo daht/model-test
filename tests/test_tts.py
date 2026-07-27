@@ -234,6 +234,26 @@ def test_qwen_model_load_falls_back_to_auto_on_meta_tensor_error():
     ]
 
 
+def test_qwen_model_load_falls_back_on_runtime_meta_tensor_error():
+    calls = []
+
+    class FakeModel:
+        @classmethod
+        def from_pretrained(cls, model_id, device_map, dtype):
+            calls.append((model_id, device_map, dtype))
+            if device_map != "auto":
+                raise RuntimeError("Cannot copy out of meta tensor; no data!")
+            return {"model_id": model_id, "device_map": device_map, "dtype": dtype}
+
+    loaded = _load_qwen_model(FakeModel, "/models/qwen", device_map="cuda:0", dtype="bf16")
+
+    assert loaded == {"model_id": "/models/qwen", "device_map": "auto", "dtype": "bf16"}
+    assert calls == [
+        ("/models/qwen", "cuda:0", "bf16"),
+        ("/models/qwen", "auto", "bf16"),
+    ]
+
+
 def test_factory_selects_qwen_without_loading_model(tmp_path):
     settings = _settings(tmp_path)
     settings.tts_backend = "qwen"

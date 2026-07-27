@@ -87,7 +87,7 @@ def _load_qwen_model(model_class, model_id: str, *, device_map: str, dtype):
             device_map=device_map,
             dtype=dtype,
         )
-    except NotImplementedError as exc:
+    except Exception as exc:
         if "Cannot copy out of meta tensor" not in str(exc):
             raise
         if device_map == "auto":
