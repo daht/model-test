@@ -155,7 +155,7 @@ compiler_env_args=()
 compiler_setup_cmd=""
 if [[ "${BACKEND}" == "qwen" ]]; then
   compiler_env_args=(-e "CC=gcc" -e "CXX=g++")
-  compiler_setup_cmd="apt-get update && apt-get install -y --no-install-recommends build-essential && rm -rf /var/lib/apt/lists/* && "
+  compiler_setup_cmd="if [ -f /etc/apt/sources.list.d/debian.sources ]; then sed -i 's|http://deb.debian.org/debian|http://mirrors.aliyun.com/debian|g; s|http://deb.debian.org/debian-security|http://mirrors.aliyun.com/debian-security|g' /etc/apt/sources.list.d/debian.sources; fi && if [ -f /etc/apt/sources.list ]; then sed -i 's|http://deb.debian.org/debian|http://mirrors.aliyun.com/debian|g; s|http://security.debian.org/debian-security|http://mirrors.aliyun.com/debian-security|g' /etc/apt/sources.list; fi && export DEBIAN_FRONTEND=noninteractive && apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=30 && apt-get install -y --no-install-recommends build-essential && rm -rf /var/lib/apt/lists/* && "
 fi
 
 run_args=(
