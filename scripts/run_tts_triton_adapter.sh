@@ -8,18 +8,30 @@ API_CONTAINER="${TTS_API_CONTAINER:-cosyvoice-tts-api}"
 API_PORT="${TTS_API_PORT:-8003}"
 TRITON_HTTP_PORT="${TTS_TRITON_HTTP_PORT:-18000}"
 TRITON_GRPC_URL="${TTS_TRITON_URL:-127.0.0.1:18001}"
-MODEL_NAME="${TTS_MODEL_NAME:-Fun-CosyVoice3-0.5B-2512}"
+BACKEND="${TTS_BACKEND:-}"
+MODEL_NAME="${TTS_MODEL_NAME:-}"
 TRITON_MODEL_NAME="${TTS_TRITON_MODEL_NAME:-cosyvoice3}"
 PROMPT_WAV="${TTS_PROMPT_WAV:-}"
 API_KEY_VALUE="${API_KEY:-}"
 ENV_FILE="${TTS_API_ENV_FILE:-${ROOT_DIR}/.env}"
 
+env_file_value() {
+  local key="$1"
+  [[ -f "${ENV_FILE}" ]] || return 0
+  awk -F= -v key="${key}" '$1 ~ "^[[:space:]]*" key "[[:space:]]*$" {sub(/^[[:space:]]*/, "", $2); sub(/[[:space:]]*$/, "", $2); print $2; exit}' "${ENV_FILE}"
+}
+
+BACKEND="${BACKEND:-$(env_file_value TTS_BACKEND)}"
+MODEL_NAME="${MODEL_NAME:-$(env_file_value TTS_MODEL_NAME)}"
+BACKEND="${BACKEND:-triton}"
+MODEL_NAME="${MODEL_NAME:-Fun-CosyVoice3-0.5B-2512}"
+
 usage() {
   cat <<'EOF'
 Usage: scripts/run_tts_triton_adapter.sh [--foreground]
 
-Starts the FastAPI WebSocket adapter in a separate Docker container.
-The Triton container must already be running and expose HTTP 18000 and gRPC 18001.
+Starts the FastAPI WebSocket adapter in a separate Docker container. The backend
+is selected by TTS_BACKEND in the environment file.
 
 Environment overrides:
   API_KEY                    Optional override; otherwise read from .env
@@ -28,6 +40,7 @@ Environment overrides:
   TTS_API_PORT               Adapter WebSocket port (default: 8003)
   TTS_TRITON_CONTAINER       Triton container name
   TTS_API_IMAGE              Adapter image (default: python:3.12-slim)
+  TTS_BACKEND                Deployment backend: triton or qwen
   TTS_MODEL_NAME             Public model name
   TTS_TRITON_MODEL_NAME      Triton model name
   TTS_PROMPT_WAV             Prompt path inside adapter container
@@ -63,25 +76,30 @@ if [[ -z "${API_KEY_VALUE}" ]] && ! grep -Eq '^[[:space:]]*API_KEY[[:space:]]*=[
   exit 2
 fi
 
-if ! docker inspect "${TRITON_CONTAINER}" >/dev/null 2>&1; then
+if [[ "${BACKEND}" == "triton" ]] && ! docker inspect "${TRITON_CONTAINER}" >/dev/null 2>&1; then
   echo "Triton container does not exist: ${TRITON_CONTAINER}" >&2
   exit 2
 fi
-if [[ "$(docker inspect --format '{{.State.Running}}' "${TRITON_CONTAINER}")" != "true" ]]; then
+if [[ "${BACKEND}" == "triton" ]] && [[ "$(docker inspect --format '{{.State.Running}}' "${TRITON_CONTAINER}")" != "true" ]]; then
   echo "Triton container is not running: ${TRITON_CONTAINER}" >&2
   exit 2
 fi
 
-ready=false
-for _ in $(seq 1 60); do
-  if curl -fsS "http://127.0.0.1:${TRITON_HTTP_PORT}/v2/health/ready" >/dev/null; then
-    ready=true
-    break
+if [[ "${BACKEND}" == "triton" ]]; then
+  ready=false
+  for _ in $(seq 1 60); do
+    if curl -fsS "http://127.0.0.1:${TRITON_HTTP_PORT}/v2/health/ready" >/dev/null; then
+      ready=true
+      break
+    fi
+    sleep 2
+  done
+  if [[ "${ready}" != "true" ]]; then
+    echo "Triton is not ready on HTTP port ${TRITON_HTTP_PORT}" >&2
+    exit 2
   fi
-  sleep 2
-done
-if [[ "${ready}" != "true" ]]; then
-  echo "Triton is not ready on HTTP port ${TRITON_HTTP_PORT}" >&2
+elif [[ "${BACKEND}" != "qwen" ]]; then
+  echo "Unsupported TTS_BACKEND: ${BACKEND}; expected triton or qwen" >&2
   exit 2
 fi
 
@@ -118,25 +136,42 @@ if [[ -n "${API_KEY_VALUE}" ]]; then
   api_key_args+=(-e "API_KEY=${API_KEY_VALUE}")
 fi
 
+requirements="/workspace/model-test/requirements-tts-adapter.txt"
+if [[ "${BACKEND}" == "qwen" ]]; then
+  requirements="${requirements} /workspace/model-test/requirements-tts-qwen.txt"
+fi
+
+cosyvoice_mount=()
+if [[ -d "${ROOT_DIR}/CosyVoice" ]]; then
+  cosyvoice_mount=(-v "${ROOT_DIR}/CosyVoice:/workspace/CosyVoice:ro")
+fi
+
+gpu_args=()
+if [[ "${BACKEND}" == "qwen" ]]; then
+  gpu_args=(--gpus all)
+fi
+
 run_args=(
   run -d
   --name "${API_CONTAINER}"
   --restart unless-stopped
   --net host
+  "${gpu_args[@]}"
   "${env_args[@]}"
   -e "ASR_BACKEND=mock"
   -e "MODEL_BACKEND=mock"
-  -e "TTS_BACKEND=triton"
+  -e "TTS_BACKEND=${BACKEND}"
   -e "TTS_MODEL_NAME=${MODEL_NAME}"
   -e "TTS_TRITON_URL=${TRITON_GRPC_URL}"
   -e "TTS_TRITON_MODEL_NAME=${TRITON_MODEL_NAME}"
   "${api_key_args[@]}"
   -v "${ROOT_DIR}:/workspace/model-test:ro"
-  -v "${ROOT_DIR}/CosyVoice:/workspace/CosyVoice:ro"
+  "${cosyvoice_mount[@]}"
   --mount "type=volume,source=tts-adapter-pip-cache,target=/root/.cache/pip"
+  --mount "type=volume,source=tts-model-cache,target=/root/.cache/huggingface"
   "${API_IMAGE}"
   sh -ec
-  "pip3 install --disable-pip-version-check -i https://mirrors.aliyun.com/pypi/simple -r /workspace/model-test/requirements-tts-adapter.txt; cd /workspace/model-test; exec python -m uvicorn app.tts_api:app --host 0.0.0.0 --port ${API_PORT}"
+  "pip3 install --disable-pip-version-check -i https://mirrors.aliyun.com/pypi/simple -r ${requirements}; cd /workspace/model-test; exec python -m uvicorn app.tts_api:app --host 0.0.0.0 --port ${API_PORT}"
 )
 
 if [[ -n "${PROMPT_WAV}" ]]; then

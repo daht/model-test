@@ -8,7 +8,6 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from pathlib import Path
 from threading import Event
 
 from fastapi import Depends, FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
@@ -22,13 +21,11 @@ settings = get_settings()
 tts_synthesizer = create_tts_synthesizer(settings)
 tts_synthesizers = {
     settings.tts_model_name: tts_synthesizer,
-    Path(settings.tts_model_id).name: tts_synthesizer,
-    settings.tts_triton_model_name: tts_synthesizer,
 }
 
 app = FastAPI(
-    title="CosyVoice TTS REST API",
-    version="0.2.0",
+    title="TTS REST API",
+    version="0.3.0",
     description="REST and MiniMax-style WebSocket API for streaming text-to-speech.",
 )
 
@@ -250,13 +247,10 @@ def _websocket_api_key(websocket: WebSocket) -> str | None:
 
 def _validate_task_start(payload: dict, settings: Settings) -> tuple[str, str, str]:
     model = payload.get("model")
-    model_names = {
-        settings.tts_model_name,
-        Path(settings.tts_model_id).name,
-        settings.tts_triton_model_name,
-    }
-    if model not in model_names:
-        raise ValueError(f"unknown TTS model: {model}")
+    if model != settings.tts_model_name:
+        raise ValueError(
+            f"unknown TTS model: {model}; configured model is {settings.tts_model_name}"
+        )
 
     voice_setting = payload.get("voice_setting")
     if not isinstance(voice_setting, dict):

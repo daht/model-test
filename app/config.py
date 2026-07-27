@@ -110,7 +110,7 @@ class Settings(BaseSettings):
     asr_gateway_default_backend: str = Field(default="local", min_length=1, max_length=128)
     asr_gateway_max_active_sessions: int = Field(default=2, gt=0, le=1024)
     tts_model_name: str = "CosyVoice"
-    tts_backend: Literal["mock", "cosyvoice", "triton"] = "mock"
+    tts_backend: Literal["mock", "cosyvoice", "triton", "qwen"] = "mock"
     tts_triton_url: str = "127.0.0.1:18001"
     tts_triton_model_name: str = "cosyvoice3"
     tts_model_id: str = "/models/CosyVoice"
@@ -123,6 +123,9 @@ class Settings(BaseSettings):
         "You are a helpful assistant.<|endofprompt|>希望你以后能够做的比我还好呦。"
     )
     tts_prompt_wav: str = "/opt/CosyVoice/asset/zero_shot_prompt.wav"
+    tts_qwen_speaker: str = "Vivian"
+    tts_qwen_language: str = "Chinese"
+    tts_qwen_instruct: str = ""
     trust_remote_code: bool = True
 
     @field_validator("asr_max_frame_bytes")

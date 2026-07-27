@@ -7,7 +7,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from app.tts import CosyVoiceTTSSynthesizer, _cosyvoice_result_to_wav
+from app.tts import CosyVoiceTTSSynthesizer, _cosyvoice_result_to_wav, create_tts_synthesizer
+from app.tts_qwen import Qwen3TTSSynthesizer
 from app.tts_triton import TritonTTSSynthesizer, _float_audio_to_pcm
 
 
@@ -187,3 +188,34 @@ def test_triton_stream_consumes_decoupled_chunks_until_final_response(tmp_path):
         np.array([0.25 * 32767], dtype="<i2").tobytes(),
         np.array([-0.25 * 32767], dtype="<i2").tobytes(),
     ]
+
+
+def test_qwen_custom_voice_uses_deployment_settings(tmp_path):
+    settings = _settings(tmp_path)
+    settings.tts_qwen_language = "Chinese"
+    settings.tts_qwen_speaker = "Vivian"
+    settings.tts_qwen_instruct = ""
+
+    class FakeModel:
+        def generate_custom_voice(self, **kwargs):
+            assert kwargs == {
+                "text": "hello",
+                "language": "Chinese",
+                "speaker": "Vivian",
+                "instruct": None,
+            }
+            return [np.array([0.25, -0.25], dtype=np.float32)], 24000
+
+    synthesizer = Qwen3TTSSynthesizer(settings)
+    synthesizer._model = FakeModel()
+
+    assert list(synthesizer.stream_pcm("hello", "default")) == [
+        np.array([8191, -8191], dtype="<i2").tobytes()
+    ]
+
+
+def test_factory_selects_qwen_without_loading_model(tmp_path):
+    settings = _settings(tmp_path)
+    settings.tts_backend = "qwen"
+
+    assert isinstance(create_tts_synthesizer(settings), Qwen3TTSSynthesizer)

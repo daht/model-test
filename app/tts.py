@@ -129,6 +129,10 @@ def create_tts_synthesizer(settings: Settings) -> TTSSynthesizer:
         from app.tts_triton import TritonTTSSynthesizer
 
         return TritonTTSSynthesizer(settings)
+    if settings.tts_backend == "qwen":
+        from app.tts_qwen import Qwen3TTSSynthesizer
+
+        return Qwen3TTSSynthesizer(settings)
     return CosyVoiceTTSSynthesizer(settings)
 
 
