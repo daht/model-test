@@ -151,6 +151,13 @@ if [[ "${BACKEND}" == "qwen" ]]; then
   gpu_args=(--gpus all)
 fi
 
+compiler_env_args=()
+compiler_setup_cmd=""
+if [[ "${BACKEND}" == "qwen" ]]; then
+  compiler_env_args=(-e "CC=gcc" -e "CXX=g++")
+  compiler_setup_cmd="apt-get update && apt-get install -y --no-install-recommends build-essential && rm -rf /var/lib/apt/lists/* && "
+fi
+
 run_args=(
   run -d
   --name "${API_CONTAINER}"
@@ -164,6 +171,7 @@ run_args=(
   -e "TTS_MODEL_NAME=${MODEL_NAME}"
   -e "TTS_TRITON_URL=${TRITON_GRPC_URL}"
   -e "TTS_TRITON_MODEL_NAME=${TRITON_MODEL_NAME}"
+  "${compiler_env_args[@]}"
   "${api_key_args[@]}"
   -v "${ROOT_DIR}:/workspace/model-test:ro"
   "${cosyvoice_mount[@]}"
@@ -171,7 +179,7 @@ run_args=(
   --mount "type=volume,source=tts-model-cache,target=/root/.cache/huggingface"
   "${API_IMAGE}"
   sh -ec
-  "pip3 install --disable-pip-version-check -i https://mirrors.aliyun.com/pypi/simple -r ${requirements}; cd /workspace/model-test; exec python -m uvicorn app.tts_api:app --host 0.0.0.0 --port ${API_PORT}"
+  "${compiler_setup_cmd}pip3 install --disable-pip-version-check -i https://mirrors.aliyun.com/pypi/simple -r ${requirements}; cd /workspace/model-test; exec python -m uvicorn app.tts_api:app --host 0.0.0.0 --port ${API_PORT}"
 )
 
 if [[ -n "${PROMPT_WAV}" ]]; then
