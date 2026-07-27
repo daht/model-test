@@ -133,6 +133,10 @@ def create_tts_synthesizer(settings: Settings) -> TTSSynthesizer:
         from app.tts_qwen import Qwen3TTSSynthesizer
 
         return Qwen3TTSSynthesizer(settings)
+    if settings.tts_backend == "vllm_omni":
+        from app.tts_vllm_omni import VLLMOmniTTSSynthesizer
+
+        return VLLMOmniTTSSynthesizer(settings)
     return CosyVoiceTTSSynthesizer(settings)
 
 

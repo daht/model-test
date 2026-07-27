@@ -41,7 +41,7 @@ Environment overrides:
   TTS_API_PORT               Adapter WebSocket port (default: 8003)
   TTS_TRITON_CONTAINER       Triton container name
   TTS_API_IMAGE              Adapter image (default: cosyvoice-tts-adapter:latest)
-  TTS_BACKEND                Deployment backend: triton or qwen
+  TTS_BACKEND                Deployment backend: triton, qwen, or vllm_omni
   TTS_MODEL_NAME             Public model name
   TTS_TRITON_MODEL_NAME      Triton model name
   TTS_PROMPT_WAV             Prompt path inside adapter container
@@ -99,8 +99,8 @@ if [[ "${BACKEND}" == "triton" ]]; then
     echo "Triton is not ready on HTTP port ${TRITON_HTTP_PORT}" >&2
     exit 2
   fi
-elif [[ "${BACKEND}" != "qwen" ]]; then
-  echo "Unsupported TTS_BACKEND: ${BACKEND}; expected triton or qwen" >&2
+elif [[ "${BACKEND}" != "qwen" && "${BACKEND}" != "vllm_omni" ]]; then
+  echo "Unsupported TTS_BACKEND: ${BACKEND}; expected triton, qwen, or vllm_omni" >&2
   exit 2
 fi
 

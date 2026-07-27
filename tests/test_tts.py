@@ -11,6 +11,7 @@ import pytest
 from app.tts import CosyVoiceTTSSynthesizer, _cosyvoice_result_to_wav, create_tts_synthesizer
 from app.tts_qwen import Qwen3TTSSynthesizer, _load_qwen_model
 from app.tts_triton import TritonTTSSynthesizer, _float_audio_to_pcm
+from app.tts_vllm_omni import VLLMOmniTTSSynthesizer
 
 
 def _settings(tmp_path: Path):
@@ -27,6 +28,10 @@ def _settings(tmp_path: Path):
         tts_qwen_batch_wait_ms=50,
         tts_qwen_queue_size=8,
         tts_qwen_request_timeout_seconds=2.0,
+        tts_vllm_omni_base_url="http://vllm-omni:8091",
+        tts_vllm_omni_model="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+        tts_vllm_omni_timeout_seconds=30.0,
+        tts_vllm_omni_api_key=None,
     )
 
 
@@ -314,8 +319,148 @@ def test_qwen_model_load_is_single_owner_under_concurrency(monkeypatch, tmp_path
     assert len(calls) == 1
 
 
+def test_vllm_omni_streams_pcm_chunks_and_uses_custom_voice_contract(tmp_path):
+    settings = _settings(tmp_path)
+    settings.tts_qwen_language = "Chinese"
+    settings.tts_qwen_speaker = "Vivian"
+    settings.tts_qwen_instruct = ""
+    calls = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+        def iter_bytes(self):
+            yield b"\x01\x00"
+            yield b"\x02\x00"
+
+    class FakeClient:
+        def stream(self, method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            return FakeResponse()
+
+    synthesizer = VLLMOmniTTSSynthesizer(settings, client=FakeClient())
+
+    assert list(synthesizer.stream_pcm("hello", "default")) == [b"\x01\x00", b"\x02\x00"]
+    assert calls == [
+        (
+            "POST",
+            "http://vllm-omni:8091/v1/audio/speech",
+            {
+                "json": {
+                    "model": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+                    "input": "hello",
+                    "voice": "Vivian",
+                    "response_format": "pcm",
+                    "stream": True,
+                    "task_type": "CustomVoice",
+                    "language": "Chinese",
+                },
+                "headers": {},
+                "timeout": 30.0,
+            },
+        )
+    ]
+
+
+def test_vllm_omni_rejects_invalid_pcm_chunks(tmp_path):
+    settings = _settings(tmp_path)
+    settings.tts_qwen_language = "Chinese"
+    settings.tts_qwen_speaker = "Vivian"
+    settings.tts_qwen_instruct = ""
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+        def iter_bytes(self):
+            yield b"\x01"
+
+    class FakeClient:
+        def stream(self, *args, **kwargs):
+            return FakeResponse()
+
+    synthesizer = VLLMOmniTTSSynthesizer(settings, client=FakeClient())
+
+    with pytest.raises(RuntimeError, match="odd-length pcm_s16le"):
+        list(synthesizer.stream_pcm("hello"))
+
+
+def test_vllm_omni_reassembles_pcm_samples_split_by_http_chunks(tmp_path):
+    settings = _settings(tmp_path)
+    settings.tts_qwen_language = "Chinese"
+    settings.tts_qwen_speaker = "Vivian"
+    settings.tts_qwen_instruct = ""
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+        def iter_bytes(self):
+            yield b"\x01"
+            yield b"\x00\x02"
+            yield b"\x00"
+
+    class FakeClient:
+        def stream(self, *args, **kwargs):
+            return FakeResponse()
+
+    synthesizer = VLLMOmniTTSSynthesizer(settings, client=FakeClient())
+
+    assert list(synthesizer.stream_pcm("hello")) == [b"\x01\x00", b"\x02\x00"]
+
+
+def test_vllm_omni_start_checks_upstream_health(tmp_path):
+    settings = _settings(tmp_path)
+    calls = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+    class FakeClient:
+        def get(self, url, **kwargs):
+            calls.append((url, kwargs))
+            return FakeResponse()
+
+    synthesizer = VLLMOmniTTSSynthesizer(settings, client=FakeClient())
+    synthesizer.start()
+
+    assert calls == [
+        (
+            "http://vllm-omni:8091/health",
+            {"timeout": 30.0},
+        )
+    ]
+
+
 def test_factory_selects_qwen_without_loading_model(tmp_path):
     settings = _settings(tmp_path)
     settings.tts_backend = "qwen"
 
     assert isinstance(create_tts_synthesizer(settings), Qwen3TTSSynthesizer)
+
+
+def test_factory_selects_vllm_omni(tmp_path):
+    settings = _settings(tmp_path)
+    settings.tts_backend = "vllm_omni"
+
+    assert isinstance(create_tts_synthesizer(settings), VLLMOmniTTSSynthesizer)

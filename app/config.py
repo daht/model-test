@@ -110,7 +110,7 @@ class Settings(BaseSettings):
     asr_gateway_default_backend: str = Field(default="local", min_length=1, max_length=128)
     asr_gateway_max_active_sessions: int = Field(default=2, gt=0, le=1024)
     tts_model_name: str = "CosyVoice"
-    tts_backend: Literal["mock", "cosyvoice", "triton", "qwen"] = "mock"
+    tts_backend: Literal["mock", "cosyvoice", "triton", "qwen", "vllm_omni"] = "mock"
     tts_triton_url: str = "127.0.0.1:18001"
     tts_triton_model_name: str = "cosyvoice3"
     tts_model_id: str = "/models/CosyVoice"
@@ -130,6 +130,14 @@ class Settings(BaseSettings):
     tts_qwen_batch_wait_ms: int = Field(default=20, ge=0, le=1000)
     tts_qwen_queue_size: int = Field(default=32, gt=0, le=1024)
     tts_qwen_request_timeout_seconds: float = Field(default=300.0, gt=0, le=3600)
+    tts_vllm_omni_base_url: str = Field(
+        default="http://127.0.0.1:8091", min_length=1
+    )
+    tts_vllm_omni_model: str = Field(
+        default="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", min_length=1
+    )
+    tts_vllm_omni_timeout_seconds: float = Field(default=300.0, gt=0, le=3600)
+    tts_vllm_omni_api_key: str | None = None
     trust_remote_code: bool = True
 
     @field_validator("asr_max_frame_bytes")
@@ -139,7 +147,12 @@ class Settings(BaseSettings):
             raise ValueError("asr_max_frame_bytes must be even for pcm_s16le")
         return value
 
-    @field_validator("vllm_base_url", "vllm_model")
+    @field_validator(
+        "vllm_base_url",
+        "vllm_model",
+        "tts_vllm_omni_base_url",
+        "tts_vllm_omni_model",
+    )
     @classmethod
     def require_nonempty_vllm_setting(cls, value: str) -> str:
         normalized = value.strip()

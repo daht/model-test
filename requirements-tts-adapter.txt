@@ -2,4 +2,5 @@ fastapi==0.139.0
 uvicorn[standard]==0.38.0
 pydantic-settings==2.14.2
 numpy==1.26.4
+httpx==0.28.1
 tritonclient[grpc]==2.59.0

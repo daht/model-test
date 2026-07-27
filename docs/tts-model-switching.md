@@ -50,5 +50,27 @@ Qwen 依赖预装进去；后续重建容器不会再次执行 pip 安装。也�
 Triton 容器。Qwen Python 包当前的 `non_streaming_mode=False`
 仍是模拟增量文本输入，不能视为真正的增量音频生成；测试报告必须标注这一差异。
 
-两种后端都使用同一个 `/v1/tts` 和 `/v1/tts/stream` 协议，压测脚本只需要替换
+## Qwen3-TTS 0.6B vLLM-Omni
+
+该后端不在 adapter 容器中加载 Qwen 或占用 GPU。它将请求转发到独立的
+vLLM-Omni `/v1/audio/speech` 服务，并使用 `stream=true` 和
+`response_format=pcm` 接收真实的增量 PCM chunk。
+
+```dotenv
+TTS_BACKEND=vllm_omni
+TTS_MODEL_NAME=Qwen3-TTS-0.6B
+TTS_VLLM_OMNI_BASE_URL=http://127.0.0.1:8091
+TTS_VLLM_OMNI_MODEL=Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice
+TTS_VLLM_OMNI_TIMEOUT_SECONDS=300
+TTS_QWEN_SPEAKER=Vivian
+TTS_QWEN_LANGUAGE=Chinese
+TTS_QWEN_INSTRUCT=
+TTS_SAMPLE_RATE=24000
+```
+
+如果 vLLM-Omni 配置了 API key，额外设置 `TTS_VLLM_OMNI_API_KEY`。adapter 在启动时
+检查上游 `/health`；上游不可用时 adapter 不会报告健康。外部接口仍为 `/v1/tts` 和
+`/v1/tts/stream`，其中 WebSocket 会在收到每个上游 PCM chunk 后立即转发。
+
+三种后端都使用同一个 `/v1/tts` 和 `/v1/tts/stream` 协议，压测脚本只需要替换
 `TTS_MODEL_NAME` 和输出目录。
