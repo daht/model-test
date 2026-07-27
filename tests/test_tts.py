@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from app.tts import CosyVoiceTTSSynthesizer, _cosyvoice_result_to_wav, create_tts_synthesizer
-from app.tts_qwen import Qwen3TTSSynthesizer
+from app.tts_qwen import Qwen3TTSSynthesizer, _load_qwen_model
 from app.tts_triton import TritonTTSSynthesizer, _float_audio_to_pcm
 
 
@@ -211,6 +211,26 @@ def test_qwen_custom_voice_uses_deployment_settings(tmp_path):
 
     assert list(synthesizer.stream_pcm("hello", "default")) == [
         np.array([8191, -8191], dtype="<i2").tobytes()
+    ]
+
+
+def test_qwen_model_load_falls_back_to_auto_on_meta_tensor_error():
+    calls = []
+
+    class FakeModel:
+        @classmethod
+        def from_pretrained(cls, model_id, device_map, dtype):
+            calls.append((model_id, device_map, dtype))
+            if device_map != "auto":
+                raise NotImplementedError("Cannot copy out of meta tensor; no data!")
+            return {"model_id": model_id, "device_map": device_map, "dtype": dtype}
+
+    loaded = _load_qwen_model(FakeModel, "/models/qwen", device_map="cuda:0", dtype="bf16")
+
+    assert loaded == {"model_id": "/models/qwen", "device_map": "auto", "dtype": "bf16"}
+    assert calls == [
+        ("/models/qwen", "cuda:0", "bf16"),
+        ("/models/qwen", "auto", "bf16"),
     ]
 
 

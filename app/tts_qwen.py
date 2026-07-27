@@ -67,7 +67,8 @@ class Qwen3TTSSynthesizer:
             "float32": torch.float32,
         }.get(self.settings.torch_dtype, torch.bfloat16)
         try:
-            self._model = Qwen3TTSModel.from_pretrained(
+            self._model = _load_qwen_model(
+                Qwen3TTSModel,
                 self.settings.tts_model_id,
                 device_map=self.settings.tts_device,
                 dtype=dtype,
@@ -77,6 +78,25 @@ class Qwen3TTSSynthesizer:
                 f"failed to load Qwen3-TTS model {self.settings.tts_model_id}: {exc}"
             ) from exc
         return self._model
+
+
+def _load_qwen_model(model_class, model_id: str, *, device_map: str, dtype):
+    try:
+        return model_class.from_pretrained(
+            model_id,
+            device_map=device_map,
+            dtype=dtype,
+        )
+    except NotImplementedError as exc:
+        if "Cannot copy out of meta tensor" not in str(exc):
+            raise
+        if device_map == "auto":
+            raise
+        return model_class.from_pretrained(
+            model_id,
+            device_map="auto",
+            dtype=dtype,
+        )
 
 
 def _float_audio_to_pcm(audio) -> bytes:
