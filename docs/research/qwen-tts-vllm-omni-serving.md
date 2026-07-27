@@ -12,7 +12,7 @@
 2. 官方 `qwen-tts` 的 `generate_custom_voice()` 支持把多个文本作为一个显式 list batch 传入，但当前官方 Python wrapper 在 `stream_pcm()` 这类调用中返回完整 waveform 后才解码，不能提供真正的增量音频生成。官方源码还明确写明 `non_streaming_mode=False` 目前只是模拟 streaming text input，不会启用真正的 streaming generation。
 3. vLLM-Omni 当前的 Qwen3-TTS 在线服务是另一套实现：Talker stage 使用 vLLM scheduler，Code2Wav stage 通过 Omni connector 传递 codec chunk；stage worker 可让多个请求进入同一个 stage batch。其官方文档建议通过 `--stage-overrides` 调整 `max_num_seqs`，而不是在应用层串行调用 Python model。
 4. Qwen 官方 README（该上游 commit）仍写着 vLLM-Omni 对 Qwen3-TTS 只支持 offline inference、online serving later；但 vLLM-Omni 当前 HEAD 已有在线 speech API 和 Qwen3-TTS online examples。这是两边文档不同步，不能把 Qwen README 的旧状态当作当前 vLLM-Omni 能力边界。
-5. vLLM-Omni 当前 supported-models 表只列出 Qwen3-TTS 12Hz 的 1.7B CustomVoice、VoiceDesign、Base；虽然其在线文档提到存在 0.6B companion，但没有把 0.6B 列入 supported-models 表。对当前使用的 `Qwen3-TTS-12Hz-0.6B-CustomVoice`，不能仅凭官方列表断言 vLLM-Omni 已验证支持，必须在目标 vLLM-Omni 版本和本地 checkpoint 上做专门兼容性验证。
+5. vLLM-Omni 最新在线 Qwen3-TTS 文档已明确列出 `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` 和 `Qwen/Qwen3-TTS-12Hz-0.6B-Base` 为支持的更小/更快变体。因此，0.6B CustomVoice 是 vLLM-Omni 官方声明支持的模型；但 upstream 当前公开的 `run_server.sh` 和在线 E2E 测试仍固定 1.7B CustomVoice，未提供 0.6B 的同等 CI 覆盖。生产切换前仍须在目标镜像、GPU 与本地 checkpoint 上做专项验收。
 
 ## Qwen3-TTS 官方 Python 实现
 
@@ -85,17 +85,17 @@ Qwen3-TTS 专门的 tuning 文档进一步说明 stage 0/Talker 和 stage 1/Talk
 
 ### 支持的模型版本
 
-vLLM-Omni supported-models 表目前列出：
+vLLM-Omni 最新的 Qwen3-TTS 在线文档明确列出：
 
 - `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`
 - `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`
 - `Qwen/Qwen3-TTS-12Hz-1.7B-Base`
+- `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`
+- `Qwen/Qwen3-TTS-12Hz-0.6B-Base`
 
-来源：[supported_models.md](https://github.com/vllm-project/vllm-omni/blob/8001bb155dae5798a1ae891ae2529a314c6ee99a/docs/models/supported_models.md#L71-L80)。
+其中 0.6B CustomVoice 的说明是“更小/更快的变体”。文档还明确说明 `stream=true` 且 `response_format="pcm"` 会在 Code2Wav 解码中输出原始 PCM chunk。来源：[vLLM-Omni Qwen3-TTS online serving 文档](https://docs.vllm.com.cn/projects/vllm-omni/en/latest/user_guide/examples/online_serving/qwen3_tts/)。
 
-在线 TTS 文档在模型表中说“each variant ships smaller 0.6B companions where available”，但该表并未把 0.6B 作为已列出的 supported model。来源：[online serving text-to-speech 文档](https://github.com/vllm-project/vllm-omni/blob/8001bb155dae5798a1ae891ae2529a314c6ee99a/docs/user_guide/examples/online_serving/text_to_speech.md#L307-L317)。
-
-Qwen 官方 README 则明确列出 `Qwen3-TTS-12Hz-0.6B-CustomVoice` 并说明该模型支持 CustomVoice；来源：[Qwen README model table](https://github.com/QwenLM/Qwen3-TTS/blob/022e286b98fb8e1e916cb940cdf532cd9f488e/README.md#L64-L100)。这证明 0.6B 是 Qwen 官方模型，但不等于 vLLM-Omni 当前 HEAD 已对它做过同等验证。
+需要区分“官方支持”和“公开 CI 覆盖”：当前 upstream `run_server.sh` 及 online E2E `test_qwen3_tts_customvoice.py` 仍使用 `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`。这不是对 0.6B 的否定，但说明 0.6B 不能直接继承 1.7B 的性能和稳定性结论。来源：[run_server.sh](https://github.com/vllm-project/vllm-omni/blob/main/examples/online_serving/text_to_speech/qwen3_tts/run_server.sh) 和 [online E2E test](https://github.com/vllm-project/vllm-omni/blob/main/tests/e2e/online_serving/test_qwen3_tts_customvoice.py)。
 
 ## 当前项目逐项核对
 
@@ -105,7 +105,7 @@ Qwen 官方 README 则明确列出 `Qwen3-TTS-12Hz-0.6B-CustomVoice` 并说明�
 | 请求并发 | `Qwen3TTSSynthesizer` 只有一个 `_model`，`stream_pcm()` 每次调用一次 `generate_custom_voice()` | vLLM-Omni stage scheduler + `max_num_seqs`/`max_batch_size`，请求可同时进入 stage batch | 当前没有 continuous batching |
 | batch | 每个 HTTP 请求只传一个 `text`，没有把多个请求合并为 list batch | 官方 qwen-tts 支持显式 list batch；vLLM-Omni 提供 `/v1/audio/speech/batch` | 当前没有利用 batch 能力 |
 | 流式输出 | 当前 `stream_pcm()` 在 `generate_custom_voice()` 返回完整 waveform 后只 yield 一次 PCM | vLLM-Omni `async_chunk` 通过 connector 输出 codec/audio chunks | 当前接口是“伪流式”（响应封装为 stream，但首 chunk 需等待完整生成） |
-| 0.6B | Qwen 本地 Python wrapper 可按官方 CustomVoice API 使用 | vLLM-Omni supported-models 当前只列 1.7B 三个 checkpoint | vLLM-Omni 0.6B 需单独验证，不应默认切换 |
+| 0.6B | Qwen 本地 Python wrapper 可按官方 CustomVoice API 使用 | vLLM-Omni 最新在线文档明确列出 0.6B CustomVoice；公开启动脚本/E2E 仍固定 1.7B | 可作为 vLLM-Omni 接入目标，但必须专项验证 |
 | 采样参数 | 当前项目只传 `text/language/speaker/instruct`，使用 qwen-tts 默认 generate 参数 | 官方示例允许 `max_new_tokens` 等 HF `generate` kwargs；vLLM deploy config 显式设 `min_tokens: 2` 等默认值 | 当前没显式设置 `min_new_tokens/min_tokens`；空音频或 EOS 首 token 风险应由线上日志验证 |
 
 ## 对当前故障的解释
@@ -115,4 +115,4 @@ Qwen 官方 README 则明确列出 `Qwen3-TTS-12Hz-0.6B-CustomVoice` 并说明�
 更符合官方实现的两条路线是：
 
 1. **保留 qwen-tts Python backend（0.6B 可行性优先）**：固定官方示例的依赖组合、固定 `device_map="cuda:0"`、在容器启动时做一次显式 model-load smoke test；并接受该路径是单进程/单请求生成，需在应用层另行设计受控并发或显式 list batch。
-2. **采用 vLLM-Omni online serving（continuous batching/低 TTFA 优先）**：使用 vLLM-Omni 的 Qwen3-TTS deploy config 和 `/v1/audio/speech`/`/v1/audio/speech/batch` API。先用官方 supported 的 1.7B checkpoint 验证，再单独验证 0.6B；不能直接把当前 Python adapter 的 `stream_pcm()` 改名为 continuous batching。
+2. **采用 vLLM-Omni online serving（continuous batching/低 TTFA 优先）**：使用 vLLM-Omni 的 Qwen3-TTS deploy config 和 `/v1/audio/speech` API，以 `stream=true` 和 `response_format="pcm"` 获取真正的增量音频。0.6B CustomVoice 已被最新在线文档列为支持模型，但应在当前目标硬件做专项性能、流式正确性和稳定性验收；不能直接把当前 Python adapter 的 `stream_pcm()` 改名为 continuous batching。
