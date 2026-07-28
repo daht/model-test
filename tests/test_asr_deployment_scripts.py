@@ -135,13 +135,23 @@ def test_tts_adapter_script_auto_starts_vllm_omni_backend():
 
     assert 'vllm-omni' in content
     assert 'TTS_VLLM_OMNI_ROOT' in content
+    assert 'TTS_VLLM_OMNI_DEPLOY_CONFIG' in content
     assert '--deploy-config' in content
     assert 'TTS_VLLM_OMNI_START_TIMEOUT_SECONDS' in content
     assert 'Reusing ready vLLM-Omni' in content
     assert '--stage-overrides' in content
     assert '!/^[[:space:]]*TTS_VLLM_OMNI_ROOT[[:space:]]*=/' in content
     assert '!/^[[:space:]]*TTS_VLLM_OMNI_BIN[[:space:]]*=/' in content
+    assert '!/^[[:space:]]*TTS_VLLM_OMNI_DEPLOY_CONFIG[[:space:]]*=/' in content
     assert '!/^[[:space:]]*TTS_VLLM_OMNI_STAGE_OVERRIDES[[:space:]]*=/' in content
+
+
+def test_tts_env_example_documents_vllm_omni_deploy_config():
+    content = Path(".env.example").read_text()
+
+    assert "TTS_VLLM_OMNI_DEPLOY_CONFIG" in content
+    assert "qwen3_tts_high_concurrency.yaml" in content
+    assert "TTS_VLLM_OMNI_STAGE_OVERRIDES" in content
 
 
 def test_a10_sensevoice_release_contract_and_evaluation_runbook():

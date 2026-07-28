@@ -4,6 +4,16 @@
 
 2026-07-24 首轮闭环/开环扫描与服务端瓶颈分析已完成，结果见 [CosyVoice 3 在 NVIDIA A10 上的 WebSocket 流式容量与瓶颈评估](tts-cosyvoice3-a10-capacity-evaluation-2026-07-24.md)。当前实现因全局推理锁和约 4 秒模型输出块，尚未达到临时交互 SLO；本文保留为优化后复测的执行入口。
 
+## 0. 当前执行顺序
+
+当前这条 TTS 生产化验证线按下面顺序走：
+
+1. 锁定可回滚基线：`d4a869f`，先保留当前可跑通的 `stage 1 max_num_seqs=1` 版本；
+2. 切换到支持 `codec_chunk_ramp` 的 vLLM-Omni deploy 配置后复测，优先确认首包和 chunk 连贯性；
+3. 通过后再做容量压测，逐级拉高并发，找出稳定吞吐和失败拐点；
+4. 最后对稳定档位做 soak，验证长时间不掉线、不 OOM、不重启；
+5. 生产验收目标先按 `TTFA p95 < 1s`、`chunk gap p99 < 1s`、0 失败、0 重启来卡。
+
 ## 工具
 
 - `scripts/benchmark_tts_stream.py`：从独立客户端发送 MiniMax 风格 WebSocket 请求，支持闭环并发和开环泊松到达率。
@@ -131,6 +141,8 @@ API key 不会写入上述报告。服务日志中的 IPv4 地址会在归档前
 - 播放断流总时长为 0。
 
 这些门槛尚待产品确认。当前已观察到 CosyVoice 单请求 TTFA 约 3–4 秒、chunk gap 约 2.4–3.1 秒，因此预计功能正确但会暂时判定 SLO 失败；这正是本轮瓶颈定位需要量化的问题。
+
+对 Qwen3-TTS 的生产化验证，实际验收目标按上面的 `TTFA p95 < 1s`、`chunk gap p99 < 1s` 执行；这里保留 0.8/0.5 作为更严格的理想线，不作为当前阻断条件。
 
 ## 7. 方案 B：官方 Triton + TensorRT-LLM 引擎部署与复测路径
 

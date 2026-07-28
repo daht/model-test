@@ -19,6 +19,7 @@ VLLM_OMNI_BASE_URL="${TTS_VLLM_OMNI_BASE_URL:-}"
 VLLM_OMNI_MODEL="${TTS_VLLM_OMNI_MODEL:-}"
 VLLM_OMNI_ROOT="${TTS_VLLM_OMNI_ROOT:-}"
 VLLM_OMNI_BIN="${TTS_VLLM_OMNI_BIN:-}"
+VLLM_OMNI_DEPLOY_CONFIG="${TTS_VLLM_OMNI_DEPLOY_CONFIG:-}"
 VLLM_OMNI_PORT="${TTS_VLLM_OMNI_PORT:-8091}"
 VLLM_OMNI_LOG="${TTS_VLLM_OMNI_LOG:-/tmp/vllm-omni-qwen-tts.log}"
 VLLM_OMNI_PID="${TTS_VLLM_OMNI_PID:-/tmp/vllm-omni-qwen-tts.pid}"
@@ -42,6 +43,7 @@ VLLM_OMNI_BASE_URL="${VLLM_OMNI_BASE_URL:-http://127.0.0.1:8091}"
 VLLM_OMNI_MODEL="${VLLM_OMNI_MODEL:-Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice}"
 VLLM_OMNI_ROOT="${VLLM_OMNI_ROOT:-$(env_file_value TTS_VLLM_OMNI_ROOT)}"
 VLLM_OMNI_BIN="${VLLM_OMNI_BIN:-$(env_file_value TTS_VLLM_OMNI_BIN)}"
+VLLM_OMNI_DEPLOY_CONFIG="${VLLM_OMNI_DEPLOY_CONFIG:-$(env_file_value TTS_VLLM_OMNI_DEPLOY_CONFIG)}"
 VLLM_OMNI_ROOT="${VLLM_OMNI_ROOT:-/opt/vllm-omni}"
 VLLM_OMNI_BIN="${VLLM_OMNI_BIN:-vllm-omni}"
 VLLM_OMNI_API_KEY_VALUE="${VLLM_OMNI_API_KEY_VALUE:-$(env_file_value TTS_VLLM_OMNI_API_KEY)}"
@@ -72,6 +74,7 @@ Environment overrides:
   TTS_PROMPT_WAV             Prompt path inside adapter container
   TTS_VLLM_OMNI_ROOT         vLLM-Omni checkout (default: /opt/vllm-omni)
   TTS_VLLM_OMNI_BIN          vLLM-Omni executable (default: vllm-omni)
+  TTS_VLLM_OMNI_DEPLOY_CONFIG  Override deploy config (default: qwen3_tts.yaml)
   TTS_VLLM_OMNI_LOG          vLLM-Omni log path (default: /tmp/vllm-omni-qwen-tts.log)
   TTS_VLLM_OMNI_START_TIMEOUT_SECONDS  Startup wait (default: 900)
   TTS_VLLM_OMNI_STAGE_OVERRIDES  JSON stage overrides passed to vLLM-Omni
@@ -157,7 +160,7 @@ if [[ "${BACKEND}" == "vllm_omni" ]]; then
           echo "vLLM-Omni root not found: ${VLLM_OMNI_ROOT}" >&2
           exit 2
         }
-        deploy_config="${TTS_VLLM_OMNI_DEPLOY_CONFIG:-${VLLM_OMNI_ROOT}/vllm_omni/deploy/qwen3_tts.yaml}"
+        deploy_config="${VLLM_OMNI_DEPLOY_CONFIG:-${VLLM_OMNI_ROOT}/vllm_omni/deploy/qwen3_tts.yaml}"
         [[ -f "${deploy_config}" ]] || {
           echo "vLLM-Omni deploy config not found: ${deploy_config}" >&2
           exit 2
@@ -263,6 +266,7 @@ if [[ -f "${ENV_FILE}" ]]; then
   awk '
     !/^[[:space:]]*TTS_VLLM_OMNI_ROOT[[:space:]]*=/ &&
     !/^[[:space:]]*TTS_VLLM_OMNI_BIN[[:space:]]*=/ &&
+    !/^[[:space:]]*TTS_VLLM_OMNI_DEPLOY_CONFIG[[:space:]]*=/ &&
     !/^[[:space:]]*TTS_VLLM_OMNI_STAGE_OVERRIDES[[:space:]]*=/
   ' "${ENV_FILE}" >"${container_env_file}"
   env_args+=(--env-file "${container_env_file}")

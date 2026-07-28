@@ -228,6 +228,17 @@ client                       server
 
 当前仓库已实现 MiniMax 风格事件协议和 `stream_pcm()` 逐块链路；CosyVoice 适配器调用 `inference_zero_shot(..., stream=True)`，通过有界线程队列把 PCM 立即交给 WebSocket，不再聚合完整 WAV。代码级时序测试已证明首块不会等待第二块，但仍须在 A10 真模型部署上保存 `first_chunk_generated < synthesis_finished` 证据后，才能正式标记为通过本准入检查。
 
+### 5.1 当前生产化验证步骤
+
+Qwen3-TTS vLLM-Omni 这条线后续按下面顺序执行，结果和证据都要留档：
+
+1. 先保留当前可回滚基线 `d4a869f`，用 `TTS_VLLM_OMNI_STAGE_OVERRIDES='{"1":{"max_num_seqs":1}}'` 复测，确认现状没有脚本级回归；
+2. 切换到支持 `codec_chunk_ramp` 的 deploy 配置，通过 `TTS_VLLM_OMNI_DEPLOY_CONFIG` 指向新的 YAML，再复测真流式准入；
+3. 通过后执行闭环并发阶梯，重点看 `TTFA p95`、`chunk gap p99`、失败率和是否连续出块；
+4. 再执行开环到达率阶梯，找到稳定吞吐和首次失败点之间的边界；
+5. 对候选生产档做 30 到 60 分钟 soak，确认没有重启、OOM、长尾卡顿或断流；
+6. 只要 `TTFA p95 < 1s` 或 `chunk gap p99 < 1s` 任何一个不满足，就回退到基线，不进入容量定档。
+
 ## 6. 指标定义
 
 ### 6.1 流式客户端指标
