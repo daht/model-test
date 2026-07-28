@@ -243,9 +243,22 @@ fi
 
 docker rm -f "${API_CONTAINER}" >/dev/null 2>&1 || true
 
+container_env_file=""
+cleanup_container_env_file() {
+  if [[ -n "${container_env_file}" ]]; then
+    rm -f "${container_env_file}"
+  fi
+}
+trap cleanup_container_env_file EXIT
+
 env_args=()
 if [[ -f "${ENV_FILE}" ]]; then
-  env_args+=(--env-file "${ENV_FILE}")
+  container_env_file="$(mktemp)"
+  awk '
+    !/^[[:space:]]*TTS_VLLM_OMNI_ROOT[[:space:]]*=/ &&
+    !/^[[:space:]]*TTS_VLLM_OMNI_BIN[[:space:]]*=/
+  ' "${ENV_FILE}" >"${container_env_file}"
+  env_args+=(--env-file "${container_env_file}")
 fi
 api_key_args=()
 if [[ -n "${API_KEY_VALUE}" ]]; then
@@ -292,6 +305,8 @@ elif ! grep -Eq '^[[:space:]]*TTS_PROMPT_WAV[[:space:]]*=' "${ENV_FILE}" 2>/dev/
 fi
 
 container_id="$(docker "${run_args[@]}" | tr -d '\n')"
+cleanup_container_env_file
+container_env_file=""
 echo "TTS adapter started: ${API_CONTAINER} (${container_id})"
 echo "WebSocket endpoint: ws://<host>:${API_PORT}/v1/tts/stream"
 
