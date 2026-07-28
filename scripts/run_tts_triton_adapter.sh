@@ -137,8 +137,55 @@ elif [[ "${BACKEND}" != "qwen" && "${BACKEND}" != "vllm_omni" ]]; then
   exit 2
 fi
 
+start_local_vllm_omni() {
+  local deploy_config
+  local vllm_args
+  command -v "${VLLM_OMNI_BIN}" >/dev/null 2>&1 || {
+    echo "${VLLM_OMNI_BIN} is required to auto-start vLLM-Omni" >&2
+    exit 2
+  }
+  [[ -d "${VLLM_OMNI_ROOT}" ]] || {
+    echo "vLLM-Omni root not found: ${VLLM_OMNI_ROOT}" >&2
+    exit 2
+  }
+  deploy_config="${VLLM_OMNI_DEPLOY_CONFIG:-${VLLM_OMNI_ROOT}/vllm_omni/deploy/qwen3_tts.yaml}"
+  [[ -f "${deploy_config}" ]] || {
+    echo "vLLM-Omni deploy config not found: ${deploy_config}" >&2
+    exit 2
+  }
+  vllm_args=(
+    serve "${VLLM_OMNI_MODEL}"
+    --deploy-config "${deploy_config}"
+    --host 0.0.0.0
+    --port "${VLLM_OMNI_PORT}"
+    --trust-remote-code
+    --omni
+  )
+  # Let qwen3_tts.yaml allocate memory independently per stage. A global
+  # 0.9 value makes stage 0 reserve nearly all memory before stage 1
+  # starts on single-GPU hosts. Set this override explicitly only when
+  # the deployment needs a global limit.
+  if [[ -n "${TTS_VLLM_OMNI_GPU_MEMORY_UTILIZATION:-}" ]]; then
+    vllm_args+=(--gpu-memory-utilization "${TTS_VLLM_OMNI_GPU_MEMORY_UTILIZATION}")
+  fi
+  if [[ -n "${VLLM_OMNI_STAGE_OVERRIDES}" ]]; then
+    vllm_args+=(--stage-overrides "${VLLM_OMNI_STAGE_OVERRIDES}")
+  fi
+  if [[ -n "${VLLM_OMNI_API_KEY_VALUE}" ]]; then
+    vllm_args+=(--api-key "${VLLM_OMNI_API_KEY_VALUE}")
+  fi
+  echo "Starting vLLM-Omni ${VLLM_OMNI_MODEL}; log: ${VLLM_OMNI_LOG}"
+  (
+    cd "${VLLM_OMNI_ROOT}"
+    nohup "${VLLM_OMNI_BIN}" "${vllm_args[@]}" >"${VLLM_OMNI_LOG}" 2>&1 &
+    echo $! >"${VLLM_OMNI_PID}"
+  )
+}
+
 if [[ "${BACKEND}" == "vllm_omni" ]]; then
   vllm_ready=false
+  vllm_local_auto_start=false
+  vllm_autostart_attempted=false
   if curl -fsS --max-time 2 "${VLLM_OMNI_BASE_URL}/health" >/dev/null 2>&1; then
     vllm_ready=true
     echo "Reusing ready vLLM-Omni at ${VLLM_OMNI_BASE_URL}"
@@ -149,49 +196,14 @@ if [[ "${BACKEND}" == "vllm_omni" ]]; then
     vllm_host="${vllm_host%%/*}"
     vllm_host="${vllm_host%%:*}"
     if [[ "${vllm_host}" == "127.0.0.1" || "${vllm_host}" == "localhost" || "${vllm_host}" == "::1" ]]; then
-      if [[ -f "${VLLM_OMNI_PID}" ]] && kill -0 "$(cat "${VLLM_OMNI_PID}")" 2>/dev/null; then
-        echo "vLLM-Omni is starting (pid $(cat "${VLLM_OMNI_PID}")); waiting..."
+      vllm_local_auto_start=true
+      if [[ -f "${VLLM_OMNI_PID}" ]] && vllm_pid="$(cat "${VLLM_OMNI_PID}" 2>/dev/null)" &&
+        [[ -n "${vllm_pid}" ]] && kill -0 "${vllm_pid}" 2>/dev/null; then
+        echo "vLLM-Omni process is not ready yet (pid ${vllm_pid}); waiting..."
       else
-        command -v "${VLLM_OMNI_BIN}" >/dev/null 2>&1 || {
-          echo "${VLLM_OMNI_BIN} is required to auto-start vLLM-Omni" >&2
-          exit 2
-        }
-        [[ -d "${VLLM_OMNI_ROOT}" ]] || {
-          echo "vLLM-Omni root not found: ${VLLM_OMNI_ROOT}" >&2
-          exit 2
-        }
-        deploy_config="${VLLM_OMNI_DEPLOY_CONFIG:-${VLLM_OMNI_ROOT}/vllm_omni/deploy/qwen3_tts.yaml}"
-        [[ -f "${deploy_config}" ]] || {
-          echo "vLLM-Omni deploy config not found: ${deploy_config}" >&2
-          exit 2
-        }
-        vllm_args=(
-          serve "${VLLM_OMNI_MODEL}"
-          --deploy-config "${deploy_config}"
-          --host 0.0.0.0
-          --port "${VLLM_OMNI_PORT}"
-          --trust-remote-code
-          --omni
-        )
-        # Let qwen3_tts.yaml allocate memory independently per stage. A global
-        # 0.9 value makes stage 0 reserve nearly all memory before stage 1
-        # starts on single-GPU hosts. Set this override explicitly only when
-        # the deployment needs a global limit.
-        if [[ -n "${TTS_VLLM_OMNI_GPU_MEMORY_UTILIZATION:-}" ]]; then
-          vllm_args+=(--gpu-memory-utilization "${TTS_VLLM_OMNI_GPU_MEMORY_UTILIZATION}")
-        fi
-        if [[ -n "${VLLM_OMNI_STAGE_OVERRIDES}" ]]; then
-          vllm_args+=(--stage-overrides "${VLLM_OMNI_STAGE_OVERRIDES}")
-        fi
-        if [[ -n "${VLLM_OMNI_API_KEY_VALUE}" ]]; then
-          vllm_args+=(--api-key "${VLLM_OMNI_API_KEY_VALUE}")
-        fi
-        echo "Starting vLLM-Omni ${VLLM_OMNI_MODEL}; log: ${VLLM_OMNI_LOG}"
-        (
-          cd "${VLLM_OMNI_ROOT}"
-          nohup "${VLLM_OMNI_BIN}" "${vllm_args[@]}" >"${VLLM_OMNI_LOG}" 2>&1 &
-          echo $! >"${VLLM_OMNI_PID}"
-        )
+        rm -f "${VLLM_OMNI_PID}"
+        start_local_vllm_omni
+        vllm_autostart_attempted=true
       fi
     else
       echo "Waiting for remote vLLM-Omni at ${VLLM_OMNI_BASE_URL}"
@@ -205,6 +217,14 @@ if [[ "${BACKEND}" == "vllm_omni" ]]; then
         break
       fi
       if [[ -f "${VLLM_OMNI_PID}" ]] && ! kill -0 "$(cat "${VLLM_OMNI_PID}")" 2>/dev/null; then
+        if [[ "${vllm_local_auto_start}" == "true" && "${vllm_autostart_attempted}" != "true" ]]; then
+          echo "Existing vLLM-Omni process exited before readiness; starting a fresh instance..."
+          rm -f "${VLLM_OMNI_PID}"
+          start_local_vllm_omni
+          vllm_autostart_attempted=true
+          sleep 1
+          continue
+        fi
         echo "vLLM-Omni exited during startup; see ${VLLM_OMNI_LOG}" >&2
         tail -n 80 "${VLLM_OMNI_LOG}" >&2 2>/dev/null || true
         exit 1
