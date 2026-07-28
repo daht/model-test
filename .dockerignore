@@ -1,8 +1,5 @@
-.venv
-__pycache__
-*.pyc
-.pytest_cache
-.env
-.git
-.idea
-models
+# The adapter image only copies the two requirement files below.
+*
+!Dockerfile.tts-adapter
+!requirements-tts-adapter.txt
+!requirements-tts-qwen.txt

@@ -164,10 +164,16 @@ if [[ "${BACKEND}" == "vllm_omni" ]]; then
           --deploy-config "${deploy_config}"
           --host 0.0.0.0
           --port "${VLLM_OMNI_PORT}"
-          --gpu-memory-utilization "${TTS_VLLM_OMNI_GPU_MEMORY_UTILIZATION:-0.9}"
           --trust-remote-code
           --omni
         )
+        # Let qwen3_tts.yaml allocate memory independently per stage. A global
+        # 0.9 value makes stage 0 reserve nearly all memory before stage 1
+        # starts on single-GPU hosts. Set this override explicitly only when
+        # the deployment needs a global limit.
+        if [[ -n "${TTS_VLLM_OMNI_GPU_MEMORY_UTILIZATION:-}" ]]; then
+          vllm_args+=(--gpu-memory-utilization "${TTS_VLLM_OMNI_GPU_MEMORY_UTILIZATION}")
+        fi
         if [[ -n "${VLLM_OMNI_API_KEY_VALUE}" ]]; then
           vllm_args+=(--api-key "${VLLM_OMNI_API_KEY_VALUE}")
         fi
