@@ -24,6 +24,7 @@ VLLM_OMNI_LOG="${TTS_VLLM_OMNI_LOG:-/tmp/vllm-omni-qwen-tts.log}"
 VLLM_OMNI_PID="${TTS_VLLM_OMNI_PID:-/tmp/vllm-omni-qwen-tts.pid}"
 VLLM_OMNI_START_TIMEOUT="${TTS_VLLM_OMNI_START_TIMEOUT_SECONDS:-900}"
 VLLM_OMNI_API_KEY_VALUE="${TTS_VLLM_OMNI_API_KEY:-}"
+VLLM_OMNI_STAGE_OVERRIDES="${TTS_VLLM_OMNI_STAGE_OVERRIDES:-}"
 
 env_file_value() {
   local key="$1"
@@ -44,6 +45,7 @@ VLLM_OMNI_BIN="${VLLM_OMNI_BIN:-$(env_file_value TTS_VLLM_OMNI_BIN)}"
 VLLM_OMNI_ROOT="${VLLM_OMNI_ROOT:-/opt/vllm-omni}"
 VLLM_OMNI_BIN="${VLLM_OMNI_BIN:-vllm-omni}"
 VLLM_OMNI_API_KEY_VALUE="${VLLM_OMNI_API_KEY_VALUE:-$(env_file_value TTS_VLLM_OMNI_API_KEY)}"
+VLLM_OMNI_STAGE_OVERRIDES="${VLLM_OMNI_STAGE_OVERRIDES:-$(env_file_value TTS_VLLM_OMNI_STAGE_OVERRIDES)}"
 vllm_url_port="${VLLM_OMNI_BASE_URL##*:}"
 vllm_url_port="${vllm_url_port%%/*}"
 if [[ "${vllm_url_port}" =~ ^[0-9]+$ ]]; then
@@ -72,6 +74,7 @@ Environment overrides:
   TTS_VLLM_OMNI_BIN          vLLM-Omni executable (default: vllm-omni)
   TTS_VLLM_OMNI_LOG          vLLM-Omni log path (default: /tmp/vllm-omni-qwen-tts.log)
   TTS_VLLM_OMNI_START_TIMEOUT_SECONDS  Startup wait (default: 900)
+  TTS_VLLM_OMNI_STAGE_OVERRIDES  JSON stage overrides passed to vLLM-Omni
 EOF
 }
 
@@ -174,6 +177,9 @@ if [[ "${BACKEND}" == "vllm_omni" ]]; then
         if [[ -n "${TTS_VLLM_OMNI_GPU_MEMORY_UTILIZATION:-}" ]]; then
           vllm_args+=(--gpu-memory-utilization "${TTS_VLLM_OMNI_GPU_MEMORY_UTILIZATION}")
         fi
+        if [[ -n "${VLLM_OMNI_STAGE_OVERRIDES}" ]]; then
+          vllm_args+=(--stage-overrides "${VLLM_OMNI_STAGE_OVERRIDES}")
+        fi
         if [[ -n "${VLLM_OMNI_API_KEY_VALUE}" ]]; then
           vllm_args+=(--api-key "${VLLM_OMNI_API_KEY_VALUE}")
         fi
@@ -256,7 +262,8 @@ if [[ -f "${ENV_FILE}" ]]; then
   container_env_file="$(mktemp)"
   awk '
     !/^[[:space:]]*TTS_VLLM_OMNI_ROOT[[:space:]]*=/ &&
-    !/^[[:space:]]*TTS_VLLM_OMNI_BIN[[:space:]]*=/
+    !/^[[:space:]]*TTS_VLLM_OMNI_BIN[[:space:]]*=/ &&
+    !/^[[:space:]]*TTS_VLLM_OMNI_STAGE_OVERRIDES[[:space:]]*=/
   ' "${ENV_FILE}" >"${container_env_file}"
   env_args+=(--env-file "${container_env_file}")
 fi
