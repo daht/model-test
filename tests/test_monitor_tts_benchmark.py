@@ -33,7 +33,7 @@ elif [[ "$1" == "inspect" ]]; then
   esac
 elif [[ "$1" == "stats" ]]; then
   echo '75.0%|4GiB / 8GiB|50.0%|2kB / 4kB|6kB / 8kB|10'
-elif [[ "$1" == "compose" && "$2" == "logs" ]]; then
+elif [[ "$1" == "logs" ]]; then
   echo '2026-07-24T00:00:01Z 198.51.100.42:1234 request'
   while true; do sleep 1; done
 else
@@ -107,6 +107,7 @@ fi
     assert report["gpu"]["utilization_percent"]["maximum"] == 60
     assert report["gpu"]["memory_used_mib"]["maximum"] == 12000
     assert report["container"]["cpu_percent"]["maximum"] == 75
+    assert (run / "service.log").stat().st_size > 0
     assert "198.51.100." not in (run / "service.log").read_text()
     assert "[redacted-ip]" in (run / "service.log").read_text()
 

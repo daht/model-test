@@ -200,7 +200,7 @@ container_collector() {
 }
 
 service_log_collector() {
-  exec docker compose logs --follow --timestamps --since "${STARTED_UTC}" "${SERVICE}" \
+  exec docker logs --follow --timestamps --since "${STARTED_UTC}" "${CONTAINER_ID}" \
     >"${CURRENT_DIR}/service.log" 2>&1
 }
 

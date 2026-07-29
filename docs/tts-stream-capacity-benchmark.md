@@ -123,6 +123,8 @@ report.md
 manifest.sha256
 ```
 
+归档前必须确认 `service.log` 非空。当前 adapter 由 `docker run` 启动，监控脚本直接跟随已解析的容器 ID 的 `docker logs`；不能依赖 `docker compose logs`，否则资源采样可能完整但服务日志为空，无法关联客户端长尾与服务端事件。
+
 客户端保留三个输出文件：
 
 ```text
