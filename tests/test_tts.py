@@ -282,6 +282,28 @@ def test_qwen_concurrent_requests_share_one_explicit_batch(tmp_path):
         synthesizer.close()
 
 
+def test_qwen_capacity_snapshot_reports_microbatch_state(tmp_path):
+    settings = _settings(tmp_path)
+    settings.tts_qwen_batch_size = 6
+    settings.tts_qwen_batch_wait_ms = 25
+    settings.tts_qwen_queue_size = 12
+
+    synthesizer = Qwen3TTSSynthesizer(settings)
+
+    assert synthesizer.capacity_snapshot() == {
+        "ready": False,
+        "supports_realtime_streaming": False,
+        "supports_microbatch": True,
+        "queue_depth": 0,
+        "queue_size": 12,
+        "batch_size": 6,
+        "batch_wait_ms": 25,
+        "dispatched_batches": 0,
+        "dispatched_requests": 0,
+        "last_batch_size": 0,
+    }
+
+
 def test_qwen_model_load_is_single_owner_under_concurrency(monkeypatch, tmp_path):
     settings = _settings(tmp_path)
     settings.tts_qwen_language = "Chinese"

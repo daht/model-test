@@ -20,7 +20,11 @@ PRODUCTION_API_KEY_PLACEHOLDERS = {
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     app_name: str = "hy-mt-rest-api"
     model_name: str = "HY-MT1.5-1.8B"

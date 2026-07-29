@@ -62,6 +62,25 @@ def test_tts_health_reports_model_name():
     assert response.json()["sample_rate"] == 24000
 
 
+def test_tts_capacity_requires_api_key():
+    response = client.get("/v1/tts/capacity")
+
+    assert response.status_code == 401
+
+
+def test_tts_capacity_reports_selected_backend():
+    response = client.get("/v1/tts/capacity", headers={"X-API-Key": "test-key"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["model"] == "CosyVoice"
+    assert body["backend"] == "mock"
+    assert body["sample_rate"] == 24000
+    assert body["supports_microbatch"] is False
+    assert body["queue_depth"] is None
+
+
 def test_tts_rejects_missing_api_key():
     response = client.post("/v1/tts", json={"text": "hello"})
 

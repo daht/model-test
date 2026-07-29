@@ -514,6 +514,18 @@ TTS WebSocket streaming protocol:
 WS ws://localhost:8003/v1/tts/stream
 ```
 
+For production TTS capacity planning, split the workload first:
+
+- `TTS_BACKEND=vllm_omni` or `triton` for interactive streaming.
+- `TTS_BACKEND=qwen` for bounded micro-batch throughput on `POST /v1/tts`.
+- See [TTS 生产能力分层与高吞吐路线](docs/tts-production-capability-plan.md) for the deployment split.
+
+Check the selected TTS backend capacity surface after deployment:
+
+```bash
+curl -H "X-API-Key: ${API_KEY}" http://localhost:8003/v1/tts/capacity
+```
+
 Authenticate the WebSocket upgrade with `Authorization: Bearer
 your-production-api-key`. The server returns `connected_success`; then start a
 task:

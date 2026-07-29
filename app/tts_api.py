@@ -15,7 +15,7 @@ from fastapi import Depends, FastAPI, HTTPException, Response, WebSocket, WebSoc
 
 from app.auth import is_valid_api_key, require_api_key
 from app.config import Settings, get_settings
-from app.schemas import TTSHealthResponse, TTSInfoResponse, TTSRequest
+from app.schemas import TTSCapacityResponse, TTSHealthResponse, TTSInfoResponse, TTSRequest
 from app.tts import TTSSynthesizer, create_tts_synthesizer
 
 settings = get_settings()
@@ -108,6 +108,25 @@ def tts_info(current_settings: Settings = Depends(get_settings)) -> TTSInfoRespo
     )
 
 
+@app.get(
+    "/v1/tts/capacity",
+    response_model=TTSCapacityResponse,
+    dependencies=[Depends(require_api_key)],
+)
+def tts_capacity(
+    current_settings: Settings = Depends(get_settings),
+    current_synthesizer: TTSSynthesizer = Depends(get_tts_synthesizer),
+) -> TTSCapacityResponse:
+    snapshot = _capacity_snapshot(current_synthesizer, current_settings)
+    return TTSCapacityResponse(
+        status="ok",
+        model=current_settings.tts_model_name,
+        backend=current_settings.tts_backend,
+        sample_rate=current_settings.tts_sample_rate,
+        **snapshot,
+    )
+
+
 @app.post("/v1/tts", dependencies=[Depends(require_api_key)])
 def synthesize_tts(
     request: TTSRequest,
@@ -123,6 +142,33 @@ def synthesize_tts(
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     return Response(content=audio, media_type="audio/wav")
+
+
+def _capacity_snapshot(
+    synthesizer: TTSSynthesizer,
+    current_settings: Settings,
+) -> dict[str, object]:
+    snapshot = getattr(synthesizer, "capacity_snapshot", None)
+    if callable(snapshot):
+        return snapshot()
+    supports_realtime_streaming = current_settings.tts_backend in {
+        "mock",
+        "cosyvoice",
+        "triton",
+        "vllm_omni",
+    }
+    return {
+        "ready": getattr(synthesizer, "ready", None),
+        "supports_realtime_streaming": supports_realtime_streaming,
+        "supports_microbatch": False,
+        "queue_depth": None,
+        "queue_size": None,
+        "batch_size": None,
+        "batch_wait_ms": None,
+        "dispatched_batches": None,
+        "dispatched_requests": None,
+        "last_batch_size": None,
+    }
 
 
 @app.websocket("/v1/tts/stream")

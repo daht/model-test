@@ -40,6 +40,10 @@ class Qwen3TTSSynthesizer:
             maxsize=settings.tts_qwen_queue_size
         )
         self._worker: threading.Thread | None = None
+        self._metrics_lock = threading.Lock()
+        self._dispatched_batches = 0
+        self._dispatched_requests = 0
+        self._last_batch_size = 0
 
     def start(self) -> None:
         """Load the model and start the single inference owner thread."""
@@ -85,6 +89,24 @@ class Qwen3TTSSynthesizer:
             and self._worker is not None
             and self._worker.is_alive()
         )
+
+    def capacity_snapshot(self) -> dict[str, object]:
+        with self._metrics_lock:
+            dispatched_batches = self._dispatched_batches
+            dispatched_requests = self._dispatched_requests
+            last_batch_size = self._last_batch_size
+        return {
+            "ready": self.ready,
+            "supports_realtime_streaming": False,
+            "supports_microbatch": True,
+            "queue_depth": self._queue.qsize(),
+            "queue_size": self.settings.tts_qwen_queue_size,
+            "batch_size": self.settings.tts_qwen_batch_size,
+            "batch_wait_ms": self.settings.tts_qwen_batch_wait_ms,
+            "dispatched_batches": dispatched_batches,
+            "dispatched_requests": dispatched_requests,
+            "last_batch_size": last_batch_size,
+        }
 
     def synthesize(self, text: str, voice: str | None = None) -> bytes:
         from app.tts import _wav_bytes
@@ -176,6 +198,10 @@ class Qwen3TTSSynthesizer:
             self._run_batch(batch)
 
     def _run_batch(self, requests: list[_QwenRequest]) -> None:
+        with self._metrics_lock:
+            self._dispatched_batches += 1
+            self._dispatched_requests += len(requests)
+            self._last_batch_size = len(requests)
         try:
             wavs, sample_rate = self._model.generate_custom_voice(
                 text=[request.text for request in requests],

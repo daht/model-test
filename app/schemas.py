@@ -93,6 +93,23 @@ class TTSHealthResponse(BaseModel):
     sample_rate: int
 
 
+class TTSCapacityResponse(BaseModel):
+    status: str
+    model: str
+    backend: str
+    sample_rate: int
+    supports_realtime_streaming: bool
+    supports_microbatch: bool
+    ready: bool | None = None
+    queue_depth: int | None = None
+    queue_size: int | None = None
+    batch_size: int | None = None
+    batch_wait_ms: int | None = None
+    dispatched_batches: int | None = None
+    dispatched_requests: int | None = None
+    last_batch_size: int | None = None
+
+
 class TTSInfoResponse(BaseModel):
     websocket_url: str
     http_endpoint: str

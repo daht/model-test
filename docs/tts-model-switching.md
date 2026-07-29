@@ -3,6 +3,12 @@
 TTS adapter 每个部署实例只加载一个模型。通过 `.env` 选择后端，重建 adapter
 即可切换；请求不会在多个模型之间动态路由，也不会在同一进程中同时占用两套模型显存。
 
+生产上建议先读 [TTS 生产能力分层与高吞吐路线](tts-production-capability-plan.md)。简化地说：
+
+- `stream` 线优先考虑 `vllm_omni` 或 `triton`。
+- `bulk` 线优先考虑 `qwen` 或 `triton` 的批量形态。
+- 不要把实时流式的 `TTFA/chunk gap` 指标直接拿去约束批量吞吐。
+
 ## CosyVoice3 Triton
 
 ```dotenv
@@ -36,6 +42,10 @@ TTS_QWEN_LANGUAGE=Chinese
 TTS_QWEN_INSTRUCT=
 TTS_SAMPLE_RATE=24000
 ```
+
+这条线更适合批量合成和高吞吐场景。它会把请求先收进有界队列，再按 `tts_qwen_batch_size`
+和 `tts_qwen_batch_wait_ms` 做显式微批；如果目标是高吞吐而不是最小首包延迟，这通常比
+纯流式更合适。
 
 然后重建 adapter：
 
@@ -71,6 +81,8 @@ TTS_SAMPLE_RATE=24000
 如果 vLLM-Omni 配置了 API key，额外设置 `TTS_VLLM_OMNI_API_KEY`。adapter 在启动时
 检查上游 `/health`；上游不可用时 adapter 不会报告健康。外部接口仍为 `/v1/tts` 和
 `/v1/tts/stream`，其中 WebSocket 会在收到每个上游 PCM chunk 后立即转发。
+
+这条线更适合在线交互流式场景。它保留真实 chunk 输出，但不承担批量合成的主吞吐职责。
 
 三种后端都使用同一个 `/v1/tts` 和 `/v1/tts/stream` 协议，压测脚本只需要替换
 `TTS_MODEL_NAME` 和输出目录。
