@@ -73,6 +73,30 @@ class TritonTTSSynthesizer:
         if not yielded:
             raise RuntimeError("Triton CosyVoice did not return audio")
 
+    def capacity_snapshot(self) -> dict[str, object]:
+        ready = False
+        try:
+            grpcclient = self._grpcclient()
+            client = grpcclient.InferenceServerClient(url=self.settings.tts_triton_url)
+            ready = bool(
+                client.is_server_ready()
+                and client.is_model_ready(self.settings.tts_triton_model_name)
+            )
+        except Exception:
+            ready = False
+        return {
+            "ready": ready,
+            "supports_realtime_streaming": True,
+            "supports_microbatch": False,
+            "queue_depth": None,
+            "queue_size": None,
+            "batch_size": None,
+            "batch_wait_ms": None,
+            "dispatched_batches": None,
+            "dispatched_requests": None,
+            "last_batch_size": None,
+        }
+
     def _grpcclient(self):
         try:
             import tritonclient.grpc as grpcclient

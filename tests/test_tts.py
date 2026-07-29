@@ -138,6 +138,36 @@ def test_triton_inputs_match_cosyvoice_model_contract(tmp_path):
     assert inputs[3].value[3].tolist() == [["hello"]]
 
 
+def test_triton_capacity_snapshot_checks_server_and_model_ready(monkeypatch, tmp_path):
+    class FakeClient:
+        def __init__(self, url):
+            assert url == "127.0.0.1:18001"
+
+        def is_server_ready(self):
+            return True
+
+        def is_model_ready(self, model_name):
+            assert model_name == "cosyvoice3"
+            return True
+
+    fake_grpc = types.SimpleNamespace(InferenceServerClient=FakeClient)
+    synthesizer = TritonTTSSynthesizer(_settings(tmp_path))
+    monkeypatch.setattr(synthesizer, "_grpcclient", lambda: fake_grpc)
+
+    assert synthesizer.capacity_snapshot() == {
+        "ready": True,
+        "supports_realtime_streaming": True,
+        "supports_microbatch": False,
+        "queue_depth": None,
+        "queue_size": None,
+        "batch_size": None,
+        "batch_wait_ms": None,
+        "dispatched_batches": None,
+        "dispatched_requests": None,
+        "last_batch_size": None,
+    }
+
+
 def test_triton_stream_consumes_decoupled_chunks_until_final_response(tmp_path):
     with wave.open(str(tmp_path / "prompt.wav"), "wb") as prompt:
         prompt.setnchannels(1)
