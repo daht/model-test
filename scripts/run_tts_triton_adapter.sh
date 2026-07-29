@@ -331,6 +331,10 @@ if [[ -z "${TTS_API_IMAGE:-}" ]]; then
     "${ROOT_DIR}"
 fi
 
+# Replace only the previous adapter managed by this script. The port check
+# below still protects any unrelated listener.
+docker rm -f "${API_CONTAINER}" >/dev/null 2>&1 || true
+
 port_in_use=false
 if command -v ss >/dev/null 2>&1; then
   ss_output="$(ss -ltn 2>/dev/null || true)"
@@ -352,8 +356,6 @@ if [[ "${port_in_use}" == "true" ]]; then
   echo "API port ${API_PORT} is already in use; stop the existing service or set TTS_API_PORT" >&2
   exit 2
 fi
-
-docker rm -f "${API_CONTAINER}" >/dev/null 2>&1 || true
 
 container_env_file=""
 cleanup_container_env_file() {

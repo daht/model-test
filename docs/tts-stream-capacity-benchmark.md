@@ -14,6 +14,8 @@
 4. 最后对稳定档位做 soak，验证长时间不掉线、不 OOM、不重启；
 5. 生产验收目标先按 `TTFA p95 < 1s`、`chunk gap p99 < 1s`、0 失败、0 重启来卡。
 
+2026-07-29 的 Qwen3-TTS 单并发复测已达到 `TTFA p95=103ms`、`chunk gap p99=877ms` 和 0 失败，但 32/32 请求发生播放缓冲断流，累计 9.598 秒，因此尚未进入并发容量阶梯。下一步先把 `codec_chunk_ramp` 调整为 `[6, 8, 12, 18, 25]`，重新通过 30 秒预检和 120 秒单并发连贯性门槛，再开始并发压测。详细证据与判定见 [Qwen3-TTS 单并发实测](tts-a10-websocket-streaming-test-plan.md#52-2026-07-29-qwen3-tts-单并发实测)。
+
 ## 工具
 
 - `scripts/benchmark_tts_stream.py`：从独立客户端发送 MiniMax 风格 WebSocket 请求，支持闭环并发和开环泊松到达率。

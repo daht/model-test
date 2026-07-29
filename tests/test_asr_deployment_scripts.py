@@ -148,6 +148,7 @@ def test_tts_adapter_script_auto_starts_vllm_omni_backend():
     assert 'check_local_vllm_omni_deps' in content
     assert 'report_vllm_omni_startup_failure' in content
     assert 'vllm.entrypoints.scale_out' in content
+    assert content.index('docker rm -f "${API_CONTAINER}"') < content.index('port_in_use=false')
     assert '!/^[[:space:]]*TTS_VLLM_OMNI_ROOT[[:space:]]*=/' in content
     assert '!/^[[:space:]]*TTS_VLLM_OMNI_BIN[[:space:]]*=/' in content
     assert '!/^[[:space:]]*TTS_VLLM_OMNI_DEPLOY_CONFIG[[:space:]]*=/' in content
