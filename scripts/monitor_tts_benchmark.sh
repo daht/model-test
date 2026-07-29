@@ -12,6 +12,9 @@ SERVICE="${TTS_MONITOR_SERVICE:-cosyvoice-tts-api}"
 GPU_INDEX="${TTS_MONITOR_GPU_INDEX:-0}"
 GPU_INTERVAL="${TTS_MONITOR_GPU_INTERVAL_SECONDS:-0.5}"
 CONTAINER_INTERVAL="${TTS_MONITOR_CONTAINER_INTERVAL_SECONDS:-1}"
+VLLM_OMNI_METRICS_URL="${TTS_MONITOR_VLLM_OMNI_METRICS_URL:-}"
+VLLM_OMNI_METRICS_INTERVAL="${TTS_MONITOR_VLLM_OMNI_METRICS_INTERVAL_SECONDS:-1}"
+VLLM_OMNI_LOG="${TTS_MONITOR_VLLM_OMNI_LOG:-}"
 
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$(python3 -c 'import secrets; print(secrets.token_hex(3))')"
 CURRENT_DIR="${RUNS_DIR}/${RUN_ID}"
@@ -34,6 +37,9 @@ Optional environment variables:
   TTS_MONITOR_GPU_INDEX
   TTS_MONITOR_GPU_INTERVAL_SECONDS
   TTS_MONITOR_CONTAINER_INTERVAL_SECONDS
+  TTS_MONITOR_VLLM_OMNI_METRICS_URL
+  TTS_MONITOR_VLLM_OMNI_METRICS_INTERVAL_SECONDS
+  TTS_MONITOR_VLLM_OMNI_LOG
 
 The collector never sends TTS requests and does not require API_KEY.
 EOF
@@ -204,6 +210,26 @@ service_log_collector() {
     >"${CURRENT_DIR}/service.log" 2>&1
 }
 
+vllm_omni_log_collector() {
+  tail -n 100 -F -- "${VLLM_OMNI_LOG}" >"${CURRENT_DIR}/vllm-omni.log" 2>&1
+}
+
+vllm_omni_metrics_collector() {
+  local output="${CURRENT_DIR}/vllm-omni-metrics.prom"
+  while true; do
+    if {
+      printf '# sampled_at=%s\n' "$(utc_now)"
+      curl --fail --silent --show-error --max-time 5 "${VLLM_OMNI_METRICS_URL}"
+      printf '\n'
+    } >>"${output}"; then
+      :
+    else
+      record_error vllm_omni_metrics sample_failed
+    fi
+    sleep "${VLLM_OMNI_METRICS_INTERVAL}"
+  done
+}
+
 start_collector() {
   "$@" &
   PIDS+=("$!")
@@ -295,6 +321,12 @@ finalize() {
     "${CURRENT_DIR}/service.log" >"${CURRENT_DIR}/service.log.sanitized" || true
   [[ -e "${CURRENT_DIR}/service.log.sanitized" ]] && \
     mv -- "${CURRENT_DIR}/service.log.sanitized" "${CURRENT_DIR}/service.log"
+  if [[ -e "${CURRENT_DIR}/vllm-omni.log" ]]; then
+    sed -E 's/([0-9]{1,3}\.){3}[0-9]{1,3}/[redacted-ip]/g' \
+      "${CURRENT_DIR}/vllm-omni.log" >"${CURRENT_DIR}/vllm-omni.log.sanitized" || true
+    [[ -e "${CURRENT_DIR}/vllm-omni.log.sanitized" ]] && \
+      mv -- "${CURRENT_DIR}/vllm-omni.log.sanitized" "${CURRENT_DIR}/vllm-omni.log"
+  fi
   generate_report
   (
     cd "${CURRENT_DIR}"
@@ -316,6 +348,13 @@ handle_signal() {
 for command in docker nvidia-smi python3 tar sha256sum; do require_command "${command}"; done
 validate_positive_decimal TTS_MONITOR_GPU_INTERVAL_SECONDS "${GPU_INTERVAL}"
 validate_positive_decimal TTS_MONITOR_CONTAINER_INTERVAL_SECONDS "${CONTAINER_INTERVAL}"
+if [[ -n "${VLLM_OMNI_METRICS_URL}" ]]; then
+  require_command curl
+  validate_positive_decimal TTS_MONITOR_VLLM_OMNI_METRICS_INTERVAL_SECONDS "${VLLM_OMNI_METRICS_INTERVAL}"
+fi
+if [[ -n "${VLLM_OMNI_LOG}" ]]; then
+  require_command tail
+fi
 prepare_output
 resolve_container
 write_metadata ""
@@ -325,6 +364,8 @@ start_collector gpu_collector
 start_collector gpu_process_collector
 start_collector container_collector
 start_collector service_log_collector
+[[ -z "${VLLM_OMNI_LOG}" ]] || start_collector vllm_omni_log_collector
+[[ -z "${VLLM_OMNI_METRICS_URL}" ]] || start_collector vllm_omni_metrics_collector
 
 echo "TTS benchmark monitor started."
 echo "Evidence directory: ${CURRENT_DIR}"

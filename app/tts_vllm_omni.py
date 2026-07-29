@@ -54,6 +54,7 @@ class VLLMOmniTTSSynthesizer:
             "voice": self.settings.tts_qwen_speaker,
             "response_format": "pcm",
             "stream": True,
+            "stream_format": "audio",
             "task_type": "CustomVoice",
             "language": self.settings.tts_qwen_language,
         }
@@ -71,6 +72,12 @@ class VLLMOmniTTSSynthesizer:
                 timeout=self.settings.tts_vllm_omni_timeout_seconds,
             ) as response:
                 response.raise_for_status()
+                content_type = response.headers.get("content-type", "").lower()
+                if not content_type.startswith("audio/pcm"):
+                    raise RuntimeError(
+                        "vLLM-Omni returned an unexpected content type for a PCM stream: "
+                        f"expected audio/pcm, got {content_type or 'missing'}"
+                    )
                 for chunk in response.iter_bytes():
                     if not chunk:
                         continue

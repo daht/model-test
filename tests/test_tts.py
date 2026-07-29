@@ -379,6 +379,8 @@ def test_vllm_omni_streams_pcm_chunks_and_uses_custom_voice_contract(tmp_path):
     calls = []
 
     class FakeResponse:
+        headers = {"content-type": "audio/pcm"}
+
         def __enter__(self):
             return self
 
@@ -411,6 +413,7 @@ def test_vllm_omni_streams_pcm_chunks_and_uses_custom_voice_contract(tmp_path):
                     "voice": "Vivian",
                     "response_format": "pcm",
                     "stream": True,
+                    "stream_format": "audio",
                     "task_type": "CustomVoice",
                     "language": "Chinese",
                 },
@@ -428,6 +431,8 @@ def test_vllm_omni_rejects_invalid_pcm_chunks(tmp_path):
     settings.tts_qwen_instruct = ""
 
     class FakeResponse:
+        headers = {"content-type": "audio/pcm"}
+
         def __enter__(self):
             return self
 
@@ -457,6 +462,8 @@ def test_vllm_omni_reassembles_pcm_samples_split_by_http_chunks(tmp_path):
     settings.tts_qwen_instruct = ""
 
     class FakeResponse:
+        headers = {"content-type": "audio/pcm"}
+
         def __enter__(self):
             return self
 
@@ -478,6 +485,37 @@ def test_vllm_omni_reassembles_pcm_samples_split_by_http_chunks(tmp_path):
     synthesizer = VLLMOmniTTSSynthesizer(settings, client=FakeClient())
 
     assert list(synthesizer.stream_pcm("hello")) == [b"\x01\x00", b"\x02\x00"]
+
+
+def test_vllm_omni_rejects_sse_response_for_pcm_stream(tmp_path):
+    settings = _settings(tmp_path)
+    settings.tts_qwen_language = "Chinese"
+    settings.tts_qwen_speaker = "Vivian"
+    settings.tts_qwen_instruct = ""
+
+    class FakeResponse:
+        headers = {"content-type": "text/event-stream; charset=utf-8"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+        def iter_bytes(self):
+            yield b"event: speech.audio.delta\n"
+
+    class FakeClient:
+        def stream(self, *args, **kwargs):
+            return FakeResponse()
+
+    synthesizer = VLLMOmniTTSSynthesizer(settings, client=FakeClient())
+
+    with pytest.raises(RuntimeError, match="expected audio/pcm"):
+        list(synthesizer.stream_pcm("hello"))
 
 
 def test_vllm_omni_start_checks_upstream_health(tmp_path):

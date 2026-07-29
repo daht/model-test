@@ -174,6 +174,7 @@ start_local_vllm_omni() {
     --port "${VLLM_OMNI_PORT}"
     --trust-remote-code
     --omni
+    --log-stats
   )
   # Let qwen3_tts.yaml allocate memory independently per stage. A global
   # 0.9 value makes stage 0 reserve nearly all memory before stage 1

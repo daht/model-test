@@ -18,6 +18,13 @@ def test_tts_monitor_collects_and_archives_evidence(tmp_path):
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     executable(
+        fake_bin / "curl",
+        """#!/usr/bin/env bash
+set -eu
+echo 'vllm:omni_num_requests_waiting{model_name="Qwen"} 0'
+""",
+    )
+    executable(
         fake_bin / "docker",
         """#!/usr/bin/env bash
 set -eu
@@ -55,12 +62,19 @@ fi
 """,
     )
     output_root = tmp_path / "monitor"
+    upstream_log = tmp_path / "vllm-omni.log"
+    upstream_log.write_text(
+        "[SpeechE2E] request_id=speech-1 stream=true status=ok total_ms=20.0 first_chunk_ms=5.0\\n"
+    )
     env = {
         **os.environ,
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "TTS_MONITOR_OUTPUT_ROOT": str(output_root),
         "TTS_MONITOR_GPU_INTERVAL_SECONDS": "0.05",
         "TTS_MONITOR_CONTAINER_INTERVAL_SECONDS": "0.05",
+        "TTS_MONITOR_VLLM_OMNI_METRICS_URL": "http://127.0.0.1:8091/metrics",
+        "TTS_MONITOR_VLLM_OMNI_METRICS_INTERVAL_SECONDS": "0.05",
+        "TTS_MONITOR_VLLM_OMNI_LOG": str(upstream_log),
     }
     process = subprocess.Popen(
         ["bash", "scripts/monitor_tts_benchmark.sh"],
@@ -93,6 +107,8 @@ fi
         "gpu-processes.csv",
         "container.csv",
         "service.log",
+        "vllm-omni.log",
+        "vllm-omni-metrics.prom",
         "collector-errors.log",
         "report.json",
         "report.md",
@@ -110,6 +126,8 @@ fi
     assert (run / "service.log").stat().st_size > 0
     assert "198.51.100." not in (run / "service.log").read_text()
     assert "[redacted-ip]" in (run / "service.log").read_text()
+    assert "[SpeechE2E]" in (run / "vllm-omni.log").read_text()
+    assert "vllm:omni_num_requests_waiting" in (run / "vllm-omni-metrics.prom").read_text()
 
 
 def test_tts_monitor_help_documents_safe_usage():
@@ -124,6 +142,8 @@ def test_tts_monitor_help_documents_safe_usage():
         "TTS_MONITOR_OUTPUT_ROOT",
         "TTS_MONITOR_SERVICE",
         "TTS_MONITOR_GPU_INDEX",
+        "TTS_MONITOR_VLLM_OMNI_METRICS_URL",
+        "TTS_MONITOR_VLLM_OMNI_LOG",
         "Ctrl+C",
         "does not require API_KEY",
     ):

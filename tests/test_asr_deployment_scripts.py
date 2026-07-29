@@ -137,6 +137,7 @@ def test_tts_adapter_script_auto_starts_vllm_omni_backend():
     assert 'TTS_VLLM_OMNI_ROOT' in content
     assert 'TTS_VLLM_OMNI_DEPLOY_CONFIG' in content
     assert '--deploy-config' in content
+    assert '--log-stats' in content
     assert 'TTS_VLLM_OMNI_START_TIMEOUT_SECONDS' in content
     assert 'Reusing ready vLLM-Omni' in content
     assert 'vLLM-Omni process is not ready yet' in content
