@@ -137,6 +137,20 @@ elif [[ "${BACKEND}" != "qwen" && "${BACKEND}" != "vllm_omni" ]]; then
   exit 2
 fi
 
+resolve_local_vllm_omni_python() {
+  local vllm_bin_path
+  if [[ "${VLLM_OMNI_BIN}" == */* ]]; then
+    vllm_bin_path="$(readlink -f "${VLLM_OMNI_BIN}" 2>/dev/null || true)"
+  else
+    vllm_bin_path="$(command -v "${VLLM_OMNI_BIN}" 2>/dev/null || true)"
+  fi
+  [[ -n "${vllm_bin_path}" ]] || return 1
+  local vllm_python
+  vllm_python="$(dirname "${vllm_bin_path}")/python"
+  [[ -x "${vllm_python}" ]] || return 1
+  printf '%s\n' "${vllm_python}"
+}
+
 start_local_vllm_omni() {
   local deploy_config
   local vllm_args
@@ -182,6 +196,72 @@ start_local_vllm_omni() {
   )
 }
 
+check_local_vllm_omni_deps() {
+  local vllm_python
+  vllm_python="$(resolve_local_vllm_omni_python)" || return 0
+  [[ -x "${vllm_python}" ]] || return 0
+  if ! "${vllm_python}" - <<'PY' >/dev/null 2>&1
+import importlib.util
+import sys
+
+sys.exit(0 if importlib.util.find_spec("vllm.entrypoints.scale_out") else 1)
+PY
+  then
+    echo "vLLM-Omni Python environment is missing vllm.entrypoints.scale_out; resync /opt/vllm-omni dependencies before auto-starting." >&2
+    exit 1
+  fi
+}
+
+maybe_force_single_gpu_stage1_device() {
+  local vllm_python
+  local gpu_count
+  local merged_overrides
+  vllm_python="$(resolve_local_vllm_omni_python)" || return 0
+  gpu_count="$("${vllm_python}" - <<'PY'
+import importlib.util
+
+if importlib.util.find_spec("torch") is None:
+    raise SystemExit(0)
+
+import torch
+
+print(torch.cuda.device_count())
+PY
+  )" || return 0
+  [[ "${gpu_count}" =~ ^[0-9]+$ ]] || return 0
+  if [[ "${gpu_count}" != "1" ]]; then
+    return 0
+  fi
+  merged_overrides="$("${vllm_python}" - "${VLLM_OMNI_STAGE_OVERRIDES}" <<'PY'
+import json
+import sys
+
+raw = sys.argv[1].strip()
+base = json.loads(raw) if raw else {}
+stage1 = base.get("1")
+if stage1 is None:
+    base["1"] = {"devices": "0"}
+elif isinstance(stage1, dict) and "devices" not in stage1:
+    stage1["devices"] = "0"
+print(json.dumps(base, separators=(",", ":")))
+PY
+  )" || {
+    echo "Failed to normalize single-GPU stage overrides" >&2
+    exit 1
+  }
+  if [[ "${merged_overrides}" != "${VLLM_OMNI_STAGE_OVERRIDES}" ]]; then
+    echo "Detected one visible GPU; forcing vLLM-Omni stage 1 onto device 0."
+    VLLM_OMNI_STAGE_OVERRIDES="${merged_overrides}"
+  fi
+}
+
+report_vllm_omni_startup_failure() {
+  if grep -q "No module named 'vllm.entrypoints.scale_out'" "${VLLM_OMNI_LOG}" 2>/dev/null; then
+    echo "Detected vLLM package mismatch: ${VLLM_OMNI_LOG} shows vllm.entrypoints.scale_out is missing." >&2
+    echo "Reinstall or resync the /opt/vllm-omni virtualenv before retrying this script." >&2
+  fi
+}
+
 if [[ "${BACKEND}" == "vllm_omni" ]]; then
   vllm_ready=false
   vllm_local_auto_start=false
@@ -197,6 +277,8 @@ if [[ "${BACKEND}" == "vllm_omni" ]]; then
     vllm_host="${vllm_host%%:*}"
     if [[ "${vllm_host}" == "127.0.0.1" || "${vllm_host}" == "localhost" || "${vllm_host}" == "::1" ]]; then
       vllm_local_auto_start=true
+      maybe_force_single_gpu_stage1_device
+      check_local_vllm_omni_deps
       if [[ -f "${VLLM_OMNI_PID}" ]] && vllm_pid="$(cat "${VLLM_OMNI_PID}" 2>/dev/null)" &&
         [[ -n "${vllm_pid}" ]] && kill -0 "${vllm_pid}" 2>/dev/null; then
         echo "vLLM-Omni process is not ready yet (pid ${vllm_pid}); waiting..."
@@ -226,7 +308,8 @@ if [[ "${BACKEND}" == "vllm_omni" ]]; then
           continue
         fi
         echo "vLLM-Omni exited during startup; see ${VLLM_OMNI_LOG}" >&2
-        tail -n 80 "${VLLM_OMNI_LOG}" >&2 2>/dev/null || true
+        report_vllm_omni_startup_failure
+        tail -n 200 "${VLLM_OMNI_LOG}" >&2 2>/dev/null || true
         exit 1
       fi
       sleep 1

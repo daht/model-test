@@ -143,6 +143,11 @@ def test_tts_adapter_script_auto_starts_vllm_omni_backend():
     assert 'Existing vLLM-Omni process exited before readiness' in content
     assert 'rm -f "${VLLM_OMNI_PID}"' in content
     assert '--stage-overrides' in content
+    assert 'maybe_force_single_gpu_stage1_device' in content
+    assert 'Detected one visible GPU; forcing vLLM-Omni stage 1 onto device 0.' in content
+    assert 'check_local_vllm_omni_deps' in content
+    assert 'report_vllm_omni_startup_failure' in content
+    assert 'vllm.entrypoints.scale_out' in content
     assert '!/^[[:space:]]*TTS_VLLM_OMNI_ROOT[[:space:]]*=/' in content
     assert '!/^[[:space:]]*TTS_VLLM_OMNI_BIN[[:space:]]*=/' in content
     assert '!/^[[:space:]]*TTS_VLLM_OMNI_DEPLOY_CONFIG[[:space:]]*=/' in content

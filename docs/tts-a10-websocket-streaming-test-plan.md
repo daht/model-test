@@ -233,6 +233,8 @@ client                       server
 Qwen3-TTS vLLM-Omni 这条线后续按下面顺序执行，结果和证据都要留档：
 
 1. 先保留当前可回滚基线 `d4a869f`，用 `TTS_VLLM_OMNI_STAGE_OVERRIDES='{"1":{"max_num_seqs":1}}'` 复测，确认现状没有脚本级回归；
+   如果本地自动启动直接报 `vllm.entrypoints.scale_out` 缺失，先修复 `/opt/vllm-omni` 的虚拟环境依赖，再继续后续参数实验；
+   如果 stage-1 被分到不存在的 GPU 编号，脚本会在单卡环境下自动把 stage-1 约束到 device 0，再继续启动；
 2. 切换到支持 `codec_chunk_ramp` 的 deploy 配置，通过 `TTS_VLLM_OMNI_DEPLOY_CONFIG` 指向新的 YAML，再复测真流式准入；
 3. 通过后执行闭环并发阶梯，重点看 `TTFA p95`、`chunk gap p99`、失败率和是否连续出块；
 4. 再执行开环到达率阶梯，找到稳定吞吐和首次失败点之间的边界；
