@@ -147,6 +147,7 @@ def test_tts_monitor_help_documents_safe_usage():
         "TTS_MONITOR_TRITON_SERVICE",
         "TTS_MONITOR_TRITON_METRICS_URL",
         "TTS_MONITOR_VOXSERVE_SERVICE",
+        "TTS_MONITOR_VOXSERVE_LOG",
         "Ctrl+C",
         "does not require API_KEY",
     ):

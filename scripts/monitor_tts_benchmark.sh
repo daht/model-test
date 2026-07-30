@@ -19,6 +19,7 @@ TRITON_SERVICE="${TTS_MONITOR_TRITON_SERVICE:-}"
 TRITON_METRICS_URL="${TTS_MONITOR_TRITON_METRICS_URL:-}"
 TRITON_METRICS_INTERVAL="${TTS_MONITOR_TRITON_METRICS_INTERVAL_SECONDS:-1}"
 VOXSERVE_SERVICE="${TTS_MONITOR_VOXSERVE_SERVICE:-}"
+VOXSERVE_LOG="${TTS_MONITOR_VOXSERVE_LOG:-}"
 
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$(python3 -c 'import secrets; print(secrets.token_hex(3))')"
 CURRENT_DIR="${RUNS_DIR}/${RUN_ID}"
@@ -50,6 +51,7 @@ Optional environment variables:
   TTS_MONITOR_TRITON_METRICS_URL
   TTS_MONITOR_TRITON_METRICS_INTERVAL_SECONDS
   TTS_MONITOR_VOXSERVE_SERVICE
+  TTS_MONITOR_VOXSERVE_LOG
 
 The collector never sends TTS requests and does not require API_KEY.
 EOF
@@ -290,6 +292,10 @@ voxserve_log_collector() {
     >"${CURRENT_DIR}/voxserve.log" 2>&1
 }
 
+voxserve_file_log_collector() {
+  tail -n 100 -F -- "${VOXSERVE_LOG}" >"${CURRENT_DIR}/voxserve.log" 2>&1
+}
+
 start_collector() {
   "$@" &
   PIDS+=("$!")
@@ -427,6 +433,13 @@ fi
 if [[ -n "${VLLM_OMNI_LOG}" ]]; then
   require_command tail
 fi
+if [[ -n "${VOXSERVE_LOG}" ]]; then
+  require_command tail
+fi
+if [[ -n "${VOXSERVE_SERVICE}" && -n "${VOXSERVE_LOG}" ]]; then
+  echo "Set only one of TTS_MONITOR_VOXSERVE_SERVICE or TTS_MONITOR_VOXSERVE_LOG" >&2
+  exit 2
+fi
 if [[ -n "${TRITON_METRICS_URL}" ]]; then
   require_command curl
   validate_positive_decimal TTS_MONITOR_TRITON_METRICS_INTERVAL_SECONDS "${TRITON_METRICS_INTERVAL}"
@@ -447,6 +460,7 @@ start_collector service_log_collector
 [[ -z "${TRITON_SERVICE}" ]] || start_collector triton_log_collector
 [[ -z "${TRITON_METRICS_URL}" ]] || start_collector triton_metrics_collector
 [[ -z "${VOXSERVE_SERVICE}" ]] || start_collector voxserve_log_collector
+[[ -z "${VOXSERVE_LOG}" ]] || start_collector voxserve_file_log_collector
 
 echo "TTS benchmark monitor started."
 echo "Evidence directory: ${CURRENT_DIR}"
