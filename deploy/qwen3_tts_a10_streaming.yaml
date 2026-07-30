@@ -1,6 +1,7 @@
 # Qwen3-TTS deploy: talker -> code2wav via shared-memory chunk streaming.
 # Based on vLLM-Omni v0.25.0rc1 qwen3_tts.yaml. This A10 experiment changes
-# only the first codec chunk from 1 to 6 frames to provide a playback buffer.
+# only codec chunk sizing: a 6-frame first chunk provides a playback buffer,
+# while 16-frame steady chunks reduce the Code2Wav output cadence.
 async_chunk: true
 
 connectors:
@@ -12,10 +13,10 @@ connectors:
       connector_get_sleep_s: 0.01
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
-      codec_chunk_frames: 25
+      codec_chunk_frames: 16
       codec_left_context_frames: 72
       initial_codec_chunk_frames: 6
-      decode_cudagraph_capture_sizes: [25, 73, 97, 169, 325]
+      decode_cudagraph_capture_sizes: [16, 25, 73, 88, 97, 169, 325]
 
 stages:
   - stage_id: 0
