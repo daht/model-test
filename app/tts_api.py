@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import queue
 import struct
 import time
@@ -25,6 +26,7 @@ tts_synthesizers = {
 }
 
 _STREAM_END = object()
+stream_logger = logging.getLogger("uvicorn.error.tts.stream")
 
 
 @dataclass(frozen=True)
@@ -222,6 +224,10 @@ async def synthesize_tts_stream(websocket: WebSocket) -> None:
     synthesis_ms = 0.0
     encode_ms = 0.0
     saw_text = False
+    last_chunk_ready_at: float | None = None
+    last_chunk_sent_at: float | None = None
+    max_chunk_ready_gap_ms = 0.0
+    max_chunk_sent_gap_ms = 0.0
 
     try:
         while True:
@@ -245,6 +251,14 @@ async def synthesize_tts_stream(websocket: WebSocket) -> None:
                         },
                     }
                 )
+                stream_logger.info(
+                    "completed trace_id=%s chunks=%d max_chunk_ready_gap_ms=%.3f "
+                    "max_chunk_sent_gap_ms=%.3f",
+                    trace_id,
+                    chunk_sequence,
+                    max_chunk_ready_gap_ms,
+                    max_chunk_sent_gap_ms,
+                )
                 await websocket.close(code=1000)
                 return
 
@@ -267,6 +281,12 @@ async def synthesize_tts_stream(websocket: WebSocket) -> None:
             returned_audio = False
             async for pcm in _stream_pcm_in_thread(current_synthesizer, text, voice):
                 returned_audio = True
+                chunk_ready_at = time.perf_counter()
+                if last_chunk_ready_at is not None:
+                    max_chunk_ready_gap_ms = max(
+                        max_chunk_ready_gap_ms,
+                        (chunk_ready_at - last_chunk_ready_at) * 1000,
+                    )
                 encode_started = time.perf_counter()
                 if transport == "binary":
                     header = struct.pack("<4sIQ", b"TTS1", chunk_sequence, sample_offset)
@@ -287,6 +307,14 @@ async def synthesize_tts_stream(websocket: WebSocket) -> None:
                         }
                     )
                 encode_ms += (time.perf_counter() - encode_started) * 1000
+                chunk_sent_at = time.perf_counter()
+                if last_chunk_sent_at is not None:
+                    max_chunk_sent_gap_ms = max(
+                        max_chunk_sent_gap_ms,
+                        (chunk_sent_at - last_chunk_sent_at) * 1000,
+                    )
+                last_chunk_ready_at = chunk_ready_at
+                last_chunk_sent_at = chunk_sent_at
                 chunk_sequence += 1
                 sample_offset += len(pcm) // 2
             if not returned_audio:
