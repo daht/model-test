@@ -2,7 +2,7 @@ import asyncio
 import json
 import os
 import struct
-from threading import Event
+from threading import BoundedSemaphore, Event
 
 from fastapi.testclient import TestClient
 
@@ -29,7 +29,7 @@ def _connect(api_key: str = "test-key"):
     )
 
 
-def _start_task(websocket, transport: str = "hex") -> None:
+def _start_task(websocket, transport: str = "hex", expect_started: bool = True) -> dict:
     connected = websocket.receive_json()
     assert connected["event"] == "connected_success"
     assert connected["base_resp"] == {"status_code": 0, "status_msg": "success"}
@@ -47,9 +47,11 @@ def _start_task(websocket, transport: str = "hex") -> None:
             "stream_options": {"audio_transport": transport},
         }
     )
-    started = websocket.receive_json()
-    assert started["event"] == "task_started"
-    assert started["base_resp"] == {"status_code": 0, "status_msg": "success"}
+    response = websocket.receive_json()
+    if expect_started:
+        assert response["event"] == "task_started"
+        assert response["base_resp"] == {"status_code": 0, "status_msg": "success"}
+    return response
 
 
 def test_tts_health_reports_model_name():
@@ -119,6 +121,20 @@ def test_tts_stream_rejects_bad_api_key():
         assert failed["event"] == "task_failed"
         assert failed["base_resp"]["status_code"] == 1001
         assert failed["base_resp"]["status_msg"] == "Invalid or missing API key"
+
+
+def test_tts_stream_rejects_when_active_capacity_is_exhausted(monkeypatch):
+    slots = BoundedSemaphore(1)
+    assert slots.acquire(blocking=False)
+    monkeypatch.setattr("app.tts_api.tts_stream_slots", slots)
+
+    with _connect() as websocket:
+        failed = _start_task(websocket, expect_started=False)
+        assert failed["event"] == "task_failed"
+        assert failed["base_resp"] == {
+            "status_code": 1013,
+            "status_msg": "TTS is at capacity",
+        }
 
 
 def test_tts_stream_hex_mode_returns_multiple_pcm_chunks():

@@ -10,7 +10,7 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from threading import Event
+from threading import BoundedSemaphore, Event
 
 from fastapi import Depends, FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
 
@@ -24,6 +24,7 @@ tts_synthesizer = create_tts_synthesizer(settings)
 tts_synthesizers = {
     settings.tts_model_name: tts_synthesizer,
 }
+tts_stream_slots = BoundedSemaphore(settings.tts_max_active_streams)
 
 _STREAM_END = object()
 stream_logger = logging.getLogger("uvicorn.error.tts.stream")
@@ -216,7 +217,16 @@ async def synthesize_tts_stream(websocket: WebSocket) -> None:
     except WebSocketDisconnect:
         return
 
-    await websocket.send_json(_event_payload("task_started", session_id, trace_id))
+    if not tts_stream_slots.acquire(blocking=False):
+        await _fail_websocket(
+            websocket,
+            session_id,
+            trace_id,
+            1013,
+            "TTS is at capacity",
+            close_code=1013,
+        )
+        return
 
     chunk_sequence = 0
     sample_offset = 0
@@ -230,6 +240,7 @@ async def synthesize_tts_stream(websocket: WebSocket) -> None:
     max_chunk_sent_gap_ms = 0.0
 
     try:
+        await websocket.send_json(_event_payload("task_started", session_id, trace_id))
         while True:
             payload = await _receive_json(websocket)
             event = payload.get("event")
@@ -327,6 +338,8 @@ async def synthesize_tts_stream(websocket: WebSocket) -> None:
         await _fail_websocket(websocket, session_id, trace_id, 1004, str(exc.detail))
     except (RuntimeError, ValueError, TypeError, json.JSONDecodeError) as exc:
         await _fail_websocket(websocket, session_id, trace_id, 1004, str(exc))
+    finally:
+        tts_stream_slots.release()
 
 
 def _websocket_api_key(websocket: WebSocket) -> str | None:
