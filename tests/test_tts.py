@@ -138,6 +138,19 @@ def test_triton_inputs_match_cosyvoice_model_contract(tmp_path):
     assert inputs[3].value[3].tolist() == [["hello"]]
 
 
+def test_triton_loads_float_wav_prompt(monkeypatch, tmp_path):
+    prompt = tmp_path / "prompt.wav"
+    prompt.touch()
+    fake_soundfile = types.SimpleNamespace(
+        read=lambda path, dtype, always_2d: (np.array([0.25, -0.5], dtype=np.float32), 16000)
+    )
+    monkeypatch.setitem(sys.modules, "soundfile", fake_soundfile)
+
+    synthesizer = TritonTTSSynthesizer(_settings(tmp_path))
+
+    assert np.allclose(synthesizer._load_prompt(), [0.25, -0.5])
+
+
 def test_triton_capacity_snapshot_checks_server_and_model_ready(monkeypatch, tmp_path):
     class FakeClient:
         def __init__(self, url):
@@ -168,7 +181,7 @@ def test_triton_capacity_snapshot_checks_server_and_model_ready(monkeypatch, tmp
     }
 
 
-def test_triton_stream_consumes_decoupled_chunks_until_final_response(tmp_path):
+def test_triton_stream_consumes_decoupled_chunks_until_final_response(monkeypatch, tmp_path):
     with wave.open(str(tmp_path / "prompt.wav"), "wb") as prompt:
         prompt.setnchannels(1)
         prompt.setsampwidth(2)
@@ -223,6 +236,13 @@ def test_triton_stream_consumes_decoupled_chunks_until_final_response(tmp_path):
     settings = _settings(tmp_path)
     synthesizer = TritonTTSSynthesizer(settings)
     synthesizer._grpcclient = lambda: FakeGrpc
+    monkeypatch.setitem(
+        sys.modules,
+        "soundfile",
+        types.SimpleNamespace(
+            read=lambda path, dtype, always_2d: (np.zeros(160, dtype=np.float32), 16000)
+        ),
+    )
 
     assert list(synthesizer.stream_pcm("hello")) == [
         np.array([0.25 * 32767], dtype="<i2").tobytes(),

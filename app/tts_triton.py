@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import queue
 import uuid
-import wave
 from pathlib import Path
 from typing import Iterator
 
@@ -110,11 +109,13 @@ class TritonTTSSynthesizer:
         if self._prompt_audio is not None:
             return self._prompt_audio
         try:
-            with wave.open(str(Path(self.settings.tts_prompt_wav).expanduser()), "rb") as wav:
-                sample_rate = wav.getframerate()
-                channels = wav.getnchannels()
-                sample_width = wav.getsampwidth()
-                frames = wav.readframes(wav.getnframes())
+            import soundfile as sf
+
+            samples, sample_rate = sf.read(
+                str(Path(self.settings.tts_prompt_wav).expanduser()),
+                dtype="float32",
+                always_2d=False,
+            )
         except Exception as exc:
             raise RuntimeError(
                 f"failed to load Triton TTS prompt audio: {exc}"
@@ -123,13 +124,9 @@ class TritonTTSSynthesizer:
             raise RuntimeError(
                 f"Triton CosyVoice prompt audio must be 16000 Hz, got {sample_rate}"
             )
-        if sample_width != 2:
-            raise RuntimeError(
-                f"Triton CosyVoice prompt audio must be PCM s16le, got {sample_width * 8}-bit"
-            )
-        samples = np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
-        if channels > 1:
-            samples = samples.reshape(-1, channels).mean(axis=1)
+        samples = np.asarray(samples, dtype=np.float32)
+        if samples.ndim > 1:
+            samples = samples.mean(axis=-1)
         samples = samples.reshape(-1)
         if samples.size == 0:
             raise RuntimeError("Triton TTS prompt audio is empty")
