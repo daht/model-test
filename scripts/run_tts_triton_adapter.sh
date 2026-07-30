@@ -412,7 +412,7 @@ run_args=(
   --mount "type=volume,source=tts-model-cache,target=/root/.cache/huggingface"
   "${API_IMAGE}"
   sh -ec
-  "cd /workspace/model-test; exec python -m uvicorn app.tts_api:app --host 0.0.0.0 --port ${API_PORT}"
+  "cd /workspace/model-test; exec python -m uvicorn app.tts_api:app --host 0.0.0.0 --port ${API_PORT} --ws websockets-sansio"
 )
 
 if [[ -n "${PROMPT_WAV}" ]]; then

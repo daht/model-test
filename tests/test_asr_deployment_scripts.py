@@ -128,6 +128,7 @@ def test_tts_adapter_dependencies_are_baked_into_image():
     assert "-r requirements-tts-qwen.txt" in dockerfile
     assert "sox" in dockerfile
     assert "pip3 install" not in script_content
+    assert "--ws websockets-sansio" in script_content
 
 
 def test_tts_adapter_script_auto_starts_vllm_omni_backend():
@@ -160,7 +161,7 @@ def test_tts_env_example_documents_vllm_omni_deploy_config():
     content = Path(".env.example").read_text()
 
     assert "TTS_VLLM_OMNI_DEPLOY_CONFIG" in content
-    assert "qwen3_tts_high_concurrency.yaml" in content
+    assert "qwen3_tts_a10_streaming.yaml" in content
     assert "TTS_VLLM_OMNI_STAGE_OVERRIDES" in content
 
 
