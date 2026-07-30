@@ -159,6 +159,7 @@ def _capacity_snapshot(
         "cosyvoice",
         "triton",
         "vllm_omni",
+        "voxserve",
     }
     return {
         "ready": getattr(synthesizer, "ready", None),

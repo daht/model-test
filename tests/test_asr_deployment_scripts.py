@@ -165,6 +165,16 @@ def test_tts_env_example_documents_vllm_omni_deploy_config():
     assert "TTS_VLLM_OMNI_STAGE_OVERRIDES" in content
 
 
+def test_tts_adapter_script_supports_voxserve_backend():
+    content = script("run_tts_triton_adapter.sh")
+
+    assert 'VOXSERVE_BASE_URL="${TTS_VOXSERVE_BASE_URL:-}"' in content
+    assert '"${VOXSERVE_BASE_URL}/health"' in content
+    assert "vllm_omni, or voxserve" in content
+    assert "TTS_VOXSERVE_MODEL" in Path(".env.example").read_text()
+    assert "TTS_VOXSERVE_MODE=base" in Path(".env.example").read_text()
+
+
 def test_a10_sensevoice_release_contract_and_evaluation_runbook():
     example = Path("cloud/A10.sensevoice.env.example").read_text()
     verifier = Path("scripts/verify_asr_release.sh").read_text()

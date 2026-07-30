@@ -26,6 +26,7 @@ VLLM_OMNI_PID="${TTS_VLLM_OMNI_PID:-/tmp/vllm-omni-qwen-tts.pid}"
 VLLM_OMNI_START_TIMEOUT="${TTS_VLLM_OMNI_START_TIMEOUT_SECONDS:-900}"
 VLLM_OMNI_API_KEY_VALUE="${TTS_VLLM_OMNI_API_KEY:-}"
 VLLM_OMNI_STAGE_OVERRIDES="${TTS_VLLM_OMNI_STAGE_OVERRIDES:-}"
+VOXSERVE_BASE_URL="${TTS_VOXSERVE_BASE_URL:-}"
 
 env_file_value() {
   local key="$1"
@@ -48,6 +49,8 @@ VLLM_OMNI_ROOT="${VLLM_OMNI_ROOT:-/opt/vllm-omni}"
 VLLM_OMNI_BIN="${VLLM_OMNI_BIN:-vllm-omni}"
 VLLM_OMNI_API_KEY_VALUE="${VLLM_OMNI_API_KEY_VALUE:-$(env_file_value TTS_VLLM_OMNI_API_KEY)}"
 VLLM_OMNI_STAGE_OVERRIDES="${VLLM_OMNI_STAGE_OVERRIDES:-$(env_file_value TTS_VLLM_OMNI_STAGE_OVERRIDES)}"
+VOXSERVE_BASE_URL="${VOXSERVE_BASE_URL:-$(env_file_value TTS_VOXSERVE_BASE_URL)}"
+VOXSERVE_BASE_URL="${VOXSERVE_BASE_URL:-http://127.0.0.1:8000}"
 vllm_url_port="${VLLM_OMNI_BASE_URL##*:}"
 vllm_url_port="${vllm_url_port%%/*}"
 if [[ "${vllm_url_port}" =~ ^[0-9]+$ ]]; then
@@ -68,7 +71,7 @@ Environment overrides:
   TTS_API_PORT               Adapter WebSocket port (default: 8003)
   TTS_TRITON_CONTAINER       Triton container name
   TTS_API_IMAGE              Adapter image (default: cosyvoice-tts-adapter:latest)
-  TTS_BACKEND                Deployment backend: triton, qwen, or vllm_omni
+  TTS_BACKEND                Deployment backend: triton, qwen, vllm_omni, or voxserve
   TTS_MODEL_NAME             Public model name
   TTS_TRITON_MODEL_NAME      Triton model name
   TTS_PROMPT_WAV             Prompt path inside adapter container
@@ -132,9 +135,17 @@ if [[ "${BACKEND}" == "triton" ]]; then
     echo "Triton is not ready on HTTP port ${TRITON_HTTP_PORT}" >&2
     exit 2
   fi
-elif [[ "${BACKEND}" != "qwen" && "${BACKEND}" != "vllm_omni" ]]; then
-  echo "Unsupported TTS_BACKEND: ${BACKEND}; expected triton, qwen, or vllm_omni" >&2
+elif [[ "${BACKEND}" != "qwen" && "${BACKEND}" != "vllm_omni" && "${BACKEND}" != "voxserve" ]]; then
+  echo "Unsupported TTS_BACKEND: ${BACKEND}; expected triton, qwen, vllm_omni, or voxserve" >&2
   exit 2
+fi
+
+if [[ "${BACKEND}" == "voxserve" ]]; then
+  if ! curl -fsS --max-time 2 "${VOXSERVE_BASE_URL}/health" >/dev/null; then
+    echo "VoxServe is not ready: ${VOXSERVE_BASE_URL}/health" >&2
+    exit 2
+  fi
+  echo "Reusing ready VoxServe at ${VOXSERVE_BASE_URL}"
 fi
 
 resolve_local_vllm_omni_python() {

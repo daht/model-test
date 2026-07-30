@@ -137,6 +137,10 @@ def create_tts_synthesizer(settings: Settings) -> TTSSynthesizer:
         from app.tts_vllm_omni import VLLMOmniTTSSynthesizer
 
         return VLLMOmniTTSSynthesizer(settings)
+    if settings.tts_backend == "voxserve":
+        from app.tts_voxserve import VoxServeTTSSynthesizer
+
+        return VoxServeTTSSynthesizer(settings)
     return CosyVoiceTTSSynthesizer(settings)
 
 

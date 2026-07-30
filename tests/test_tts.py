@@ -12,6 +12,7 @@ from app.tts import CosyVoiceTTSSynthesizer, _cosyvoice_result_to_wav, create_tt
 from app.tts_qwen import Qwen3TTSSynthesizer, _load_qwen_model
 from app.tts_triton import TritonTTSSynthesizer, _float_audio_to_pcm
 from app.tts_vllm_omni import VLLMOmniTTSSynthesizer
+from app.tts_voxserve import VoxServeTTSSynthesizer
 
 
 def _settings(tmp_path: Path):
@@ -32,6 +33,12 @@ def _settings(tmp_path: Path):
         tts_vllm_omni_model="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
         tts_vllm_omni_timeout_seconds=30.0,
         tts_vllm_omni_api_key=None,
+        tts_voxserve_base_url="http://voxserve:8000",
+        tts_voxserve_model="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+        tts_voxserve_mode="custom_voice",
+        tts_voxserve_timeout_seconds=30.0,
+        tts_qwen_reference_wav=None,
+        tts_qwen_reference_text=None,
     )
 
 
@@ -574,3 +581,174 @@ def test_factory_selects_vllm_omni(tmp_path):
     settings.tts_backend = "vllm_omni"
 
     assert isinstance(create_tts_synthesizer(settings), VLLMOmniTTSSynthesizer)
+
+
+def test_voxserve_custom_voice_streams_pcm_with_expected_contract(tmp_path):
+    settings = _settings(tmp_path)
+    settings.tts_qwen_language = "Chinese"
+    settings.tts_qwen_speaker = "Vivian"
+    calls = []
+
+    class FakeResponse:
+        headers = {"content-type": "audio/pcm"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+        def iter_bytes(self):
+            yield b"\x01\x00"
+            yield b"\x02\x00"
+
+    class FakeClient:
+        def stream(self, method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            return FakeResponse()
+
+    synthesizer = VoxServeTTSSynthesizer(settings, client=FakeClient())
+
+    assert list(synthesizer.stream_pcm("hello", "default")) == [b"\x01\x00", b"\x02\x00"]
+    assert calls == [
+        (
+            "POST",
+            "http://voxserve:8000/v1/audio/speech",
+            {
+                "timeout": 30.0,
+                "json": {
+                    "model": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+                    "input": "hello",
+                    "voice": "Vivian",
+                    "language": "Chinese",
+                    "response_format": "pcm",
+                    "stream": True,
+                },
+            },
+        )
+    ]
+
+
+def test_voxserve_base_uploads_reference_and_strips_streaming_wav_header(tmp_path):
+    settings = _settings(tmp_path)
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"reference")
+    settings.tts_voxserve_mode = "base"
+    settings.tts_qwen_language = "Chinese"
+    settings.tts_voxserve_model = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+    settings.tts_qwen_language = "Chinese"
+    settings.tts_qwen_reference_wav = str(reference)
+    settings.tts_qwen_reference_text = "参考音频文本"
+    calls = []
+    header = _wav_header(24000)
+
+    class FakeResponse:
+        headers = {"content-type": "audio/wav"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+        def iter_bytes(self):
+            yield header[:17]
+            yield header[17:] + b"\x01"
+            yield b"\x00\x02\x00"
+
+    class FakeClient:
+        def stream(self, method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            return FakeResponse()
+
+    synthesizer = VoxServeTTSSynthesizer(settings, client=FakeClient())
+
+    assert list(synthesizer.stream_pcm("hello")) == [b"\x01\x00\x02\x00"]
+    method, url, kwargs = calls[0]
+    assert (method, url, kwargs["timeout"]) == ("POST", "http://voxserve:8000/generate", 30.0)
+    assert kwargs["data"] == {
+        "text": "hello",
+        "streaming": "true",
+        "language": "Chinese",
+        "ref_text": "参考音频文本",
+    }
+    assert kwargs["files"]["audio"][0] == "reference.wav"
+    assert kwargs["files"]["audio"][2] == "audio/wav"
+
+
+def test_voxserve_base_rejects_invalid_streaming_wav(tmp_path):
+    settings = _settings(tmp_path)
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"reference")
+    settings.tts_voxserve_mode = "base"
+    settings.tts_qwen_language = "Chinese"
+    settings.tts_qwen_reference_wav = str(reference)
+    settings.tts_qwen_reference_text = "reference"
+
+    class FakeResponse:
+        headers = {"content-type": "audio/wav"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+        def iter_bytes(self):
+            yield b"not-a-wave!!"
+
+    class FakeClient:
+        def stream(self, *args, **kwargs):
+            return FakeResponse()
+
+    with pytest.raises(RuntimeError, match="invalid WAV"):
+        list(VoxServeTTSSynthesizer(settings, client=FakeClient()).stream_pcm("hello"))
+
+
+def test_voxserve_start_and_capacity_snapshot(tmp_path):
+    settings = _settings(tmp_path)
+    calls = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+    class FakeClient:
+        def get(self, url, **kwargs):
+            calls.append((url, kwargs))
+            return FakeResponse()
+
+        def close(self):
+            return None
+
+    synthesizer = VoxServeTTSSynthesizer(settings, client=FakeClient())
+    synthesizer.start()
+
+    assert calls == [("http://voxserve:8000/health", {"timeout": 30.0})]
+    assert synthesizer.capacity_snapshot()["supports_microbatch"] is True
+
+
+def test_factory_selects_voxserve(tmp_path):
+    settings = _settings(tmp_path)
+    settings.tts_backend = "voxserve"
+
+    assert isinstance(create_tts_synthesizer(settings), VoxServeTTSSynthesizer)
+
+
+def _wav_header(sample_rate: int) -> bytes:
+    output = __import__("io").BytesIO()
+    with wave.open(output, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(b"")
+    return output.getvalue()

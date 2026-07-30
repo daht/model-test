@@ -114,7 +114,7 @@ class Settings(BaseSettings):
     asr_gateway_default_backend: str = Field(default="local", min_length=1, max_length=128)
     asr_gateway_max_active_sessions: int = Field(default=2, gt=0, le=1024)
     tts_model_name: str = "CosyVoice"
-    tts_backend: Literal["mock", "cosyvoice", "triton", "qwen", "vllm_omni"] = "mock"
+    tts_backend: Literal["mock", "cosyvoice", "triton", "qwen", "vllm_omni", "voxserve"] = "mock"
     tts_triton_url: str = "127.0.0.1:18001"
     tts_triton_model_name: str = "cosyvoice3"
     tts_model_id: str = "/models/CosyVoice"
@@ -143,6 +143,14 @@ class Settings(BaseSettings):
     )
     tts_vllm_omni_timeout_seconds: float = Field(default=300.0, gt=0, le=3600)
     tts_vllm_omni_api_key: str | None = None
+    tts_voxserve_base_url: str = Field(default="http://127.0.0.1:8000", min_length=1)
+    tts_voxserve_model: str = Field(
+        default="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", min_length=1
+    )
+    tts_voxserve_mode: Literal["custom_voice", "base"] = "custom_voice"
+    tts_voxserve_timeout_seconds: float = Field(default=300.0, gt=0, le=3600)
+    tts_qwen_reference_wav: str | None = None
+    tts_qwen_reference_text: str | None = None
     trust_remote_code: bool = True
 
     @field_validator("asr_max_frame_bytes")
@@ -157,6 +165,8 @@ class Settings(BaseSettings):
         "vllm_model",
         "tts_vllm_omni_base_url",
         "tts_vllm_omni_model",
+        "tts_voxserve_base_url",
+        "tts_voxserve_model",
     )
     @classmethod
     def require_nonempty_vllm_setting(cls, value: str) -> str:
@@ -164,6 +174,16 @@ class Settings(BaseSettings):
         if not normalized:
             raise ValueError("vLLM setting must not be empty")
         return normalized
+
+    @model_validator(mode="after")
+    def validate_voxserve_base_reference(self) -> "Settings":
+        if self.tts_backend != "voxserve" or self.tts_voxserve_mode != "base":
+            return self
+        if not (self.tts_qwen_reference_wav or "").strip():
+            raise ValueError("tts_qwen_reference_wav is required for VoxServe Base mode")
+        if not (self.tts_qwen_reference_text or "").strip():
+            raise ValueError("tts_qwen_reference_text is required for VoxServe Base mode")
+        return self
 
     @field_validator("asr_vad_model_sha256")
     @classmethod
