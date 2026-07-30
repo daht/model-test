@@ -15,12 +15,16 @@ CONTAINER_INTERVAL="${TTS_MONITOR_CONTAINER_INTERVAL_SECONDS:-1}"
 VLLM_OMNI_METRICS_URL="${TTS_MONITOR_VLLM_OMNI_METRICS_URL:-}"
 VLLM_OMNI_METRICS_INTERVAL="${TTS_MONITOR_VLLM_OMNI_METRICS_INTERVAL_SECONDS:-1}"
 VLLM_OMNI_LOG="${TTS_MONITOR_VLLM_OMNI_LOG:-}"
+TRITON_SERVICE="${TTS_MONITOR_TRITON_SERVICE:-}"
+TRITON_METRICS_URL="${TTS_MONITOR_TRITON_METRICS_URL:-}"
+TRITON_METRICS_INTERVAL="${TTS_MONITOR_TRITON_METRICS_INTERVAL_SECONDS:-1}"
 
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$(python3 -c 'import secrets; print(secrets.token_hex(3))')"
 CURRENT_DIR="${RUNS_DIR}/${RUN_ID}"
 ARCHIVE_PATH="${RUNS_DIR}/${RUN_ID}.tar.gz"
 STARTED_UTC="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
 CONTAINER_ID=""
+TRITON_CONTAINER_ID=""
 PIDS=()
 FINALIZED=0
 
@@ -40,6 +44,9 @@ Optional environment variables:
   TTS_MONITOR_VLLM_OMNI_METRICS_URL
   TTS_MONITOR_VLLM_OMNI_METRICS_INTERVAL_SECONDS
   TTS_MONITOR_VLLM_OMNI_LOG
+  TTS_MONITOR_TRITON_SERVICE
+  TTS_MONITOR_TRITON_METRICS_URL
+  TTS_MONITOR_TRITON_METRICS_INTERVAL_SECONDS
 
 The collector never sends TTS requests and does not require API_KEY.
 EOF
@@ -107,6 +114,18 @@ resolve_container() {
     exit 2
   fi
   CONTAINER_ID="${container_ids[0]}"
+}
+
+resolve_triton_container() {
+  local raw
+  raw="$(docker ps -q --filter name="${TRITON_SERVICE}" 2>/dev/null || true)"
+  mapfile -t container_ids < <(printf '%s\n' "${raw}" | sed '/^[[:space:]]*$/d')
+  if [[ ${#container_ids[@]} -ne 1 ]]; then
+    echo "Expected exactly one running Triton container: ${TRITON_SERVICE}" >&2
+    release_lock
+    exit 2
+  fi
+  TRITON_CONTAINER_ID="${container_ids[0]}"
 }
 
 record_error() {
@@ -230,6 +249,27 @@ vllm_omni_metrics_collector() {
   done
 }
 
+triton_log_collector() {
+  exec docker logs --follow --timestamps --since "${STARTED_UTC}" "${TRITON_CONTAINER_ID}" \
+    >"${CURRENT_DIR}/triton.log" 2>&1
+}
+
+triton_metrics_collector() {
+  local output="${CURRENT_DIR}/triton-metrics.prom"
+  while true; do
+    if {
+      printf '# sampled_at=%s\n' "$(utc_now)"
+      curl --fail --silent --show-error --max-time 5 "${TRITON_METRICS_URL}"
+      printf '\n'
+    } >>"${output}"; then
+      :
+    else
+      record_error triton_metrics sample_failed
+    fi
+    sleep "${TRITON_METRICS_INTERVAL}"
+  done
+}
+
 start_collector() {
   "$@" &
   PIDS+=("$!")
@@ -327,6 +367,12 @@ finalize() {
     [[ -e "${CURRENT_DIR}/vllm-omni.log.sanitized" ]] && \
       mv -- "${CURRENT_DIR}/vllm-omni.log.sanitized" "${CURRENT_DIR}/vllm-omni.log"
   fi
+  if [[ -e "${CURRENT_DIR}/triton.log" ]]; then
+    sed -E 's/([0-9]{1,3}\.){3}[0-9]{1,3}/[redacted-ip]/g' \
+      "${CURRENT_DIR}/triton.log" >"${CURRENT_DIR}/triton.log.sanitized" || true
+    [[ -e "${CURRENT_DIR}/triton.log.sanitized" ]] && \
+      mv -- "${CURRENT_DIR}/triton.log.sanitized" "${CURRENT_DIR}/triton.log"
+  fi
   generate_report
   (
     cd "${CURRENT_DIR}"
@@ -355,8 +401,13 @@ fi
 if [[ -n "${VLLM_OMNI_LOG}" ]]; then
   require_command tail
 fi
+if [[ -n "${TRITON_METRICS_URL}" ]]; then
+  require_command curl
+  validate_positive_decimal TTS_MONITOR_TRITON_METRICS_INTERVAL_SECONDS "${TRITON_METRICS_INTERVAL}"
+fi
 prepare_output
 resolve_container
+[[ -z "${TRITON_SERVICE}" ]] || resolve_triton_container
 write_metadata ""
 trap handle_signal INT TERM
 trap finalize EXIT
@@ -366,6 +417,8 @@ start_collector container_collector
 start_collector service_log_collector
 [[ -z "${VLLM_OMNI_LOG}" ]] || start_collector vllm_omni_log_collector
 [[ -z "${VLLM_OMNI_METRICS_URL}" ]] || start_collector vllm_omni_metrics_collector
+[[ -z "${TRITON_SERVICE}" ]] || start_collector triton_log_collector
+[[ -z "${TRITON_METRICS_URL}" ]] || start_collector triton_metrics_collector
 
 echo "TTS benchmark monitor started."
 echo "Evidence directory: ${CURRENT_DIR}"

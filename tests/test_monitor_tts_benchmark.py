@@ -144,6 +144,8 @@ def test_tts_monitor_help_documents_safe_usage():
         "TTS_MONITOR_GPU_INDEX",
         "TTS_MONITOR_VLLM_OMNI_METRICS_URL",
         "TTS_MONITOR_VLLM_OMNI_LOG",
+        "TTS_MONITOR_TRITON_SERVICE",
+        "TTS_MONITOR_TRITON_METRICS_URL",
         "Ctrl+C",
         "does not require API_KEY",
     ):
