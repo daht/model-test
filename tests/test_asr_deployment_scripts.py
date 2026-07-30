@@ -172,7 +172,7 @@ def test_tts_adapter_script_supports_voxserve_backend():
     assert '"${VOXSERVE_BASE_URL}/health"' in content
     assert "vllm_omni, or voxserve" in content
     assert "TTS_VOXSERVE_MODEL" in Path(".env.example").read_text()
-    assert "TTS_VOXSERVE_MODE=base" in Path(".env.example").read_text()
+    assert "Qwen3-TTS-12Hz-0.6B-CustomVoice" in Path(".env.example").read_text()
 
 
 def test_a10_sensevoice_release_contract_and_evaluation_runbook():

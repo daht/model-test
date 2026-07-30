@@ -147,10 +147,7 @@ class Settings(BaseSettings):
     tts_voxserve_model: str = Field(
         default="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", min_length=1
     )
-    tts_voxserve_mode: Literal["custom_voice", "base"] = "custom_voice"
     tts_voxserve_timeout_seconds: float = Field(default=300.0, gt=0, le=3600)
-    tts_qwen_reference_wav: str | None = None
-    tts_qwen_reference_text: str | None = None
     trust_remote_code: bool = True
 
     @field_validator("asr_max_frame_bytes")
@@ -174,16 +171,6 @@ class Settings(BaseSettings):
         if not normalized:
             raise ValueError("vLLM setting must not be empty")
         return normalized
-
-    @model_validator(mode="after")
-    def validate_voxserve_base_reference(self) -> "Settings":
-        if self.tts_backend != "voxserve" or self.tts_voxserve_mode != "base":
-            return self
-        if not (self.tts_qwen_reference_wav or "").strip():
-            raise ValueError("tts_qwen_reference_wav is required for VoxServe Base mode")
-        if not (self.tts_qwen_reference_text or "").strip():
-            raise ValueError("tts_qwen_reference_text is required for VoxServe Base mode")
-        return self
 
     @field_validator("asr_vad_model_sha256")
     @classmethod

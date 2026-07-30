@@ -35,10 +35,7 @@ def _settings(tmp_path: Path):
         tts_vllm_omni_api_key=None,
         tts_voxserve_base_url="http://voxserve:8000",
         tts_voxserve_model="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
-        tts_voxserve_mode="custom_voice",
         tts_voxserve_timeout_seconds=30.0,
-        tts_qwen_reference_wav=None,
-        tts_qwen_reference_text=None,
         tts_qwen_instruct="",
     )
 
@@ -633,94 +630,12 @@ def test_voxserve_custom_voice_streams_pcm_with_expected_contract(tmp_path):
     ]
 
 
-def test_voxserve_base_uploads_reference_and_strips_streaming_wav_header(tmp_path):
-    settings = _settings(tmp_path)
-    reference = tmp_path / "reference.wav"
-    reference.write_bytes(b"reference")
-    settings.tts_voxserve_mode = "base"
-    settings.tts_qwen_language = "Chinese"
-    settings.tts_voxserve_model = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
-    settings.tts_qwen_language = "Chinese"
-    settings.tts_qwen_reference_wav = str(reference)
-    settings.tts_qwen_reference_text = "参考音频文本"
-    calls = []
-    header = _wav_header(24000)
-
-    class FakeResponse:
-        headers = {"content-type": "audio/wav"}
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return None
-
-        def raise_for_status(self):
-            return None
-
-        def iter_bytes(self):
-            yield header[:17]
-            yield header[17:] + b"\x01"
-            yield b"\x00\x02\x00"
-
-    class FakeClient:
-        def stream(self, method, url, **kwargs):
-            calls.append((method, url, kwargs))
-            return FakeResponse()
-
-    synthesizer = VoxServeTTSSynthesizer(settings, client=FakeClient())
-
-    assert list(synthesizer.stream_pcm("hello")) == [b"\x01\x00\x02\x00"]
-    method, url, kwargs = calls[0]
-    assert (method, url, kwargs["timeout"]) == ("POST", "http://voxserve:8000/generate", 30.0)
-    assert kwargs["data"] == {
-        "text": "hello",
-        "streaming": "true",
-        "language": "Chinese",
-        "ref_text": "参考音频文本",
-    }
-    assert kwargs["files"]["audio"][0] == "reference.wav"
-    assert kwargs["files"]["audio"][2] == "audio/wav"
-
-
 def test_voxserve_custom_voice_rejects_unsupported_instruction(tmp_path):
     settings = _settings(tmp_path)
     settings.tts_qwen_instruct = "warm voice"
 
     with pytest.raises(RuntimeError, match="does not expose Qwen instruction"):
         list(VoxServeTTSSynthesizer(settings).stream_pcm("hello"))
-
-
-def test_voxserve_base_rejects_invalid_streaming_wav(tmp_path):
-    settings = _settings(tmp_path)
-    reference = tmp_path / "reference.wav"
-    reference.write_bytes(b"reference")
-    settings.tts_voxserve_mode = "base"
-    settings.tts_qwen_language = "Chinese"
-    settings.tts_qwen_reference_wav = str(reference)
-    settings.tts_qwen_reference_text = "reference"
-
-    class FakeResponse:
-        headers = {"content-type": "audio/wav"}
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return None
-
-        def raise_for_status(self):
-            return None
-
-        def iter_bytes(self):
-            yield b"not-a-wave!!"
-
-    class FakeClient:
-        def stream(self, *args, **kwargs):
-            return FakeResponse()
-
-    with pytest.raises(RuntimeError, match="invalid WAV"):
-        list(VoxServeTTSSynthesizer(settings, client=FakeClient()).stream_pcm("hello"))
 
 
 def test_voxserve_start_and_capacity_snapshot(tmp_path):
@@ -751,13 +666,3 @@ def test_factory_selects_voxserve(tmp_path):
     settings.tts_backend = "voxserve"
 
     assert isinstance(create_tts_synthesizer(settings), VoxServeTTSSynthesizer)
-
-
-def _wav_header(sample_rate: int) -> bytes:
-    output = __import__("io").BytesIO()
-    with wave.open(output, "wb") as wav_file:
-        wav_file.setnchannels(1)
-        wav_file.setsampwidth(2)
-        wav_file.setframerate(sample_rate)
-        wav_file.writeframes(b"")
-    return output.getvalue()
