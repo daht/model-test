@@ -228,6 +228,7 @@ async def send_request(
                 max_size=None,
                 open_timeout=min(15.0, config.request_timeout_seconds),
                 close_timeout=5,
+                ping_interval=None,
             ) as websocket:
                 connected = _json_message(await websocket.recv())
                 _require_event(connected, "connected_success")
@@ -313,8 +314,8 @@ async def send_request(
         error_category = "timeout"
     except websockets.exceptions.InvalidStatus as exc:
         error_category = f"websocket_http_{exc.response.status_code}"
-    except websockets.exceptions.WebSocketException:
-        error_category = "websocket_error"
+    except websockets.exceptions.WebSocketException as exc:
+        error_category = f"websocket_{type(exc).__name__}"
     except (BenchmarkError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
         error_category = str(exc).split()[0]
 
