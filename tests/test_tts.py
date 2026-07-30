@@ -39,6 +39,7 @@ def _settings(tmp_path: Path):
         tts_voxserve_timeout_seconds=30.0,
         tts_qwen_reference_wav=None,
         tts_qwen_reference_text=None,
+        tts_qwen_instruct="",
     )
 
 
@@ -680,6 +681,14 @@ def test_voxserve_base_uploads_reference_and_strips_streaming_wav_header(tmp_pat
     }
     assert kwargs["files"]["audio"][0] == "reference.wav"
     assert kwargs["files"]["audio"][2] == "audio/wav"
+
+
+def test_voxserve_custom_voice_rejects_unsupported_instruction(tmp_path):
+    settings = _settings(tmp_path)
+    settings.tts_qwen_instruct = "warm voice"
+
+    with pytest.raises(RuntimeError, match="does not expose Qwen instruction"):
+        list(VoxServeTTSSynthesizer(settings).stream_pcm("hello"))
 
 
 def test_voxserve_base_rejects_invalid_streaming_wav(tmp_path):

@@ -59,6 +59,10 @@ class VoxServeTTSSynthesizer:
         yield from self._stream_custom_voice(text)
 
     def _stream_custom_voice(self, text: str) -> Iterator[bytes]:
+        if self.settings.tts_qwen_instruct:
+            raise RuntimeError(
+                "VoxServe /v1/audio/speech does not expose Qwen instruction control"
+            )
         payload = {
             "model": self.settings.tts_voxserve_model,
             "input": text,
