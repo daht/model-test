@@ -405,6 +405,13 @@ finalize() {
     [[ -e "${CURRENT_DIR}/voxserve.log.sanitized" ]] && \
       mv -- "${CURRENT_DIR}/voxserve.log.sanitized" "${CURRENT_DIR}/voxserve.log"
   fi
+  if [[ -s "${CURRENT_DIR}/triton-metrics.prom" ]]; then
+    if ! python3 scripts/analyze_triton_metrics.py "${CURRENT_DIR}/triton-metrics.prom" \
+      --json-output "${CURRENT_DIR}/triton-batching.json" \
+      --markdown-output "${CURRENT_DIR}/triton-batching.md"; then
+      record_error triton_metrics analysis_failed
+    fi
+  fi
   generate_report
   (
     cd "${CURRENT_DIR}"

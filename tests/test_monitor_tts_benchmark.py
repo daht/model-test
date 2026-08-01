@@ -130,6 +130,62 @@ fi
     assert "vllm:omni_num_requests_waiting" in (run / "vllm-omni-metrics.prom").read_text()
 
 
+def test_triton_metrics_analyzer_reports_per_model_batching(tmp_path):
+    metrics = tmp_path / "triton-metrics.prom"
+    metrics.write_text(
+        """# sampled_at=2026-08-01T00:00:00.000Z
+nv_inference_request_success{model=\"llm\",version=\"1\"} 10
+nv_inference_exec_count{model=\"llm\",version=\"1\"} 10
+nv_inference_count{model=\"llm\",version=\"1\"} 10
+nv_inference_request_success{model=\"vocoder\",version=\"1\"} 8
+nv_inference_exec_count{model=\"vocoder\",version=\"1\"} 8
+nv_inference_count{model=\"vocoder\",version=\"1\"} 8
+# sampled_at=2026-08-01T00:00:01.000Z
+nv_inference_request_success{model=\"llm\",version=\"1\"} 16
+nv_inference_exec_count{model=\"llm\",version=\"1\"} 12
+nv_inference_count{model=\"llm\",version=\"1\"} 18
+nv_inference_request_success{model=\"vocoder\",version=\"1\"} 14
+nv_inference_exec_count{model=\"vocoder\",version=\"1\"} 14
+nv_inference_count{model=\"vocoder\",version=\"1\"} 14
+"""
+    )
+    result = subprocess.run(
+        [
+            "python3",
+            "scripts/analyze_triton_metrics.py",
+            str(metrics),
+            "--json-output",
+            str(tmp_path / "report.json"),
+            "--markdown-output",
+            str(tmp_path / "report.md"),
+        ],
+        cwd=ROOT,
+        check=True,
+    )
+    assert result.returncode == 0
+    report = json.loads((tmp_path / "report.json").read_text())
+    assert report["snapshot_count"] == 2
+    assert report["models"] == [
+        {
+            "average_batch_size": 4.0,
+            "executions_delta": 2.0,
+            "inference_elements_delta": 8.0,
+            "model": "llm",
+            "requests_per_execution": 3.0,
+            "successful_requests_delta": 6.0,
+        },
+        {
+            "average_batch_size": 1.0,
+            "executions_delta": 6.0,
+            "inference_elements_delta": 6.0,
+            "model": "vocoder",
+            "requests_per_execution": 1.0,
+            "successful_requests_delta": 6.0,
+        },
+    ]
+    assert "| vocoder | 6.00 | 6.00 | 6.00 | 1.00 | 1.00 |" in (tmp_path / "report.md").read_text()
+
+
 def test_tts_monitor_help_documents_safe_usage():
     result = subprocess.run(
         ["bash", "scripts/monitor_tts_benchmark.sh", "--help"],
