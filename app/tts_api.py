@@ -294,11 +294,10 @@ async def synthesize_tts_stream(websocket: WebSocket) -> None:
             async for pcm in _stream_pcm_in_thread(current_synthesizer, text, voice):
                 returned_audio = True
                 chunk_ready_at = time.perf_counter()
+                ready_gap_ms = 0.0
                 if last_chunk_ready_at is not None:
-                    max_chunk_ready_gap_ms = max(
-                        max_chunk_ready_gap_ms,
-                        (chunk_ready_at - last_chunk_ready_at) * 1000,
-                    )
+                    ready_gap_ms = (chunk_ready_at - last_chunk_ready_at) * 1000
+                    max_chunk_ready_gap_ms = max(max_chunk_ready_gap_ms, ready_gap_ms)
                 encode_started = time.perf_counter()
                 if transport == "binary":
                     header = struct.pack("<4sIQ", b"TTS1", chunk_sequence, sample_offset)
@@ -320,10 +319,20 @@ async def synthesize_tts_stream(websocket: WebSocket) -> None:
                     )
                 encode_ms += (time.perf_counter() - encode_started) * 1000
                 chunk_sent_at = time.perf_counter()
+                sent_gap_ms = 0.0
                 if last_chunk_sent_at is not None:
-                    max_chunk_sent_gap_ms = max(
-                        max_chunk_sent_gap_ms,
-                        (chunk_sent_at - last_chunk_sent_at) * 1000,
+                    sent_gap_ms = (chunk_sent_at - last_chunk_sent_at) * 1000
+                    max_chunk_sent_gap_ms = max(max_chunk_sent_gap_ms, sent_gap_ms)
+                gap_trace_ms = current_settings.tts_stream_gap_trace_ms
+                if gap_trace_ms and max(ready_gap_ms, sent_gap_ms) >= gap_trace_ms:
+                    stream_logger.info(
+                        "TTS gap trace: trace_id=%s chunk_sequence=%d ready_gap_ms=%.3f "
+                        "sent_gap_ms=%.3f pcm_bytes=%d",
+                        trace_id,
+                        chunk_sequence,
+                        ready_gap_ms,
+                        sent_gap_ms,
+                        len(pcm),
                     )
                 last_chunk_ready_at = chunk_ready_at
                 last_chunk_sent_at = chunk_sent_at

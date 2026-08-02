@@ -49,6 +49,15 @@ def test_active_stream_limit_accepts_128_and_rejects_129():
         )
 
 
+def test_tts_stream_gap_trace_is_disabled_by_default_and_bounded():
+    assert Settings(_env_file=None).tts_stream_gap_trace_ms == 0.0
+    assert Settings(_env_file=None, tts_stream_gap_trace_ms=60000).tts_stream_gap_trace_ms == 60000
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, tts_stream_gap_trace_ms=-1)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, tts_stream_gap_trace_ms=60001)
+
+
 @pytest.mark.parametrize("version", ["1", "3"])
 def test_protocol_version_rejects_other_environment_values(monkeypatch, version):
     monkeypatch.setenv("ASR_PROTOCOL_VERSION", version)

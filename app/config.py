@@ -122,6 +122,7 @@ class Settings(BaseSettings):
     tts_sample_rate: int = 24000
     tts_max_text_chars: int = 1000
     tts_max_active_streams: int = Field(default=2, gt=0, le=128)
+    tts_stream_gap_trace_ms: float = Field(default=0.0, ge=0, le=60000)
     tts_default_voice: str = "default"
     tts_cosyvoice_repo: str | None = "/opt/CosyVoice"
     tts_prompt_text: str = (
