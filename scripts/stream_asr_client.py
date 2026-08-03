@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from dataclasses import dataclass
 import json
 import os
 import sys
@@ -14,6 +15,11 @@ import websockets
 
 class StreamClientError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class StreamResult:
+    events: list[dict[str, object]]
 
 
 class APIKeyAction(argparse.Action):
@@ -210,6 +216,7 @@ async def receive_messages(
     print_mode: str = "events",
     sequence_tracker: SequenceTracker | None = None,
     verify_protocol: bool = False,
+    events: list[dict[str, object]] | None = None,
 ) -> None:
     display_state = DisplayState()
     tracker = sequence_tracker or SequenceTracker()
@@ -232,6 +239,8 @@ async def receive_messages(
                 continue
             if not isinstance(payload, dict):
                 raise StreamClientError("server returned a non-object event")
+            if events is not None:
+                events.append(payload)
             sequence = payload.get("sequence")
             if verify_protocol and (
                 isinstance(sequence, bool)
@@ -383,6 +392,7 @@ async def run_stream_tasks(
     *,
     chunk_size: int,
     sequence_tracker: SequenceTracker,
+    events: list[dict[str, object]] | None = None,
 ) -> None:
     sender = asyncio.create_task(send_audio(websocket, process, args, chunk_size))
     receiver = asyncio.create_task(
@@ -391,6 +401,7 @@ async def run_stream_tasks(
             args.print_mode,
             sequence_tracker,
             verify_protocol=getattr(args, "verify_protocol", False),
+            events=events,
         )
     )
     tasks = {sender, receiver}
@@ -424,7 +435,7 @@ async def run_stream_tasks(
                 raise
 
 
-async def stream_audio(args: argparse.Namespace) -> None:
+async def stream_audio(args: argparse.Namespace) -> StreamResult:
     validate_api_key_input(args)
 
     stream_info = None
@@ -479,6 +490,7 @@ async def stream_audio(args: argparse.Namespace) -> None:
             verify_protocol=getattr(args, "verify_protocol", False),
         ):
             print(f"warning: {warning}", file=sys.stderr)
+        events = [first]
 
         process = await start_ffmpeg(args.audio_file, args.sample_rate)
         await run_stream_tasks(
@@ -487,7 +499,9 @@ async def stream_audio(args: argparse.Namespace) -> None:
             args,
             chunk_size=chunk_size,
             sequence_tracker=sequence_tracker,
+            events=events,
         )
+    return StreamResult(events=events)
 
 
 def main() -> None:
